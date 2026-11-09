@@ -1,0 +1,53 @@
+# taskpilot config. Paths may start with ~/.
+
+home: ~/.taskpilot            # task state, worktrees, plugin
+operator_language: Vietnamese # language of summaries shown in the TUI
+
+claude:
+  bin: claude
+  model: ""                   # empty = Claude Code default
+  effort: ""                  # low | medium | high | xhigh | max
+  max_budget_usd: 2           # per run (one turn between two gates)
+  permission_mode: dontAsk    # only pre-approved tools run; nothing prompts
+  setting_sources: ""         # e.g. "project,local" to ignore ~/.claude settings
+  extra_args: []
+
+daemon:
+  concurrency: 2
+  poll_interval: 3s
+
+source:
+  type: mock                  # hasaki-work later
+  dir: ~/.taskpilot/inbox
+
+# Gates the agent can request. Rules below refer to them.
+gates: [plan, pr, deploy]
+
+# Omit `rules` to use the built-in defaults:
+#   Edit/Write before `plan`; git push / gh pr before `pr`;
+#   argocd sync/rollback (CLI or MCP) before `deploy`;
+#   vault secret reads/writes and force-push always denied.
+# rules:
+#   - tool: Bash
+#     command: '\bkubectl\s+(apply|delete|scale)\b'
+#     requires: deploy
+
+repos:
+  example:
+    path: ~/repos/github/example
+    base: main
+    verify: go test ./...
+    allowed_tools:            # Claude Code permission rules, on top of the defaults
+      - Bash(go test *)
+      - Bash(go build *)
+      - Bash(go vet *)
+    prepare:                  # best-effort commands run in a new worktree
+      - [graphify, update, .]
+    mcp_servers:
+      graphify:
+        command: python3
+        args: [-m, graphify.serve, graphify-out/graph.json]
+      # argocd:
+      #   command: npx
+      #   args: [argocd-mcp@latest, stdio]
+      #   env: {ARGOCD_BASE_URL: "https://argocd.example", MCP_READ_ONLY: "true"}
