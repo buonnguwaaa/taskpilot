@@ -16,6 +16,7 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/runner"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
+	"github.com/buonnguwaaa/taskpilot/internal/workspace"
 )
 
 type harness struct {
@@ -255,6 +256,42 @@ func TestUnknownProjectOrRepoFails(t *testing.T) {
 	}
 }
 
+// A repo added to the config file while the daemon runs is accepted without
+// a restart.
+func TestConfigReloadedWhenFileChanges(t *testing.T) {
+	h := newHarness(t)
+	h.step() // first pass starts watching the file
+	path := h.d.Config.Path
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := h.d.Config.Projects["demo"].Repos["api"].Path
+	b = append(b, fmt.Sprintf("      fptpay: {path: %s, base: main, verify: \"true\"}\n", repo)...)
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Minute)
+	os.Chtimes(path, later, later)
+
+	h.src.Submit(source.Ticket{ID: "T9", Title: "x", Project: "demo", Repo: "fptpay"})
+	h.step()
+	if tk := h.task("mock-T9"); tk.State == store.StateFailed {
+		t.Fatalf("new repo still unknown after the config changed: %s", tk.LastError)
+	}
+
+	// A broken edit keeps the last good config.
+	if err := os.WriteFile(path, []byte("projects: [broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later = later.Add(time.Minute)
+	os.Chtimes(path, later, later)
+	h.step()
+	if _, ok := h.d.conf().Projects["demo"].Repos["fptpay"]; !ok {
+		t.Fatal("a broken config must not replace the current one")
+	}
+}
+
 func TestWorkspaceWithoutHintStartsEmpty(t *testing.T) {
 	h := newHarness(t)
 	h.src.Submit(source.Ticket{ID: "T8", Title: "x", Project: "demo"})
@@ -368,4 +405,29 @@ func TestRecoverParksAtGateOrDone(t *testing.T) {
 	}
 	h.expect("mock-R1", store.StateAwaitApproval, "pr-1")
 	h.expect("mock-R2", store.StateDone, "")
+}
+
+// Done tasks hold no worktree: the operator must be able to check their
+// branch out. Tasks finished before this was automatic are freed at start.
+func TestDoneTasksReleaseWorktreesAtStart(t *testing.T) {
+	h := newHarness(t)
+	repo := h.d.Config.Projects["demo"].Repos["api"]
+	ws, err := workspace.Create(h.d.Config.Home, "mock-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspace.OpenRepo(context.Background(), ws, "mock-old", "api", repo); err != nil {
+		t.Fatal(err)
+	}
+	tk := &store.Task{ID: "mock-old", Title: "x", Project: "demo", Workspace: ws, Branch: workspace.Branch("mock-old")}
+	tk.Transition(store.StateDone, "finished long ago")
+	h.st.SaveTask(tk)
+
+	if err := h.d.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := workspace.OpenedRepos(ws); len(got) != 0 {
+		t.Fatalf("worktrees still held: %v", got)
+	}
+	mustGit(t, repo.Path, "checkout", "-q", workspace.Branch("mock-old"))
 }

@@ -39,6 +39,10 @@ Có hai dạng response:
 | Thêm comment ✍️ | `POST v2/task/comment`, multipart: `user_id`, `obj_id`, `type=2`, `comment`, `parent_id`?, `file[]`? | chưa gọi thử |
 | Đổi trường task ✍️ | `POST hr/projects/update-field`, multipart: `id`, `field=status`, `value` | chưa gọi thử |
 | Đổi trạng thái assignment ✍️ | `POST hr/projects/update-assign-status`: `task_id`, `assign_id`, `status` | chưa gọi thử |
+| Tạo task ✍️ | `POST hr/projects/upsert-task-input/0`, JSON: `id=0`, `name`, `prid`, `parent_id` (EPIC), `milestone_id` (sprint, lấy từ EPIC như web làm khi tạo subtask), `planned_hours` (phút, 480 = 8h), `date_end` (`YYYY-MM-DD 00:00:00`), `note` (mô tả), `no_assign=1`, `sub_type=0` | đã gọi thật 2026-11-10: `data` là task mới (`id`, `code`, `planned_hours` dạng chuỗi), `assign_to_user: []` (chưa giao) |
+| Giao người ✍️ | `POST hr/projects/mass-update-field-task-input`, multipart: `id`, `field=assign_staff`, `value[]=<staff_id>` | theo code JS của web (ô chọn người thực hiện); `staff_id` là `staff_info.staff_id` của profile, không phải user id |
+| Task của một dự án | `GET hr/projects/mytasks-es?option=all&prid={id}&limit=500&offset=0[&status=…][&keyword=…]` | đã gọi thử 2026-11-10; `keyword` lọc theo tên. Index **không trả đủ**: một số EPIC đang mở chỉ thấy qua `parent` của task con |
+| Thông tin dự án | `GET hr/projects/{prid}` | đã gọi thử |
 | Activity | `GET hr/projects/activities` | chưa thử |
 
 Bộ lọc trạng thái (`status=`): `_00_01` (đang mở), `_05` (chờ duyệt), `_02` (đã
@@ -54,3 +58,16 @@ Các trường chính của một task: `id`, `code` (ví dụ `HSK-9602DG23`), 
 
 Lúc khám phá, có 24 task đang mở thuộc 3 project: BOM (Manufactory) `8388`,
 PLM `7264`, Payment (New) `7771`.
+
+## EPIC theo sprint
+
+Mỗi dự án có một EPIC cho mỗi loại trong mỗi sprint: `[EPIC] DEV …` (hoặc
+`DEV & QC`), `[EPIC] Improve Sprint N`, `[EPIC] Issue Production`. EPIC gắn với
+sprint qua `milestone_id`. Phím `h` (tab Tasks) và `taskpilot hw epics` tìm EPIC
+đang mở mới nhất của từng loại: ứng viên lấy từ `keyword=EPIC`, từ `parent` của
+task đang mở trong dự án và của task của tôi; mỗi ứng viên được đọc chi tiết
+(`task-input/{id}`) để biết trạng thái và sprint. Bỏ qua EPIC đã xong (2) hoặc hủy (4).
+
+`milestone_id` có lúc là số, có lúc là chuỗi hoặc `null`.
+
+Để khám phá thêm: `taskpilot hw get PATH k=v …` gọi GET và in `data`.

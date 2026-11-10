@@ -19,10 +19,12 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/gate"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
 	"github.com/buonnguwaaa/taskpilot/internal/herdr"
+	"github.com/buonnguwaaa/taskpilot/internal/intake"
 	"github.com/buonnguwaaa/taskpilot/internal/logring"
 	"github.com/buonnguwaaa/taskpilot/internal/plugin"
 	"github.com/buonnguwaaa/taskpilot/internal/runner"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
+	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/tui"
 )
@@ -59,6 +61,10 @@ func cmdTUI(args []string) error {
 
 	deps := tui.Deps{
 		Config: cfg, Store: st, HW: hw, Inbox: inbox, Exe: exe,
+		Draft: (&intake.Drafter{Config: cfg}).Draft,
+		SPLGen: func(ctx context.Context, lc splgen.Context, q string) (*splgen.Result, error) {
+			return (&splgen.Generator{Config: cfg}).Generate(ctx, lc, q)
+		},
 		Banner: func() (string, bool) {
 			s, err := hasakiwork.ReadStatus(ctx, d)
 			if err != nil {

@@ -243,3 +243,63 @@ func TestImportLegacy(t *testing.T) {
 		t.Fatalf("import must be idempotent: %v %v", again, err)
 	}
 }
+
+func TestDeleteTask(t *testing.T) {
+	s := newStore(t)
+	saved(t, s, "mock-1", StateDone)
+	saved(t, s, "mock-2", StateDone)
+	if _, err := s.AddRequest("mock-1", "plan", "p", ""); err != nil {
+		t.Fatal(err)
+	}
+	s.SetCompletion("mock-1", &Completion{Summary: "xong", CreatedAt: time.Now()})
+	s.SetPullRequest("mock-1", &PullRequest{Repo: "api", Destination: "main", URL: "u", CreatedAt: time.Now()})
+	s.SetHasakiLink("mock-1", &HasakiLink{HWID: 1, Code: "HSK-1", CreatedAt: time.Now()})
+	s.SetNudge("mock-1", "hi")
+	os.MkdirAll(s.TaskDir("mock-1"), 0o755)
+	os.WriteFile(s.EventsPath("mock-1"), []byte("{}\n"), 0o644)
+
+	if err := s.DeleteTask("mock-1"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Exists("mock-1") || !s.Exists("mock-2") {
+		t.Fatal("only mock-1 must be gone")
+	}
+	for _, table := range []string{"approvals", "completions", "pull_requests", "hasaki_links", "operator_messages", "task_transitions"} {
+		var n int
+		s.DB.QueryRow(`SELECT count(*) FROM ` + table + ` WHERE task_id = 'mock-1'`).Scan(&n)
+		if n != 0 {
+			t.Errorf("%s still has %d row(s)", table, n)
+		}
+	}
+	if _, err := os.Stat(s.TaskDir("mock-1")); !os.IsNotExist(err) {
+		t.Fatal("task directory must be removed")
+	}
+	if err := s.DeleteTask("mock-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func TestTaskProfile(t *testing.T) {
+	s := newStore(t)
+	saved(t, s, "mock-1", StateRunning)
+	if p, _ := s.TaskProfile("mock-1"); p != nil {
+		t.Fatal("no profile yet")
+	}
+	if err := s.SetTaskProfile("mock-1", &Profile{Model: "opus", Effort: "high", Reason: "r", SetBy: "agent"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTaskProfile("mock-1", &Profile{Model: "sonnet", Effort: "medium", Reason: "easier", SetBy: "agent"}); err != nil {
+		t.Fatal("the agent may revise its own choice")
+	}
+	s.SetTaskProfile("mock-1", &Profile{Model: "fable", SetBy: "operator"})
+	if err := s.SetTaskProfile("mock-1", &Profile{Model: "sonnet", SetBy: "agent"}); err != ErrProfilePinned {
+		t.Fatalf("pinned: %v", err)
+	}
+	if p, _ := s.TaskProfile("mock-1"); p.Model != "fable" || p.SetBy != "operator" {
+		t.Fatalf("profile = %+v", p)
+	}
+	s.ClearTaskProfile("mock-1")
+	if p, _ := s.TaskProfile("mock-1"); p != nil {
+		t.Fatal("cleared")
+	}
+}

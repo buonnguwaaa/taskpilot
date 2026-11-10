@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -206,11 +207,32 @@ func (c *Client) Search(ctx context.Context, r Request) ([]Event, error) {
 	var res struct {
 		Results []Event `json:"results"`
 	}
+	// A transforming search (stats, top…) has rows only in /results; /events
+	// would return the raw events it read, or nothing.
+	endpoint := "/events"
+	if IsTransforming(r.SPL) {
+		endpoint = "/results"
+	}
 	q := url.Values{"count": {strconv.Itoa(r.MaxEvents)}, "offset": {"0"}, "segmentation": {"none"}}
-	if err := c.do(ctx, http.MethodGet, c.prefix()+"/jobs/"+url.PathEscape(created.SID)+"/events", nil, q, &res); err != nil {
+	if err := c.do(ctx, http.MethodGet, c.prefix()+"/jobs/"+url.PathEscape(created.SID)+endpoint, nil, q, &res); err != nil {
 		return nil, err
 	}
 	return res.Results, nil
+}
+
+// transforming are the commands whose output is a table, not events.
+var transforming = map[string]bool{"stats": true, "chart": true, "timechart": true, "top": true, "rare": true,
+	"table": true, "fields": false, "sistats": true, "tstats": true, "geostats": true, "xyseries": true}
+
+// IsTransforming reports whether the search ends in a table (stats, top…):
+// its rows are read from the job's results instead of its events.
+func IsTransforming(spl string) bool {
+	for _, m := range cmdRe.FindAllStringSubmatch(spl, -1) {
+		if transforming[strings.ToLower(m[1])] {
+			return true
+		}
+	}
+	return false
 }
 
 func truthy(v any) bool {
@@ -314,6 +336,12 @@ func Format(query, earliest string, events []Event, max int) string {
 		b.WriteString(" (limit reached: narrow the search or time range to see everything)")
 	}
 	b.WriteString("\n")
+	if IsTransforming(query) {
+		for _, l := range Table(events, 0) {
+			b.WriteString("\n" + l)
+		}
+		return b.String()
+	}
 	const perEvent, total = 800, 48 << 10
 	for _, e := range events {
 		raw := fmt.Sprint(e["_raw"])
@@ -458,13 +486,69 @@ func Expand(spl string, vals map[string]string) (string, error) {
 	return strings.TrimSpace(out), bad
 }
 
-// WebURL opens a search in Splunk Web.
+// WebURL opens a search in Splunk Web, up to now.
 func WebURL(base, locale, spl, earliest string) string {
+	return WebURLRange(base, locale, spl, earliest, "")
+}
+
+// WebURLRange opens a search in Splunk Web over [earliest, latest).
+func WebURLRange(base, locale, spl, earliest, latest string) string {
 	if locale == "" {
 		locale = "en-US"
 	}
-	q := url.Values{"q": {"search " + strings.TrimPrefix(spl, "search ")}, "earliest": {earliest}, "latest": {"now"}}
+	if latest == "" {
+		latest = "now"
+	}
+	q := url.Values{"q": {"search " + strings.TrimPrefix(spl, "search ")}, "earliest": {earliest}, "latest": {latest}}
 	return strings.TrimRight(base, "/") + "/" + locale + "/app/search/search?" + q.Encode()
+}
+
+// Table renders the rows of a transforming search (stats, top…) as aligned
+// columns, internal fields left out.
+func Table(rows []Event, width int) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var cols []string
+	for _, r := range rows {
+		for k := range r {
+			if !seen[k] && !strings.HasPrefix(k, "_") {
+				seen[k] = true
+				cols = append(cols, k)
+			}
+		}
+	}
+	sort.Strings(cols)
+	// "count"-like numbers last reads better: put them at the end.
+	sort.SliceStable(cols, func(i, j int) bool {
+		return cols[i] != "count" && cols[j] == "count"
+	})
+	cell := func(r Event, c string) string { return strings.ReplaceAll(str(r[c]), "\n", " ") }
+	wid := map[string]int{}
+	for _, c := range cols {
+		wid[c] = len([]rune(c))
+		for _, r := range rows {
+			wid[c] = min(max(wid[c], len([]rune(cell(r, c)))), 60)
+		}
+	}
+	line := func(get func(string) string) string {
+		var parts []string
+		for _, c := range cols {
+			v := []rune(get(c))
+			if len(v) > wid[c] {
+				v = append(v[:wid[c]-1], '…')
+			}
+			parts = append(parts, string(v)+strings.Repeat(" ", wid[c]-len(v)))
+		}
+		return clip(strings.TrimRight(strings.Join(parts, "  "), " "), width)
+	}
+	out := []string{line(func(c string) string { return c })}
+	for _, r := range rows {
+		r := r
+		out = append(out, line(func(c string) string { return cell(r, c) }))
+	}
+	return out
 }
 
 // Pretty renders events for people: time, level, container, message and the

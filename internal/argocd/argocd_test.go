@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -126,5 +127,47 @@ func TestTokenExpiry(t *testing.T) {
 	tok := "h." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1800000000}`)) + ".s"
 	if e, ok := TokenExpiry(tok); !ok || e.Unix() != 1800000000 {
 		t.Fatalf("%v %v", e, ok)
+	}
+}
+
+func TestMainContainer(t *testing.T) {
+	for _, c := range []struct {
+		choices       []string
+		workload, app string
+		want          string
+	}{
+		{[]string{"vault-agent-init", "merge-ca-bundle", "linkerd-init", "linkerd-proxy", "payment-vnpay"}, "payment-vnpay", "payment-qc-payment-vnpay", "payment-vnpay"},
+		{[]string{"linkerd-proxy", "api"}, "bom-api", "bom-qc-bom-api", "api"},
+		{[]string{"istio-proxy", "server", "worker"}, "x", "y", "server"},
+		{[]string{"linkerd-proxy"}, "x", "y", "linkerd-proxy"},
+	} {
+		if got := MainContainer(c.choices, c.workload, c.app); got != c.want {
+			t.Errorf("MainContainer(%v) = %q, want %q", c.choices, got, c.want)
+		}
+	}
+}
+
+// Kubernetes refuses logs of a multi-container pod without a container; the
+// refusal may come back as the only "log line". Logs retries with the app's.
+func TestLogsPicksTheAppContainer(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := r.URL.Query().Get("container")
+		asked = append(asked, c)
+		if c == "" {
+			io.WriteString(w, `{"result":{"content":"a container name must be specified for pod p-1, choose one of: [vault-agent-init linkerd-proxy payment-vnpay]"}}`+"\n")
+			return
+		}
+		io.WriteString(w, `{"result":{"content":"hello from `+c+`","timeStamp":"2026-11-10T10:00:00Z","podName":"p-1"}}`+"\n")
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, Token: "t"}
+	app := App{Name: "payment-qc-payment-vnpay", Resources: []Resource{{Kind: "Deployment", Name: "payment-vnpay", Namespace: "payment-qc"}}}
+	lines, err := c.Logs(context.Background(), app, LogOptions{TailLines: 5})
+	if err != nil || len(lines) != 1 || lines[0].Content != "hello from payment-vnpay" {
+		t.Fatalf("lines=%+v err=%v asked=%q", lines, err, asked)
+	}
+	if len(asked) != 2 || asked[1] != "payment-vnpay" {
+		t.Fatalf("asked containers %q", asked)
 	}
 }

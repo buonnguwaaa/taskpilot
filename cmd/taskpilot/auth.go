@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -29,6 +30,7 @@ const authUsage = `taskpilot auth <command>
   refresh       get a fresh JWT from the stored session cookie now
   bitbucket     store the Bitbucket email + API token used to open PRs [-expires YYYY-MM-DD]
   argocd        log in to Argo CD QC with the dedicated Chrome profile [-token to paste instead]
+  set-db P      store the MySQL DSN of project P's QC database (read from stdin, not echoed)
   splunk        log in to Splunk with the dedicated Chrome profile [-create: then make a personal API token, -expires-in +90d]
                 [-token | -cookie to paste instead]
 `
@@ -109,6 +111,12 @@ func cmdAuth(args []string) error {
 		}
 		fmt.Printf("đã lưu token, hết hạn %s\n", exp.Local().Format("2006-01-02 15:04"))
 		return nil
+
+	case "set-db":
+		if c.fs.NArg() != 1 {
+			return fmt.Errorf("usage: taskpilot auth set-db PROJECT")
+		}
+		return authSetDB(ctx, cfg, d, c.fs.Arg(0))
 
 	case "set-cookie":
 		v, err := readSecret("Dán Cookie header của work.hasaki.vn rồi Enter: ")
@@ -216,6 +224,8 @@ const hwUsage = `taskpilot hw <command>
   me                     show the logged-in Hasaki Work user
   tasks [-status _00_01] list my tasks (_00_01 open, _05 waiting approval, _02 finished, _04 cancelled)
   show ID                show one task with its description and comment count
+  get PATH [k=v ...]     GET a raw API path (read-only, for exploring the API)
+  epics                  show the open DEV / Improve / Issue Production EPIC of each project (used by TUI key h)
 `
 
 func cmdHW(args []string) error {
@@ -229,6 +239,9 @@ func cmdHW(args []string) error {
 	id := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		id, args = args[0], args[1:]
+	}
+	if sub == "get" { // k=v pairs are the query, not flags
+		args, id = nil, strings.Join(args, "&")+"\x00"+id
 	}
 	c.fs.Parse(args)
 	cfg, d, a, err := openAuth(c)
@@ -263,6 +276,47 @@ func cmdHW(args []string) error {
 				scope = "(" + t.Project.Name + ")"
 			}
 			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Code, hasakiwork.StatusName(t.Status), scope, short(t.DateEnd, 10), short(t.Name, 70))
+		}
+		return w.Flush()
+	case "get":
+		q, path, _ := strings.Cut(id, "\x00")
+		vals, err := url.ParseQuery(q)
+		if err != nil {
+			return err
+		}
+		raw, err := cl.GetRaw(ctx, path, vals)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(raw))
+		return nil
+	case "epics":
+		var mine []hasakiwork.Task
+		for _, st := range []string{"_00_01", "_05", "_02"} {
+			ts, err := cl.MyTasks(ctx, st)
+			if err != nil {
+				return err
+			}
+			mine = append(mine, ts...)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "PROJECT\tKIND\tEPIC ID\tCODE\tSPRINT\tNAME")
+		for _, name := range cfg.ProjectNames() {
+			p := cfg.Projects[name]
+			if p.HasakiProjectID == 0 {
+				continue
+			}
+			eps, err := cl.CurrentEpics(ctx, p.HasakiProjectID, mine)
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			for _, k := range hasakiwork.EpicKinds {
+				if e := eps[k]; e != nil {
+					fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%d %s\t%s\n", name, k.Label(), e.ID, e.Code, e.MilestoneID, short(e.Milestone, 30), e.Name)
+				} else {
+					fmt.Fprintf(w, "%s\t%s\t-\t\t\t(không tìm thấy EPIC đang mở)\n", name, k.Label())
+				}
+			}
 		}
 		return w.Flush()
 	case "show":

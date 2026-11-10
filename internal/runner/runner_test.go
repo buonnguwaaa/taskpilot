@@ -80,6 +80,10 @@ func TestArgs(t *testing.T) {
 	if argValue(args, "--resume") != task.SessionID || argValue(args, "--session-id") != "" {
 		t.Fatalf("resume args: %v", args)
 	}
+	cfg.Claude.MaxBudgetUSD = 0
+	if args, _ = r.Args(task, repo, false); strings.Contains(strings.Join(args, " "), "--max-budget-usd") {
+		t.Fatalf("no budget set: no cap, got %v", args)
+	}
 }
 
 func TestParseEvent(t *testing.T) {
@@ -116,5 +120,39 @@ func TestToolCallsFromStream(t *testing.T) {
 	}
 	if tc.calls[0].IsError {
 		t.Fatal("successful call marked as error")
+	}
+}
+
+func TestArgsUseTaskProfile(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &store.Task{ID: "mock-p", SessionID: "11111111-1111-4111-8111-111111111111"}
+	task.Transition(store.StateQueued, "")
+	st.SaveTask(task)
+	cfg := &config.Config{Claude: config.Claude{Bin: "claude", Model: "sonnet", Effort: "medium", Models: []string{"opus", "sonnet"}}}
+	r := &Runner{Config: cfg, Store: st, PluginDir: "/p", Exe: "/bin/tp"}
+	proj := config.Project{}
+
+	args, _ := r.Args(task, proj, false)
+	if argValue(args, "--model") != "sonnet" || argValue(args, "--effort") != "medium" {
+		t.Fatalf("no profile: config default, got %v", args)
+	}
+	if !strings.Contains(args[len(args)-1], "Agent") {
+		t.Fatal("subagents (Agent) must be allowed")
+	}
+	st.SetTaskProfile("mock-p", &store.Profile{Model: "opus", Effort: "xhigh", Reason: "cross-repo", SetBy: "agent"})
+	args, _ = r.Args(task, proj, true)
+	if argValue(args, "--model") != "opus" || argValue(args, "--effort") != "xhigh" {
+		t.Fatalf("agent profile not applied: %v", args)
+	}
+	// The operator pins a model only: the effort falls back to the config.
+	st.SetTaskProfile("mock-p", &store.Profile{Model: "sonnet", SetBy: "operator"})
+	if m, e := r.Profile(task); m != "sonnet" || e != "medium" {
+		t.Fatalf("pinned model only: %s/%s", m, e)
+	}
+	if err := st.SetTaskProfile("mock-p", &store.Profile{Model: "opus", Effort: "max", SetBy: "agent"}); err != store.ErrProfilePinned {
+		t.Fatalf("the agent cannot override a pinned profile: %v", err)
 	}
 }

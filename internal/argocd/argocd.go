@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -265,7 +266,87 @@ func (a App) Workload() (Resource, bool) {
 }
 
 // Logs returns the latest log lines of the app's workload (not followed).
+// When the pods run several containers (service mesh, Vault agent…) and none
+// was asked for, the application's own container is picked.
 func (c *Client) Logs(ctx context.Context, app App, o LogOptions) ([]LogLine, error) {
+	lines, err := c.logs(ctx, app, o)
+	if o.Container == "" {
+		// Kubernetes' refusal comes back as an error, or as the only "log line"
+		// (no pod, no time) depending on the Argo CD version.
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		} else if len(lines) > 0 && lines[0].Pod == "" && lines[0].Time == "" {
+			msg = lines[0].Content
+		}
+		if choices := containerChoices(msg); len(choices) > 0 {
+			w, _ := app.Workload()
+			if o.Name != "" {
+				w.Name = o.Name
+			}
+			o.Container = MainContainer(choices, w.Name, app.Name)
+			return c.logs(ctx, app, o)
+		}
+	}
+	return lines, err
+}
+
+var choicesRe = regexp.MustCompile(`choose one of: \[([^\]]*)\]`)
+
+// containerChoices reads the containers Kubernetes lists when a pod has
+// several and none was named.
+func containerChoices(msg string) []string {
+	m := choicesRe.FindStringSubmatch(msg)
+	if m == nil {
+		return nil
+	}
+	return strings.Fields(m[1])
+}
+
+// sidecars are containers injected next to the application, never the one
+// whose logs are wanted.
+var sidecars = []string{"linkerd", "istio", "envoy", "vault-agent", "merge-ca-bundle", "cloudsql-proxy",
+	"fluent", "filebeat", "promtail", "datadog", "otel", "jaeger"}
+
+// MainContainer picks the application's container: the one named like the
+// workload or the app, else the first that is not a known sidecar or an
+// init container, else the first.
+func MainContainer(choices []string, workload, app string) string {
+	if len(choices) == 0 {
+		return ""
+	}
+	for _, want := range []string{workload, app} {
+		for _, c := range choices {
+			if want != "" && c == want {
+				return c
+			}
+		}
+	}
+	for _, want := range []string{workload, app} { // payment-qc-payment-vnpay ⊃ payment-vnpay
+		for _, c := range choices {
+			if want != "" && strings.HasSuffix(want, c) && !isSidecar(c) {
+				return c
+			}
+		}
+	}
+	for _, c := range choices {
+		if !isSidecar(c) && !strings.HasSuffix(c, "-init") && !strings.HasPrefix(c, "init-") {
+			return c
+		}
+	}
+	return choices[0]
+}
+
+func isSidecar(c string) bool {
+	for _, s := range sidecars {
+		if strings.Contains(c, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) logs(ctx context.Context, app App, o LogOptions) ([]LogLine, error) {
 	if o.Kind == "" {
 		w, ok := app.Workload()
 		if !ok {

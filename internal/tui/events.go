@@ -141,8 +141,14 @@ func truncate(s string, w int) string {
 	return string(r[:w-1]) + "…"
 }
 
+// wrap fits s to w columns. URLs are clickable and never broken over lines:
+// one too wide is shown shortened, still opening the full URL.
 func wrap(s string, w int) string {
-	return lipgloss.NewStyle().Width(max(10, w)).Render(strings.TrimSpace(s))
+	w = max(10, w)
+	// Leave room for punctuation glued to a URL ("(…)."), so the word the URL
+	// is in still fits a line and is not hard-wrapped through the URL.
+	s, links := shortenURLs(strings.TrimSpace(s), w-4)
+	return linkify(lipgloss.NewStyle().Width(w).Render(s), links)
 }
 
 // sortedPRs orders PRs with pending ones (needing the operator) first, then by repo.

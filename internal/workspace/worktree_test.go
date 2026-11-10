@@ -96,3 +96,67 @@ func TestOpenRepoRejectsBadName(t *testing.T) {
 		t.Fatal("path traversal in repo name accepted")
 	}
 }
+
+func TestRemoveWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	run(t, dir, "init", "-q", "-b", "main", repo)
+	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("1"), 0o644)
+	run(t, repo, "add", ".")
+	run(t, repo, "commit", "-q", "-m", "one")
+
+	ws, err := Create(filepath.Join(dir, "home"), "mock-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenRepo(context.Background(), ws, "mock-1", "svc", config.Repo{Path: repo, Base: "main", Remote: "-"}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(ws, "svc", "dirty.txt"), []byte("x"), 0o644) // uncommitted work
+
+	if err := Remove(context.Background(), ws); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ws); !os.IsNotExist(err) {
+		t.Fatal("workspace directory must be gone")
+	}
+	if out := run(t, repo, "worktree", "list"); strings.Contains(out, "svc") {
+		t.Fatalf("worktree still registered:\n%s", out)
+	}
+	if out := run(t, repo, "branch", "--list", Branch("mock-1")); out == "" {
+		t.Fatal("the work branch must be kept")
+	}
+	if err := Remove(context.Background(), ""); err != nil {
+		t.Fatal("no workspace: nothing to do")
+	}
+}
+
+func TestReleaseFreesCleanWorktrees(t *testing.T) {
+	dir := t.TempDir()
+	var repos []string
+	for _, n := range []string{"clean", "dirty"} {
+		repo := filepath.Join(dir, n)
+		run(t, dir, "init", "-q", "-b", "main", repo)
+		os.WriteFile(filepath.Join(repo, "a.txt"), []byte("1"), 0o644)
+		run(t, repo, "add", ".")
+		run(t, repo, "commit", "-q", "-m", "one")
+		repos = append(repos, repo)
+	}
+	ws, _ := Create(filepath.Join(dir, "home"), "mock-1")
+	for i, n := range []string{"clean", "dirty"} {
+		if _, err := OpenRepo(context.Background(), ws, "mock-1", n, config.Repo{Path: repos[i], Base: "main", Remote: "-"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.WriteFile(filepath.Join(ws, "dirty", "wip.txt"), []byte("x"), 0o644)
+
+	kept, err := Release(context.Background(), ws)
+	if err != nil || len(kept) != 1 || kept[0] != "dirty" {
+		t.Fatalf("kept=%v err=%v", kept, err)
+	}
+	// The branch is free again: the operator's clone can check it out.
+	run(t, repos[0], "checkout", "-q", Branch("mock-1"))
+	if _, err := os.Stat(filepath.Join(ws, "dirty", "wip.txt")); err != nil {
+		t.Fatal("uncommitted work must stay")
+	}
+}

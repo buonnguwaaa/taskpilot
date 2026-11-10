@@ -26,6 +26,7 @@ var hwFilters = []struct{ value, label string }{
 
 type hwTab struct {
 	list     []hasakiwork.Task
+	epics    int // EPICs left out of list: they group tasks, there is nothing to do on them
 	cursor   int
 	filter   int
 	loading  bool
@@ -81,7 +82,14 @@ func (m Model) onHWTasks(msg hwTasksMsg) (tea.Model, tea.Cmd) {
 		m.refreshHWDetail(true)
 		return m, nil
 	}
-	m.hw.list = msg.tasks
+	m.hw.list, m.hw.epics = nil, 0
+	for _, t := range msg.tasks {
+		if hasakiwork.IsEpic(t.Name) {
+			m.hw.epics++
+			continue
+		}
+		m.hw.list = append(m.hw.list, t)
+	}
 	m.hw.cursor = min(m.hw.cursor, max(0, len(m.hw.list)-1))
 	return m.selectHW()
 }
@@ -217,6 +225,8 @@ func (m Model) hwView() string {
 	title := fmt.Sprintf("Hasaki Work · %s (s đổi)", hwFilters[m.hw.filter].label)
 	if m.hw.loading {
 		title += " · đang tải…"
+	} else if m.hw.epics > 0 {
+		title += fmt.Sprintf(" · ẩn %d EPIC", m.hw.epics)
 	}
 	var lines []string
 	for i := m.hw.offset(rows); i < len(m.hw.list) && len(lines) < rows; i++ {
@@ -266,6 +276,15 @@ func (m Model) hwKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.loadHW()
 	case "enter":
 		return m.dispatchHW()
+	case "n":
+		t := m.hw.current()
+		if t == nil {
+			return m, nil
+		}
+		if full, ok := m.hw.details[t.ID]; ok {
+			return m.subtaskForm(*full)
+		}
+		return m.subtaskForm(*t)
 	}
 	return m, nil
 }
@@ -307,7 +326,11 @@ func (m Model) dispatchHW() (tea.Model, tea.Cmd) {
 	}
 	inbox, task := m.d.Inbox, *full
 	f := newForm("Giao cho agent: "+t.Code, func(v map[string]string) (tea.Cmd, error) {
-		body := hwTicketBody(&task, v["notes"])
+		notes, err := m.attach(store.TaskID(hwSource, task.Code), v["notes"])
+		if err != nil {
+			return nil, err
+		}
+		body := hwTicketBody(&task, notes)
 		return nil, inbox.Submit(source.Ticket{ID: task.Code, Source: hwSource, Title: task.Name, Body: body, Project: v["project"], Repo: v["repo"]})
 	})
 	f.hint = truncate(t.Name, 120)

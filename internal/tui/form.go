@@ -8,6 +8,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/buonnguwaaa/taskpilot/internal/refs"
 )
 
 type fieldKind int
@@ -44,6 +46,8 @@ type form struct {
 	err      string
 	onSubmit func(v map[string]string) (tea.Cmd, error)
 	width    int
+	// picker is open (Ctrl+O) to insert a file reference in the focused field.
+	picker *picker
 }
 
 func newForm(title string, onSubmit func(map[string]string) (tea.Cmd, error)) *form {
@@ -151,7 +155,22 @@ func (f *form) submit() (tea.Cmd, bool) {
 // update handles a key; done reports that the form closed (submitted or cancelled).
 func (f *form) update(msg tea.KeyMsg) (cmd tea.Cmd, done bool) {
 	fl := f.fields[f.focus]
+	if f.picker != nil {
+		path, closed := f.picker.update(msg)
+		if path != "" {
+			f.insert(fl, refs.Format(path))
+		}
+		if closed {
+			f.picker = nil
+		}
+		return nil, false
+	}
 	switch msg.String() {
+	case "ctrl+o":
+		if fl.kind == fieldText || fl.kind == fieldArea {
+			f.picker = newPicker()
+		}
+		return nil, false
 	case "esc":
 		return nil, true
 	case "ctrl+s":
@@ -188,8 +207,30 @@ func (f *form) update(msg tea.KeyMsg) (cmd tea.Cmd, done bool) {
 	return cmd, false
 }
 
+// insert adds a file reference at the cursor of a text field.
+func (f *form) insert(fl *field, token string) {
+	switch fl.kind {
+	case fieldArea:
+		v := fl.area.Value()
+		if v != "" && !strings.HasSuffix(v, " ") && !strings.HasSuffix(v, "\n") {
+			token = " " + token
+		}
+		fl.area.InsertString(token + " ")
+	case fieldText:
+		v := fl.input.Value()
+		if v != "" && !strings.HasSuffix(v, " ") {
+			v += " "
+		}
+		fl.input.SetValue(v + token + " ")
+		fl.input.CursorEnd()
+	}
+}
+
 func (f *form) view(width int) string {
 	w := min(max(50, width-10), 110)
+	if f.picker != nil {
+		return modalStyle.Width(w).Render(f.picker.view(w-6, 18))
+	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(f.title) + "\n")
 	if f.hint != "" {
@@ -222,7 +263,11 @@ func (f *form) view(width int) string {
 	if f.err != "" {
 		b.WriteString(errStyle.Render("✗ "+f.err) + "\n")
 	}
-	b.WriteString(dimStyle.Render("Tab/Shift+Tab: chuyển ô · ←/→: chọn · Ctrl+S: gửi · Esc: huỷ"))
+	help := "Tab/Shift+Tab: chuyển ô · ←/→: chọn · Ctrl+S: gửi · Esc: huỷ"
+	if fl := f.fields[f.focus]; fl.kind == fieldText || fl.kind == fieldArea {
+		help += " · Ctrl+O: đính kèm tệp (hoặc gõ @đường/dẫn)"
+	}
+	b.WriteString(dimStyle.Render(help))
 	return modalStyle.Width(w).Render(b.String())
 }
 

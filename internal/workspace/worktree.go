@@ -162,3 +162,63 @@ func tail(b []byte, n int) string {
 	}
 	return s
 }
+
+// Remove deletes a task workspace: each repo worktree is unregistered from its
+// repository (uncommitted changes are lost), then the directory is removed.
+// The work branches stay in the repositories.
+func Remove(ctx context.Context, workspaceDir string) error {
+	if workspaceDir == "" {
+		return nil
+	}
+	var errs []string
+	for _, name := range OpenedRepos(workspaceDir) {
+		wt := filepath.Join(workspaceDir, name)
+		common, err := git(ctx, wt, "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		if _, err := git(ctx, "", "--git-dir="+strings.TrimSpace(common), "worktree", "remove", "--force", wt); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+		}
+	}
+	if err := os.RemoveAll(workspaceDir); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("remove workspace: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// Release unregisters the clean worktrees of a finished task, so their
+// branches can be checked out in the operator's own clone again (git refuses a
+// branch another worktree holds). Worktrees with uncommitted changes are kept
+// and returned. Branches and commits stay in the repositories; reopening the
+// task opens the repos again.
+func Release(ctx context.Context, workspaceDir string) (kept []string, err error) {
+	var errs []string
+	for _, name := range OpenedRepos(workspaceDir) {
+		wt := filepath.Join(workspaceDir, name)
+		status, err := git(ctx, wt, "status", "--porcelain")
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		if strings.TrimSpace(status) != "" {
+			kept = append(kept, name)
+			continue
+		}
+		common, err := git(ctx, wt, "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err == nil {
+			_, err = git(ctx, "", "--git-dir="+strings.TrimSpace(common), "worktree", "remove", wt)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return kept, fmt.Errorf("release worktrees: %s", strings.Join(errs, "; "))
+	}
+	return kept, nil
+}

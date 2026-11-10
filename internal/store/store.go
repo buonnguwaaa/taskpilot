@@ -692,3 +692,141 @@ func (s *Store) SplunkQueries(id string) ([]*SplunkQuery, error) {
 	}
 	return out, rows.Err()
 }
+
+// HasakiLink is the Hasaki Work task a local task was pushed to.
+type HasakiLink struct {
+	HWID      int64
+	Code      string
+	CreatedAt time.Time
+}
+
+// SetHasakiLink records that the task was pushed to Hasaki Work.
+func (s *Store) SetHasakiLink(id string, l *HasakiLink) error {
+	_, err := s.DB.ExecContext(bg(), `INSERT INTO hasaki_links (task_id, hw_id, code, created_at) VALUES (?,?,?,?)
+		ON CONFLICT (task_id) DO UPDATE SET hw_id=excluded.hw_id, code=excluded.code, created_at=excluded.created_at`,
+		id, l.HWID, l.Code, ts(l.CreatedAt))
+	return err
+}
+
+// HasakiLink returns the Hasaki Work task the task was pushed to, or nil.
+func (s *Store) HasakiLink(id string) (*HasakiLink, error) {
+	var l HasakiLink
+	var created string
+	err := s.DB.QueryRowContext(bg(), `SELECT hw_id, code, created_at FROM hasaki_links WHERE task_id = ?`, id).Scan(&l.HWID, &l.Code, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	l.CreatedAt = parseTS(created)
+	return &l, nil
+}
+
+// DeleteTask removes a task: its record and everything attached to it (the
+// related tables cascade) and its directory (event log, stderr logs). The
+// workspace and the source ticket are the caller's business.
+func (s *Store) DeleteTask(id string) error {
+	if !ValidID(id) {
+		return fmt.Errorf("invalid task id %q", id)
+	}
+	res, err := s.DB.ExecContext(bg(), `DELETE FROM tasks WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return os.RemoveAll(s.TaskDir(id))
+}
+
+// DBQuery is an audit record of one agent query on a QC database.
+type DBQuery struct {
+	At     time.Time
+	Target string // host:port/schema
+	Query  string
+	Rows   int
+	Error  string
+}
+
+// AppendDBQuery records one agent query.
+func (s *Store) AppendDBQuery(id string, q *DBQuery) error {
+	_, err := s.DB.ExecContext(bg(), `INSERT INTO db_queries (task_id, at, target, query, rows, error) VALUES (?,?,?,?,?,?)`,
+		id, ts(q.At), q.Target, q.Query, q.Rows, q.Error)
+	return err
+}
+
+// DBQueries lists a task's QC database queries, oldest first.
+func (s *Store) DBQueries(id string) ([]*DBQuery, error) {
+	rows, err := s.DB.QueryContext(bg(), `SELECT at, target, query, rows, error FROM db_queries WHERE task_id = ? ORDER BY id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*DBQuery
+	for rows.Next() {
+		var q DBQuery
+		var at string
+		if err := rows.Scan(&at, &q.Target, &q.Query, &q.Rows, &q.Error); err != nil {
+			return nil, err
+		}
+		q.At = parseTS(at)
+		out = append(out, &q)
+	}
+	return out, rows.Err()
+}
+
+// Profile is the model and effort a task runs with. The agent sets it after
+// assessing the task; the operator can pin one, which the agent cannot change.
+type Profile struct {
+	Model     string
+	Effort    string
+	Reason    string
+	SetBy     string // "agent" or "operator"
+	UpdatedAt time.Time
+}
+
+// ErrProfilePinned is returned when the agent tries to change a profile the
+// operator pinned.
+var ErrProfilePinned = errors.New("the operator pinned this task's execution profile")
+
+// TaskProfile returns the task's profile, or nil.
+func (s *Store) TaskProfile(id string) (*Profile, error) {
+	var p Profile
+	var at string
+	err := s.DB.QueryRowContext(bg(), `SELECT model, effort, reason, set_by, updated_at FROM task_profiles WHERE task_id = ?`, id).
+		Scan(&p.Model, &p.Effort, &p.Reason, &p.SetBy, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.UpdatedAt = parseTS(at)
+	return &p, nil
+}
+
+// SetTaskProfile records the task's profile. The agent cannot replace one the
+// operator pinned (ErrProfilePinned).
+func (s *Store) SetTaskProfile(id string, p *Profile) error {
+	q := `INSERT INTO task_profiles (task_id, model, effort, reason, set_by, updated_at) VALUES (?,?,?,?,?,?)
+		ON CONFLICT (task_id) DO UPDATE SET model=excluded.model, effort=excluded.effort, reason=excluded.reason,
+		set_by=excluded.set_by, updated_at=excluded.updated_at`
+	if p.SetBy == "agent" {
+		q += ` WHERE task_profiles.set_by = 'agent'`
+	}
+	res, err := s.DB.ExecContext(bg(), q, id, p.Model, p.Effort, p.Reason, p.SetBy, ts(time.Now()))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrProfilePinned
+	}
+	return nil
+}
+
+// ClearTaskProfile removes the task's profile (back to the config default).
+func (s *Store) ClearTaskProfile(id string) error {
+	_, err := s.DB.ExecContext(bg(), `DELETE FROM task_profiles WHERE task_id = ?`, id)
+	return err
+}

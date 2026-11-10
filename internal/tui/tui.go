@@ -20,7 +20,9 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/desktop"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
+	"github.com/buonnguwaaa/taskpilot/internal/intake"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
+	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
 )
@@ -29,6 +31,11 @@ import (
 type HW interface {
 	MyTasks(ctx context.Context, statusFilter string) ([]hasakiwork.Task, error)
 	Task(ctx context.Context, id int64) (*hasakiwork.Task, error)
+	// Used by key h in the Tasks tab (create a task on Hasaki Work).
+	Profile(ctx context.Context) (*hasakiwork.Profile, error)
+	CurrentEpics(ctx context.Context, projectID int64, mine []hasakiwork.Task) (map[hasakiwork.EpicKind]*hasakiwork.Epic, error)
+	CreateTask(ctx context.Context, t hasakiwork.NewTask) (*hasakiwork.Created, error)
+	AssignStaff(ctx context.Context, taskID int64, staffIDs ...int64) error
 }
 
 // Herdr is the part of the herdr client the TUI uses.
@@ -66,6 +73,10 @@ type Deps struct {
 	AuthStatus func() []string
 	OpenURL    func(string) error
 	Copy       func(string) error
+	// Draft turns a free-form prompt into a ticket draft (nil: "N" is unavailable).
+	Draft func(ctx context.Context, prompt string) (*intake.Draft, error)
+	// SPLGen writes a Splunk search from a question (nil: "Hỏi bằng lời" is unavailable).
+	SPLGen func(ctx context.Context, lc splgen.Context, question string) (*splgen.Result, error)
 }
 
 type tabID int
@@ -110,7 +121,11 @@ type outputView struct {
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	d Deps
+	d        Deps
+	cfgWatch *config.Watcher // reloads d.Config when the file changes
+	// mouseOff hands the mouse back to the terminal (F2), so text can be
+	// selected and copied; clicks and the wheel then do nothing in the TUI.
+	mouseOff bool
 
 	width, height int
 	tab           tabID
@@ -252,7 +267,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.msg = string(msg)
 		m.reloadTasks()
 		return m, nil
+	case investigateMsg:
+		if m.modal != nil {
+			return m, nil
+		}
+		return m.newTaskForm(msg.ticket, msg.hint)
+	case taskDeletedMsg:
+		return m.onTaskDeleted(msg)
+	case hwSubtasksMsg:
+		return m.onHWSubtasks(msg)
+	case hwEpicsMsg:
+		return m.onHWEpics(msg)
+	case hwPushedMsg:
+		delete(m.tasks.hwPushing, msg.taskID)
+		m.msg = msg.msg
+		m.reloadTasks()
+		return m, nil
 	case tickMsg:
+		m.reloadConfig()
 		m.reloadTasks()
 		m.refreshBanner()
 		if m.tab == tabStatus {
@@ -270,6 +302,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshBanner()
 		m.refreshStatus()
 		m.reloadTasks()
+		if m.mouseOff { // the terminal was restored with the startup mouse mode
+			return m, tea.DisableMouse
+		}
 		return m, nil
 
 	case cmdOutputMsg:
@@ -284,10 +319,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshStatus()
 		return m, nil
 
+	case draftStartedMsg:
+		m.tasks.drafting = true
+		m.msg = "Claude đang soạn task từ prompt…"
+		return m, nil
+	case draftMsg:
+		return m.onDraft(msg)
 	case hwTasksMsg:
 		return m.onHWTasks(msg)
 	case hwDetailMsg:
 		return m.onHWDetail(msg)
+	case splGenStartedMsg:
+		m.logs.generating = true
+		m.msg = "Claude đang viết SPL…"
+		return m, nil
+	case splGenMsg:
+		return m.onSPLGen(msg)
 	case logsResultMsg:
 		return m.onLogsResult(msg)
 	case qcAppsMsg:
@@ -348,8 +395,19 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.help = false
 		return m, nil
 	}
+	if m.tab == tabTasks && m.tasks.searching {
+		return m.searchKey(k) // typed text, not shortcuts
+	}
 
 	switch k.String() {
+	case "f2":
+		m.mouseOff = !m.mouseOff
+		if m.mouseOff {
+			m.msg = "chuột trả cho terminal: kéo để bôi đen, copy như bình thường · F2 bật lại click/cuộn"
+			return m, tea.DisableMouse
+		}
+		m.msg = "đã bật lại chuột trong TUI (giữ Shift khi kéo để vẫn bôi đen được)"
+		return m, tea.EnableMouseCellMotion
 	case "ctrl+c", "q":
 		return m.quit()
 	case "1", "2", "3", "4":
@@ -378,6 +436,25 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.statusKey(k)
 	}
 	return m, nil
+}
+
+// reloadConfig picks up changes of the config file (e.g. a repo added), so
+// the forms offer it without restarting the TUI.
+func (m *Model) reloadConfig() {
+	if m.d.Config == nil || m.d.Config.Path == "" {
+		return
+	}
+	if m.cfgWatch == nil {
+		m.cfgWatch = config.NewWatcher(m.d.Config)
+	}
+	c, err := m.cfgWatch.Check()
+	switch {
+	case err != nil:
+		m.msg = "config vừa sửa bị lỗi, vẫn dùng bản cũ: " + err.Error()
+	case c != nil:
+		m.d.Config = c
+		m.msg = "đã nạp lại config"
+	}
 }
 
 func (m Model) switchTab(t tabID) (tea.Model, tea.Cmd) {
@@ -452,8 +529,9 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if inList && ev.Button == tea.MouseButtonLeft && row >= 0 && row < m.listRows() {
-			if i := m.tasks.offset(m.listRows()) + row; i < len(m.tasks.list) {
-				m.tasks.cursor = i
+			all := m.tasks.rows()
+			if i := m.tasks.rowOffset(all, m.listRows()) + row; i < len(all) && all[i].task >= 0 {
+				m.tasks.cursor = all[i].task
 				m.refreshTaskDetail(false)
 			}
 		}
@@ -727,14 +805,23 @@ func (m Model) footerView() string {
 	keys := ""
 	switch m.tab {
 	case tabTasks:
-		keys = "↑↓ chọn · a duyệt · A duyệt+ghi chú · x từ chối · m nhắn · p PR · o làm tay · n task mới · f lọc"
+		keys = "↑↓ chọn · a duyệt · A duyệt+ghi chú · x từ chối · m nhắn · p PR · h đẩy lên Hasaki Work · o làm tay · v hoạt động · / tìm · e model · c xong · d xoá · n task mới · N task từ prompt · f lọc"
+		if m.tasks.drafting {
+			keys = "Claude đang soạn task từ prompt… · " + keys
+		}
 	case tabHasaki:
-		keys = "↑↓ chọn · Enter giao cho agent · s lọc trạng thái · r tải lại"
+		keys = "↑↓ chọn · Enter giao cho agent · n tạo subtask · s lọc trạng thái · r tải lại"
 	case tabLogs:
 		if m.logs.env == envQC {
 			keys = "e Production · ←/→ project · ↑↓ app · Enter log · / lọc · t thời gian · o Argo CD · S sync · r tải lại"
 		} else {
-			keys = "e QC · ←/→ project · ↑↓ chọn · Enter chạy · / tìm tự do · t thời gian · o Splunk Web · c copy · i kiến thức"
+			keys = "e QC · ←/→ project · ↑↓ chọn · Enter chạy · g nhóm lỗi · n điều tra · / tìm theo điều kiện · a hỏi bằng lời · t/T thời gian · o Splunk Web · c copy · i kiến thức"
+			if m.logs.groupsFocus {
+				keys = "nhóm lỗi: ↑↓ chọn · Enter xem log · n điều tra · f sửa ngay · s chỉ service này · t thời gian · r chạy lại · esc về danh sách"
+			}
+			if m.logs.generating {
+				keys = "Claude đang viết SPL… · " + keys
+			}
 			if m.logs.running {
 				keys = "đang tìm trên Splunk… · " + keys
 			}
@@ -742,7 +829,10 @@ func (m Model) footerView() string {
 	case tabStatus:
 		keys = "l Hasaki · s/S Splunk (S: tạo token) · a Argo CD · t dán token · b Bitbucket · d doctor · r làm mới"
 	}
-	keys += " · 1-4 tab · : lệnh · ? trợ giúp · q thoát"
+	keys += " · 1-4 tab · : lệnh · F2 bôi đen · ? trợ giúp · q thoát"
+	if m.mouseOff {
+		keys = "[chuột: bôi đen, F2 tắt] · " + keys
+	}
 	if m.msg != "" {
 		return truncate(accentStyle.Render(m.msg)+"   "+dimStyle.Render(keys), m.width+40)
 	}
@@ -753,21 +843,34 @@ func (m Model) helpView() string {
 	h := `taskpilot — làm mọi thứ bằng phím hoặc chuột
 
 Chung      1 2 3 4 / Tab: đổi tab (hoặc click tên tab) · : gõ lệnh taskpilot bất kỳ
+           F2 bật/tắt chuột trong TUI: tắt để kéo bôi đen và copy (hoặc giữ Shift khi kéo)
            ? trợ giúp · q thoát
 
 Tasks      ↑↓ / click: chọn task · cuộn chuột bên phải: đọc plan/diff dài
            a duyệt yêu cầu đang chờ · A duyệt kèm ghi chú · x từ chối kèm nhận xét
-           m nhắn agent (task đang dừng) · p mở PR / trang tạo PR
+           m nhắn agent (task đang dừng) · p mở PR / trang tạo PR · v mở/thu gọn Hoạt động
+           h tạo task trên Hasaki Work từ task này: chọn dự án + nhập tên, EPIC (DEV / Improve / Issue Production)
+             và sprint hiện tại được điền tự động, task giao cho bạn
            o làm tay trong session của agent · n tạo task mới · f chỉ hiện task cần bạn
+           / tìm task (theo id, tên, project, nhánh, ticket; gõ không dấu được) · Esc xoá bộ lọc
+           e chọn model/effort cho task (ghim, hoặc để agent tự chọn sau khi đánh giá task)
+           c đánh dấu task xong bằng tay (kèm ghi chú) · d xoá task (hỏi lại trước; xoá cả workspace, giữ nhánh git và PR)
+           danh sách chia hai nhóm: Đang làm ở trên, Đã xong ở dưới
+           N tạo task từ prompt: mô tả bằng lời, Claude điền project/repo/tiêu đề/mô tả để bạn sửa rồi gửi
 
 Hasaki     ↑↓ / click: chọn task · Enter (hoặc click lần 2): giao cho agent
+           n tạo subtask dưới task đang chọn (mỗi dòng một subtask, cùng dự án + sprint, giao cho bạn)
            s đổi bộ lọc (đang mở / chờ duyệt / đã xong) · r tải lại
 
 Logs       e đổi môi trường: QC (Argo CD, cả 3 project) ↔ Production (Splunk, bom + payment)
   QC       ←/→ project · ↑↓ app · Enter xem log pod · / lọc · t khoảng thời gian
            o mở app trên Argo CD · S sync (hỏi xác nhận) · r tải lại trạng thái
-  Prod     ←/→ project · ↑↓ truy vấn · Enter chạy (hỏi tham số) · / tìm tự do · t thời gian
-           o mở trên Splunk Web · c copy SPL · i kiến thức log production
+  Prod     ←/→ project · ↑↓ truy vấn · Enter chạy (hỏi tham số) · t/T thời gian (15 phút … hôm nay, hôm qua, 7 ngày)
+           g nhóm lỗi theo service: ↑↓ chọn nhóm · Enter xem log · n tạo task điều tra · f tạo task sửa ngay · s chỉ service đó
+           n điều tra sự cố: từ nhóm lỗi, từ kết quả tìm log, hoặc từ mô tả triệu chứng (mục 🔎) — agent tìm nguyên nhân gốc
+             trên Splunk + code + DB QC, báo cáo ở cổng plan, chỉ sửa khi bạn duyệt
+           / tìm theo điều kiện (service, mức, chuỗi, request_id → tự sinh SPL) · a hỏi bằng lời (Claude viết SPL)
+           o mở trên Splunk Web · c copy SPL · r chạy lại · i kiến thức log production
 
 Status     l đăng nhập Hasaki Work · s đăng nhập Splunk · S đăng nhập + tạo token Splunk · t dán JWT · b lưu token Bitbucket · d doctor
            : splunk search "<SPL>" -earliest -1h   tự tìm log

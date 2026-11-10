@@ -130,6 +130,30 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	return json.Unmarshal(env.Data, out)
 }
 
+// GetRaw GETs path and returns the data of the response, for exploring the API.
+func (c *Client) GetRaw(ctx context.Context, path string, query url.Values) (json.RawMessage, error) {
+	var out json.RawMessage
+	err := c.do(ctx, http.MethodGet, path, query, nil, "", &out)
+	return out, err
+}
+
+// FlexInt is an integer the API sends as a number, a string or null.
+type FlexInt int64
+
+func (f *FlexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("not an integer: %s", b)
+	}
+	*f = FlexInt(n)
+	return nil
+}
+
 // Ref is a small {id, name, code} reference.
 type Ref struct {
 	ID   int64  `json:"id"`
@@ -156,6 +180,7 @@ type Task struct {
 	Type         int     `json:"type"`
 	ProjectID    int64   `json:"prid"`
 	ParentID     int64   `json:"parent_id"`
+	MilestoneID  FlexInt `json:"milestone_id"`
 	DateStart    string  `json:"date_start"`
 	DateEnd      string  `json:"date_end"`
 	PlannedHours float64 `json:"planned_hours"`
@@ -174,17 +199,23 @@ type Profile struct {
 	ID    int64  `json:"id"`
 	Name  string `json:"name"`
 	Email string `json:"email"`
+	// StaffID identifies the user as an assignee (staff_info.staff_id).
+	StaffID int64 `json:"-"`
 }
 
 // Profile returns the current user.
 func (c *Client) Profile(ctx context.Context) (*Profile, error) {
 	var out struct {
-		Profile Profile `json:"profile"`
+		Profile   Profile `json:"profile"`
+		StaffInfo struct {
+			StaffID int64 `json:"staff_id"`
+		} `json:"staff_info"`
 	}
 	err := c.do(ctx, http.MethodGet, "setting/user/profile", url.Values{"employee": {"1"}}, nil, "", &out)
 	if err != nil {
 		return nil, err
 	}
+	out.Profile.StaffID = out.StaffInfo.StaffID
 	return &out.Profile, nil
 }
 
@@ -272,4 +303,64 @@ func (c *Client) AddComment(ctx context.Context, userID, taskID int64, text stri
 		return err
 	}
 	return c.do(ctx, http.MethodPost, "v2/task/comment", nil, &buf, w.FormDataContentType(), nil)
+}
+
+// NewTask is the payload of upsert-task-input for a new task, as the web app
+// sends it. Assignees are set afterwards (AssignStaff).
+type NewTask struct {
+	Name        string
+	Note        string // description (markdown); empty: none
+	ProjectID   int64  // prid
+	ParentID    int64  // usually the EPIC; 0: none
+	MilestoneID int64  // sprint; 0: none
+	// PlannedMinutes goes to planned_hours, which the web app fills in minutes (480 = 8h).
+	PlannedMinutes int
+	DateEnd        time.Time // zero: none
+}
+
+// Created identifies a task just created.
+type Created struct {
+	ID   int64  `json:"id"`
+	Code string `json:"code"`
+}
+
+// CreateTask creates a task, unassigned as the web app's create dialog does
+// (no_assign=1; see AssignStaff). This WRITES to Hasaki Work.
+func (c *Client) CreateTask(ctx context.Context, t NewTask) (*Created, error) {
+	if strings.TrimSpace(t.Name) == "" || t.ProjectID == 0 {
+		return nil, errors.New("create task: name and project are required")
+	}
+	p := map[string]any{
+		"id":            0,
+		"name":          strings.TrimSpace(t.Name),
+		"prid":          t.ProjectID,
+		"no_assign":     1,
+		"sub_type":      0,
+		"planned_hours": t.PlannedMinutes,
+	}
+	if t.ParentID != 0 {
+		p["parent_id"] = t.ParentID
+	}
+	if t.MilestoneID != 0 {
+		p["milestone_id"] = t.MilestoneID
+	}
+	if n := strings.TrimSpace(t.Note); n != "" {
+		p["note"] = n
+	}
+	if !t.DateEnd.IsZero() {
+		p["date_end"] = t.DateEnd.Format("2006-01-02") + " 00:00:00"
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	// data is the new task; only id and code are read (planned_hours comes back as a string).
+	var out Created
+	if err := c.do(ctx, http.MethodPost, "hr/projects/upsert-task-input/0", nil, bytes.NewReader(body), "application/json", &out); err != nil {
+		return nil, err
+	}
+	if out.ID == 0 || out.Code == "" {
+		return nil, fmt.Errorf("create task: response has no id/code (id=%d code=%q)", out.ID, out.Code)
+	}
+	return &out, nil
 }

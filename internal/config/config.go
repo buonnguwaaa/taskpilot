@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -43,14 +44,30 @@ type Config struct {
 
 // Claude controls how headless Claude Code sessions are launched.
 type Claude struct {
-	Bin            string   `yaml:"bin"`
-	Model          string   `yaml:"model"`
-	Effort         string   `yaml:"effort"`
+	Bin string `yaml:"bin"`
+	// Model and Effort run a task until the agent picks its own execution
+	// profile (MCP tool set_execution_profile, after assessing the task), and
+	// whenever the operator has not pinned one. Empty: Claude Code's default.
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
+	// Models are the models the agent may pick for itself (aliases such as
+	// fable, opus, sonnet, haiku, or full names). Default: fable, opus, sonnet.
+	Models []string `yaml:"models"`
+	// MaxBudgetUSD caps the cost of one run; 0 (the default) means no cap.
 	MaxBudgetUSD   float64  `yaml:"max_budget_usd"`
 	PermissionMode string   `yaml:"permission_mode"`
 	SettingSources string   `yaml:"setting_sources"`
 	ExtraArgs      []string `yaml:"extra_args"`
 }
+
+// Efforts are the effort levels Claude Code accepts, lowest first.
+var Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+// ValidEffort reports whether e is an effort level Claude Code accepts.
+func ValidEffort(e string) bool { return slices.Contains(Efforts, e) }
+
+// AllowsModel reports whether the agent may pick model m.
+func (c Claude) AllowsModel(m string) bool { return slices.Contains(c.Models, m) }
 
 // HasakiWork configures the Hasaki Work integration.
 type HasakiWork struct {
@@ -173,6 +190,40 @@ type Project struct {
 	LogsProduction *ProdLogs `yaml:"logs_production"`
 	// ArgoCD links the project to its QC applications.
 	ArgoCD ProjectArgo `yaml:"argocd"`
+	// QCDB gives agents read-only access to the project's QC database (MCP
+	// tool db_query). Nil: no database access.
+	QCDB *QCDB `yaml:"qc_db"`
+}
+
+// QCDB locates the credentials of a project's QC database (MySQL). They are
+// read when a query runs, from a file the project's repos keep, or — with no
+// file — from the secret store (`taskpilot auth set-db PROJECT`).
+type QCDB struct {
+	// File holds the credentials: a KEY=VALUE env file (with Env) or a YAML
+	// config (with YAML).
+	File string `yaml:"file"`
+	// Env is the key whose value is a MySQL DSN (user:pass@tcp(host:3306)/db).
+	Env string `yaml:"env"`
+	// YAML gives the dotted key paths of the connection fields.
+	YAML *QCDBYAML `yaml:"yaml"`
+	// Database overrides the schema of the DSN.
+	Database string `yaml:"database"`
+	// MaxRows caps the rows returned per query (default 200, at most 1000).
+	MaxRows int `yaml:"max_rows"`
+	// Timeout bounds a query (default 30s).
+	Timeout time.Duration `yaml:"timeout"`
+	// Notes are shown to the agent with the tool (e.g. main tables).
+	Notes string `yaml:"notes"`
+}
+
+// QCDBYAML gives the dotted key paths of a YAML config's connection fields,
+// e.g. host: MySql.MySqlHost.
+type QCDBYAML struct {
+	Host     string `yaml:"host"`
+	Port     string `yaml:"port"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	Database string `yaml:"database"`
 }
 
 // ProdLogs describes where a project's production logs are and the saved
@@ -276,8 +327,8 @@ func (c *Config) applyDefaults() {
 	if c.Claude.PermissionMode == "" {
 		c.Claude.PermissionMode = "dontAsk"
 	}
-	if c.Claude.MaxBudgetUSD == 0 {
-		c.Claude.MaxBudgetUSD = 2
+	if len(c.Claude.Models) == 0 {
+		c.Claude.Models = []string{"fable", "opus", "sonnet"}
 	}
 	if c.Daemon.Concurrency <= 0 {
 		c.Daemon.Concurrency = 2
@@ -366,6 +417,16 @@ func (c *Config) applyDefaults() {
 		}
 		for i, f := range p.ContextFiles {
 			p.ContextFiles[i] = ExpandHome(f)
+		}
+		if q := p.QCDB; q != nil {
+			q.File = ExpandHome(q.File)
+			if q.MaxRows <= 0 {
+				q.MaxRows = 200
+			}
+			q.MaxRows = min(q.MaxRows, 1000)
+			if q.Timeout <= 0 {
+				q.Timeout = 30 * time.Second
+			}
 		}
 		for name, r := range p.Repos {
 			r.Path = ExpandHome(r.Path)
@@ -553,6 +614,10 @@ func (r Repo) Stage(target string) (PRStage, bool) {
 func (p Project) AllowedToolList() []string {
 	tools := []string{
 		"Read", "Glob", "Grep", "Edit", "Write", "MultiEdit", "Skill", "TodoWrite",
+		// Subagents (the taskpilot:* agents of the plugin, or general ones); the
+		// workflow skill says when to use them. Their tool calls go through the
+		// same allowlist and gate hook.
+		"Agent",
 		"Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
 		"Bash(git add*)", "Bash(git commit*)", "Bash(git push*)", "Bash(git rev-parse*)",
 		"Bash(git -C *)", "Bash(cd *)", "Bash(ls*)", "Bash(rg *)",

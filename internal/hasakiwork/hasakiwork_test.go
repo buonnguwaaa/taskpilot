@@ -193,3 +193,45 @@ func TestClient(t *testing.T) {
 		t.Fatalf("blacklisted token must map to ErrUnauthorized, got %v (path %s)", err, lastPath)
 	}
 }
+
+func TestCreateTask(t *testing.T) {
+	var got map[string]any
+	var ctype string
+	// Captured from the real API (2026-11-10).
+	resp := `{"message":"Success","status":1,"code":200,"data":{"progress":0,"status":0,"prid":7771,"planned_hours":"480","reality_hours":0,` +
+		`"name":"[BE] Scaffolding","parent_id":10297623,"milestone_id":10297539,"sub_type":0,"date_end":"2026-11-30 00:00:00","type":1,` +
+		`"created_by":43149,"data":{"require_virtual_configs":true},"code":"HSK-E8HL95JP","tz":null,"id":14556670,"assign_to_user":[],"staff":[]}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/hr/projects/upsert-task-input/0" {
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		ctype = r.Header.Get("Content-Type")
+		json.NewDecoder(r.Body).Decode(&got)
+		io.WriteString(w, resp)
+	}))
+	defer srv.Close()
+	c := NewClient(staticToken("tok"))
+	c.BaseURL = srv.URL + "/api"
+	created, err := c.CreateTask(context.Background(), NewTask{
+		Name: " [BE] Scaffolding ", ProjectID: 7771, ParentID: 10297623, MilestoneID: 10297539,
+		PlannedMinutes: 480, DateEnd: time.Date(2026, 11, 30, 15, 0, 0, 0, time.Local), Note: " mô tả ",
+	})
+	if err != nil || created.ID != 14556670 || created.Code != "HSK-E8HL95JP" {
+		t.Fatalf("created=%+v err=%v", created, err)
+	}
+	want := map[string]any{"id": 0.0, "name": "[BE] Scaffolding", "prid": 7771.0, "parent_id": 10297623.0, "milestone_id": 10297539.0,
+		"planned_hours": 480.0, "no_assign": 1.0, "sub_type": 0.0, "date_end": "2026-11-30 00:00:00", "note": "mô tả"}
+	if ctype != "application/json" || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("payload = %v (%s)", got, ctype)
+	}
+
+	resp = `{"status":1,"code":200,"message":"Success","data":{"id":5}}`
+	if _, err := c.CreateTask(context.Background(), NewTask{Name: "n", ProjectID: 1}); err == nil {
+		t.Error("a response without code must fail")
+	}
+	if _, err := c.CreateTask(context.Background(), NewTask{Name: "n"}); err == nil {
+		t.Error("project is required")
+	}
+}

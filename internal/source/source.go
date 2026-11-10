@@ -128,3 +128,15 @@ func sanitize(id string) string {
 		return r
 	}, filepath.Base(id))
 }
+
+// Remove deletes a ticket (and its report log) from the mock inbox, so the
+// daemon does not pick it up again once its task is deleted. A missing ticket
+// is not an error.
+func (m *Mock) Remove(ticketID string) error {
+	for _, ext := range []string{".json", ".log"} {
+		if err := os.Remove(filepath.Join(m.Dir, sanitize(ticketID)+ext)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}

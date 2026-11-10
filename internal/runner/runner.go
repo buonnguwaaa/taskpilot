@@ -21,11 +21,21 @@ import (
 
 // Runner holds what every run needs.
 type Runner struct {
-	Config    *config.Config
+	Config *config.Config
+	// Conf, when set, returns the current config (the daemon reloads it when
+	// the file changes); Config is used otherwise.
+	Conf      func() *config.Config
 	Store     *store.Store
 	PluginDir string
 	// Exe is the taskpilot binary, used for the MCP server and the hook.
 	Exe string
+}
+
+func (r *Runner) cfg() *config.Config {
+	if r.Conf != nil {
+		return r.Conf()
+	}
+	return r.Config
 }
 
 // Result summarizes one run.
@@ -51,7 +61,7 @@ Follow the taskpilot:workflow skill for the whole task. Talk to the operator onl
 // Run executes one turn: a fresh session with the initial prompt, or a resume
 // of t.SessionID with prompt. Stdout events are appended to the task's event log.
 func (r *Runner) Run(ctx context.Context, t *store.Task, prompt string, resume bool) (*Result, error) {
-	proj, ok := r.Config.Projects[t.Project]
+	proj, ok := r.cfg().Projects[t.Project]
 	if !ok {
 		return nil, fmt.Errorf("unknown project %q", t.Project)
 	}
@@ -59,7 +69,7 @@ func (r *Runner) Run(ctx context.Context, t *store.Task, prompt string, resume b
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, r.Config.Claude.Bin, args...)
+	cmd := exec.CommandContext(ctx, r.cfg().Claude.Bin, args...)
 	cmd.Dir = t.Workspace
 	// Own process group: on stop, SIGTERM reaches claude and everything it
 	// started (Bash tool commands, MCP servers) so nothing is orphaned and
@@ -70,7 +80,7 @@ func (r *Runner) Run(ctx context.Context, t *store.Task, prompt string, resume b
 	cmd.Env = append(os.Environ(),
 		"TASKPILOT_HOME="+r.Store.Home,
 		"TASKPILOT_TASK_ID="+t.ID,
-		"TASKPILOT_CONFIG="+r.Config.Path,
+		"TASKPILOT_CONFIG="+r.cfg().Path,
 	)
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -95,7 +105,7 @@ func (r *Runner) Run(ctx context.Context, t *store.Task, prompt string, resume b
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start %s: %w", r.Config.Claude.Bin, err)
+		return nil, fmt.Errorf("start %s: %w", r.cfg().Claude.Bin, err)
 	}
 	res := &Result{SessionID: t.SessionID}
 	tc := &toolCalls{byID: map[string]int{}}
@@ -119,10 +129,30 @@ func (r *Runner) Run(ctx context.Context, t *store.Task, prompt string, resume b
 	return res, nil
 }
 
+// Profile is the model and effort the task's next run uses: the task's own
+// profile (picked by the agent or pinned by the operator) over the config
+// default, field by field.
+func (r *Runner) Profile(t *store.Task) (model, effort string) {
+	c := r.cfg().Claude
+	model, effort = c.Model, c.Effort
+	if r.Store == nil {
+		return model, effort
+	}
+	if p, err := r.Store.TaskProfile(t.ID); err == nil && p != nil {
+		if p.Model != "" {
+			model = p.Model
+		}
+		if p.Effort != "" {
+			effort = p.Effort
+		}
+	}
+	return model, effort
+}
+
 // Args builds the claude command line. The prompt is passed on stdin, so no
 // positional argument can be swallowed by a variadic flag.
 func (r *Runner) Args(t *store.Task, proj config.Project, resume bool) ([]string, error) {
-	c := r.Config.Claude
+	c := r.cfg().Claude
 	mcpCfg, err := r.mcpConfig(t, proj)
 	if err != nil {
 		return nil, err
@@ -141,15 +171,18 @@ func (r *Runner) Args(t *store.Task, proj config.Project, resume bool) ([]string
 		"--settings", settings,
 		"--strict-mcp-config",
 		"--mcp-config", mcpCfg,
-		"--append-system-prompt", fmt.Sprintf(systemContract, r.Config.OperatorLanguage),
-		"--max-budget-usd", fmt.Sprintf("%.2f", c.MaxBudgetUSD),
+		"--append-system-prompt", fmt.Sprintf(systemContract, r.cfg().OperatorLanguage),
 		"--name", "taskpilot " + t.ID,
 	}
-	if c.Model != "" {
-		args = append(args, "--model", c.Model)
+	if c.MaxBudgetUSD > 0 { // no cap unless the operator sets one
+		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", c.MaxBudgetUSD))
 	}
-	if c.Effort != "" {
-		args = append(args, "--effort", c.Effort)
+	model, effort := r.Profile(t)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
 	}
 	if c.SettingSources != "" {
 		args = append(args, "--setting-sources", c.SettingSources)
@@ -169,7 +202,7 @@ func (r *Runner) mcpConfig(t *store.Task, proj config.Project) (string, error) {
 	servers := map[string]config.MCPServer{
 		"taskpilot": {
 			Command: r.Exe,
-			Args:    []string{"mcp", "--config", r.Config.Path, "--task", t.ID},
+			Args:    []string{"mcp", "--config", r.cfg().Path, "--task", t.ID},
 		},
 	}
 	for name, s := range proj.MCPServers {
@@ -180,7 +213,7 @@ func (r *Runner) mcpConfig(t *store.Task, proj config.Project) (string, error) {
 }
 
 func (r *Runner) settings(t *store.Task) (string, error) {
-	hookCmd := shellQuote(r.Exe) + " hook --config " + shellQuote(r.Config.Path) + " --task " + shellQuote(t.ID)
+	hookCmd := shellQuote(r.Exe) + " hook --config " + shellQuote(r.cfg().Path) + " --task " + shellQuote(t.ID)
 	s := map[string]any{
 		"hooks": map[string]any{
 			"PreToolUse": []any{

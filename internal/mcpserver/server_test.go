@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -449,5 +450,71 @@ func TestQCToolsAreScopedToTheProject(t *testing.T) {
 	out, err = h.QCLogs(ctx, QCLogsIn{App: "bom-api-qc", Filter: "MO-1", Tail: 10000})
 	if err != nil || !strings.Contains(out, "boom MO-1") {
 		t.Fatalf("qc_logs: %q %v", out, err)
+	}
+}
+
+func TestDBQueryGuards(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	for _, id := range []string{"mock-db", "mock-nodb"} {
+		tk := &store.Task{ID: id, Project: map[string]string{"mock-db": "payment", "mock-nodb": "plm"}[id]}
+		tk.Transition(store.StateRunning, "")
+		st.SaveTask(tk)
+	}
+	asked := 0
+	cfg := &config.Config{Projects: map[string]config.Project{
+		"payment": {Name: "Payment", QCDB: &config.QCDB{MaxRows: 10, Timeout: time.Second}},
+		"plm":     {Name: "PLM"},
+	}}
+	secret := func(context.Context, string) (string, error) { asked++; return "", errors.New("no DSN") }
+	ctx := context.Background()
+
+	h := &Handlers{Store: st, Config: cfg, TaskID: "mock-nodb", Secret: secret}
+	if _, err := h.DBQuery(ctx, DBQueryIn{SQL: "SELECT 1"}); err == nil || !strings.Contains(err.Error(), "no QC database") {
+		t.Fatalf("project without qc_db: %v", err)
+	}
+	h.TaskID = "mock-db"
+	if _, err := h.DBQuery(ctx, DBQueryIn{SQL: "DELETE FROM transactions"}); err == nil || asked != 0 {
+		t.Fatalf("a write must be refused before any credential is read: %v (asked %d)", err, asked)
+	}
+	if _, err := h.DBQuery(ctx, DBQueryIn{SQL: "SELECT 1"}); err == nil || asked != 1 {
+		t.Fatalf("missing DSN must fail: %v", err)
+	}
+}
+
+func TestSetExecutionProfile(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-x", Project: "payment"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	cfg := &config.Config{
+		Claude:   config.Claude{Model: "sonnet", Models: []string{"fable", "opus", "sonnet"}},
+		Projects: map[string]config.Project{"payment": {Name: "Payment"}},
+	}
+	h := &Handlers{Store: st, Config: cfg, TaskID: "mock-x"}
+
+	for _, bad := range []SetProfileIn{
+		{Model: "haiku", Effort: "high", Reason: "r"},
+		{Model: "opus", Effort: "turbo", Reason: "r"},
+		{Model: "opus", Effort: "high"},
+	} {
+		if _, err := h.SetExecutionProfile(bad); err == nil {
+			t.Errorf("%+v accepted", bad)
+		}
+	}
+	out, err := h.SetExecutionProfile(SetProfileIn{Model: "opus", Effort: "HIGH", Reason: "new service, long spec"})
+	if err != nil || !strings.Contains(out, "next run") {
+		t.Fatalf("%q %v", out, err)
+	}
+	info, _ := h.TaskInfo()
+	if !strings.Contains(info, `"current_model": "opus"`) || !strings.Contains(info, `"set_by": "agent"`) || !strings.Contains(info, "fable") {
+		t.Fatalf("task_info must show the profile:\n%s", info)
+	}
+	st.SetTaskProfile("mock-x", &store.Profile{Model: "sonnet", Effort: "low", SetBy: "operator"})
+	out, err = h.SetExecutionProfile(SetProfileIn{Model: "fable", Effort: "max", Reason: "r"})
+	if err != nil || !strings.Contains(out, "pinned") {
+		t.Fatalf("pinned: %q %v", out, err)
+	}
+	if p, _ := st.TaskProfile("mock-x"); p.Model != "sonnet" {
+		t.Fatal("the pinned profile must stay")
 	}
 }

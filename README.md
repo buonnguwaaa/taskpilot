@@ -75,9 +75,10 @@ taskpilot                    # mở TUI; daemon chạy bên trong, không cần 
 
 | Tab | Làm gì |
 |---|---|
-| **1 Tasks** | Task của agent. `a` duyệt, `A` duyệt kèm ghi chú, `x` từ chối kèm nhận xét, `m` nhắn agent, `p` mở PR, `o` tự làm trong session của agent, `n` tạo task mới bằng form, `f` chỉ hiện task cần bạn |
-| **2 Hasaki Work** | Task của bạn trên Hasaki Work, kèm phạm vi (bom/plm/payment) và mô tả. **Enter** (hoặc click lần hai) mở form giao cho agent: chọn project, repo bắt đầu, ghi chú. `s` đổi bộ lọc |
-| **3 Logs** | Bấm `e` để đổi môi trường. **QC · Argo CD** (cả bom, payment, plm): danh sách app kèm health và sync, revision, image; Enter xem log pod, `/` lọc, `t` khoảng thời gian, `o` mở trên Argo CD, `S` sync (hỏi xác nhận). **Production · Splunk** (bom, payment; PLM không có log prod): truy vấn có sẵn (hỏi tham số), `/` tìm tự do, `t` thời gian, `o` Splunk Web, `c` copy SPL, `i` kiến thức log của project |
+| (mọi tab) | `F2` bật/tắt chuột trong TUI: tắt để kéo bôi đen và copy (hoặc giữ Shift khi kéo) |
+| **1 Tasks** | Task của agent. `a` duyệt, `A` duyệt kèm ghi chú, `x` từ chối kèm nhận xét, `m` nhắn agent, `p` mở PR, `h` tạo task trên Hasaki Work từ task đã làm (tự chọn EPIC DEV / Improve / Issue Production + sprint của dự án, giao cho bạn), `v` mở/thu gọn Hoạt động, `o` tự làm trong session của agent, `n` tạo task mới bằng form, `N` tạo task từ prompt (mô tả bằng lời, Claude điền form), `f` chỉ hiện task cần bạn, `/` tìm task, `c` đánh dấu xong, `d` xoá task. Danh sách chia hai nhóm: Đang làm ở trên, Đã xong ở dưới |
+| **2 Hasaki Work** | `n` tạo subtask dưới task đang chọn (mỗi dòng một subtask, cùng dự án và sprint, giao cho bạn). Task của bạn trên Hasaki Work, kèm phạm vi (bom/plm/payment) và mô tả. **Enter** (hoặc click lần hai) mở form giao cho agent: chọn project, repo bắt đầu, ghi chú. `s` đổi bộ lọc |
+| **3 Logs** | Bấm `e` để đổi môi trường. **QC · Argo CD** (cả bom, payment, plm): danh sách app kèm health và sync, revision, image; Enter xem log pod, `/` lọc, `t` khoảng thời gian, `o` mở trên Argo CD, `S` sync (hỏi xác nhận). **Production · Splunk** (bom, payment; PLM không có log prod): `g` nhóm lỗi, `n` tạo task điều tra sự cố, truy vấn có sẵn (hỏi tham số), `/` tìm theo điều kiện, `a` hỏi bằng lời, `t` thời gian, `o` Splunk Web, `c` copy SPL, `i` kiến thức log của project |
 | **4 Status** | Đăng nhập (`l` đăng nhập Hasaki Work, `t` dán JWT, `b` lưu token Bitbucket), `d` chạy doctor, log của daemon |
 
 - **Chuột:** click tên tab, click dòng để chọn, cuộn để đọc plan hoặc diff dài.
@@ -142,6 +143,62 @@ Tạo ticket thử (khi dùng mock source):
 ```bash
 taskpilot submit -project bom -title "…" -body "$(taskpilot hw show 14352972)"
 taskpilot submit -project bom -repo bom-api -title "…"   # -repo: mở sẵn một repo
+taskpilot submit -prompt "export MO bị timeout khi >10k dòng"   # Claude soạn ticket, in ra, hỏi y/N
+echo "…" | taskpilot submit -prompt - -yes                      # đọc yêu cầu từ stdin, gửi luôn
+```
+
+**Tạo task từ prompt** (`N` trong TUI, `submit -prompt` ở CLI): một lượt `claude -p`
+ngắn, **không có tool** và không lưu session, đọc yêu cầu cùng danh sách project và repo
+(kèm `description` của repo) rồi trả về project, repo bắt đầu, tiêu đề và mô tả. Project
+hoặc repo không có trong config sẽ bị bỏ trống để bạn tự chọn. Yêu cầu gốc luôn được
+giữ nguyên ở cuối mô tả. Không có gì vào inbox cho tới khi bạn xác nhận. Các flag
+`-project`, `-repo`, `-title`, `-body` truyền kèm sẽ ghi đè bản nháp.
+
+### Log production (tab 3 → `e` Production)
+
+- **`g` Nhóm lỗi theo service**: đếm lỗi của mọi service, gộp các thông điệp giống nhau (số, mã, UUID được che) thành
+  một nhóm, nhiều nhất trước. Chọn nhóm để xem caller, prefix, request_id, stacktrace; `Enter` xem log của nhóm
+  (lọc theo `caller` + cụm từ cố định), `n` tạo **task điều tra** (xem dưới), `f` tạo task sửa ngay (dự án, repo trùng
+  tên service, tiêu đề, mô tả có bằng chứng và SPL), `s` gom lại chỉ cho service đó.
+- **`n` Điều tra sự cố production**: từ một nhóm lỗi, từ kết quả tìm log đang xem, hoặc từ mục **🔎 Điều tra sự cố…**
+  (mô tả triệu chứng khách / vận hành báo, mã đơn / giao dịch, khoảng thời gian). Taskpilot mở form task mới điền sẵn
+  ticket điều tra: bằng chứng ban đầu, khoảng thời gian chốt thành **mốc tuyệt đối** (agent chạy sau vẫn tìm đúng chỗ) và
+  việc phải giao. Agent dựng diễn biến từ log, lần theo request qua các service, đọc code tại caller, xem thay đổi gần
+  đây, kiểm tra dữ liệu trên DB QC, rồi gửi **báo cáo nguyên nhân gốc + ảnh hưởng + đề xuất sửa ở cổng `plan`**; chỉ sửa
+  code khi bạn duyệt. Không cần sửa code (lỗi đối tác, dữ liệu, cấu hình) thì agent kết thúc bằng báo cáo.
+- **`/` Tìm theo điều kiện**: chọn service, mức (error / warn+error / mọi mức), chuỗi cần tìm, request_id, bỏ log nhiễu;
+  SPL được tự sinh (hoặc tự viết vào ô SPL).
+- **`a` Hỏi bằng lời**: Claude (không có tool) đọc tài liệu log của dự án và viết SPL + khoảng thời gian; bạn xem, sửa
+  rồi mới chạy. SPL luôn qua bộ kiểm tra chỉ-đọc, bộ lọc prod được thêm khi chạy.
+- **`t`/`T` thời gian**: theo truy vấn, 15 phút, 1 giờ, 4 giờ, 24 giờ, hôm nay, hôm qua, 7 ngày.
+- Truy vấn thống kê (`stats`, `top`…) hiện thành bảng — trước đây chúng luôn trả 0 dòng.
+
+### DB QC (chỉ đọc)
+
+Agent có tool `db_query` để đọc DB QC (MySQL/MariaDB) của dự án khi debug hoặc kiểm tra dữ liệu sau khi deploy QC.
+Thông tin đăng nhập không bao giờ tới tay agent: taskpilot đọc nó lúc chạy query, từ file mà repo đã có
+(`qc_db.file` + `env` cho file KEY=VALUE, hoặc `yaml` cho file YAML), hoặc từ kho secret (`taskpilot auth set-db PROJECT`).
+
+- Chỉ nhận một câu `SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN`; session và transaction đều READ ONLY, server tự ngắt
+  query quá `timeout` (mặc định 30s), tối đa `max_rows` dòng (mặc định 200).
+- Mọi query của agent được ghi vào bảng `db_queries` (target, câu SQL, số dòng, lỗi).
+
+```yaml
+projects:
+  payment:
+    qc_db: {file: ~/repos/bitbucket/payment/payment/build/.base.env, env: DB_DATA_SOURCE}
+  bom:
+    qc_db:
+      file: ~/repos/bitbucket/BOM/bom-api/config/local.yml
+      yaml: {host: MySql.MySqlHost, port: MySql.MySqlPort, user: MySql.MySqlUser, password: MySql.MySqlPassword, database: MySql.MySqlDbname}
+  plm:
+    qc_db: {}          # DSN trong kho secret: taskpilot auth set-db plm
+```
+
+```bash
+taskpilot qcdb list                                   # DB QC của từng dự án (không in mật khẩu)
+taskpilot qcdb query bom "SHOW TABLES"                # tự query thử, cùng giới hạn như agent
+taskpilot auth set-db plm                             # dán DSN user:pass@tcp(host:3306)/db (không hiện ký tự)
 ```
 
 ### Hasaki Work
@@ -235,6 +292,18 @@ cách điều tra) nằm trong skill `prod-logs`
 log; trong TUI bấm `i` để đọc cùng nội dung đó. Project có `no_logs: true` (PLM)
 thì agent không được tìm Splunk. `taskpilot doctor` kiểm tra mọi truy vấn có sẵn.
 
+### Đính kèm tệp khi nhắn agent
+
+Trong mọi ô gõ cho agent (tạo task `n`/`N`, nhắn `m`, duyệt/từ chối kèm ghi chú `A`/`x`, giao task Hasaki Work):
+
+- **Ctrl+O** mở bộ chọn tệp (mặc định ở thư mục Downloads của Windows), Enter để chèn tham chiếu; hoặc
+- gõ **`@đường/dẫn`**, `@"đường dẫn có dấu cách"`, hay kéo-thả tệp từ Explorer sau dấu `@` (`@C:\Users\…` được đổi sang `/mnt/c/…`).
+
+Khi gửi, tệp được chép vào `~/.taskpilot/refs/<task>/` và tin nhắn có thêm mục "Tệp đính kèm" để agent đọc bằng Read
+(text, PDF, ảnh). Tệp không tồn tại hoặc là thư mục bị báo lỗi ngay trong form, chưa gửi gì. `@team` hay email không
+bị coi là tệp. CLI cũng nhận `@tệp` trong `submit -body`, `message -text`, `approve/reject -comment`. Xoá task thì xoá
+luôn các bản chép.
+
 ### Phím tắt trong TUI
 
 | Phím | Tác dụng |
@@ -244,6 +313,13 @@ thì agent không được tìm Splunk. `taskpilot doctor` kiểm tra mọi truy
 | `x` | từ chối kèm nhận xét (agent sửa lại rồi xin duyệt lại) |
 | `m` | gửi message để chạy tiếp task `needs_attention`, `failed` hoặc `done` |
 | `o` | take over: mở `claude --resume <session>` trong worktree; daemon tạm dừng task này |
+| `n` | tạo task mới bằng form |
+| `h` | task lấy từ Hasaki Work: tạo subtask dưới nó (như `n` ở tab 2). Task tạo trong taskpilot: tạo task trên Hasaki Work từ task đang chọn: chọn dự án, nhập tên; EPIC (DEV / Improve / Issue Production, đoán theo tiêu đề) và sprint hiện tại được điền tự động, mô tả lấy từ tóm tắt hoàn thành, task giao cho bạn. Ghi thật lên Hasaki Work. Đẩy lại task đã đẩy sẽ tạo thêm task mới (form có cảnh báo) |
+| `v` | mở/thu gọn phần Hoạt động |
+| `c` | đánh dấu task xong bằng tay (việc đã làm ngoài agent, hoặc không cần nữa): kèm ghi chú làm tóm tắt hoàn thành; yêu cầu duyệt đang treo được đóng, agent không chạy tiếp |
+| `d` | xoá task (hỏi lại trước): xoá lịch sử, lượt chạy, workspace và ticket trong inbox; giữ nhánh git, PR trên Bitbucket và task trên Hasaki Work. Không xoá được task đang chạy |
+| `/` | tìm task theo id, tên, project, nhánh, ticket (gõ không dấu được, nhiều từ thì phải khớp hết); Enter giữ bộ lọc, Esc xoá |
+| `N` | tạo task từ prompt: gõ yêu cầu bằng lời, Claude chọn project/repo, viết tiêu đề + mô tả + acceptance criteria, rồi mở form điền sẵn để bạn sửa và `Ctrl+S` gửi |
 | `f` | lọc inbox: chỉ hiện task đang cần bạn |
 | `q` | thoát |
 

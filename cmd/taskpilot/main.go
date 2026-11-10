@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -24,8 +26,10 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/daemon"
 	"github.com/buonnguwaaa/taskpilot/internal/gate"
 	"github.com/buonnguwaaa/taskpilot/internal/hook"
+	"github.com/buonnguwaaa/taskpilot/internal/intake"
 	"github.com/buonnguwaaa/taskpilot/internal/mcpserver"
 	"github.com/buonnguwaaa/taskpilot/internal/plugin"
+	"github.com/buonnguwaaa/taskpilot/internal/refs"
 	"github.com/buonnguwaaa/taskpilot/internal/runner"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
@@ -45,6 +49,7 @@ Usage:
   taskpilot tui [-no-daemon]                    same as running taskpilot with no command
   taskpilot list                                print tasks
   taskpilot submit -project P -title T [-repo R] [-body B] [-id ID]   add a ticket to the mock inbox
+  taskpilot submit -prompt "…" [-yes] [-project P] [-repo R]   let Claude draft the ticket from a free-form request
   taskpilot approve TASK [-comment C]           approve the pending request
   taskpilot reject TASK -comment C              reject the pending request
   taskpilot message TASK -text M                resume a stopped task with a message
@@ -65,6 +70,11 @@ Bitbucket:
 Splunk:
   taskpilot auth splunk [-token|-cookie]        log in (Chrome profile) or paste a token / cookie
   taskpilot splunk search "<SPL>" [-earliest -1h] [-project P]   read-only search
+
+QC databases (read-only, agents use the MCP tool db_query):
+  taskpilot auth set-db PROJECT                 store a project's QC DSN (when no repo file has it)
+  taskpilot qcdb list                           where each project's QC database is (no credentials shown)
+  taskpilot qcdb query PROJECT "SELECT …"       run one read-only statement
 
 Argo CD (QC):
   taskpilot auth argocd [-token]                log in (Chrome profile) or paste a token
@@ -126,6 +136,8 @@ func main() {
 		err = cmdArgo(args)
 	case "hw":
 		err = cmdHW(args)
+	case "qcdb":
+		err = cmdQCDB(args)
 	case "mcp":
 		err = cmdMCP(args)
 	case "hook":
@@ -270,6 +282,8 @@ func cmdSubmit(args []string) error {
 	title := c.fs.String("title", "", "ticket title")
 	body := c.fs.String("body", "", "ticket body (acceptance criteria, reproduction, ...)")
 	id := c.fs.String("id", "", "ticket id (default: timestamp)")
+	prompt := c.fs.String("prompt", "", `free-form request; Claude drafts project, repo, title and body ("-": read stdin)`)
+	yes := c.fs.Bool("yes", false, "with -prompt: submit the draft without asking")
 	c.fs.Parse(args)
 	cfg, _, err := c.load()
 	if err != nil {
@@ -277,6 +291,21 @@ func cmdSubmit(args []string) error {
 	}
 	if cfg.Source.Type != "mock" {
 		return fmt.Errorf("submit only works with the mock source (configured: %s)", cfg.Source.Type)
+	}
+	if *prompt != "" {
+		tk, ok, err := draftTicket(cfg, *prompt, *yes)
+		if err != nil || !ok {
+			return err
+		}
+		// Explicit flags win over the draft.
+		for dst, v := range map[*string]string{project: tk.Project, repo: tk.Repo, title: tk.Title, body: tk.Body} {
+			if *dst == "" {
+				*dst = v
+			}
+		}
+		if *project == "" {
+			return fmt.Errorf("Claude could not tell the project; pass -project (configured: %v)", cfg.ProjectNames())
+		}
 	}
 	if *project == "" || *title == "" {
 		return fmt.Errorf("-project and -title are required")
@@ -292,7 +321,55 @@ func cmdSubmit(args []string) error {
 	if err != nil {
 		return err
 	}
-	return m.Submit(source.Ticket{ID: *id, Title: *title, Body: *body, Project: *project, Repo: *repo})
+	if *id == "" {
+		*id = time.Now().UTC().Format("20060102-150405")
+	}
+	// @path references in the body are copied next to the task (see internal/refs).
+	b, _, err := refs.Attach(*body, refs.Dir(cfg.Home, store.TaskID(m.Name(), *id)))
+	if err != nil {
+		return err
+	}
+	return m.Submit(source.Ticket{ID: *id, Title: *title, Body: b, Project: *project, Repo: *repo})
+}
+
+// draftTicket asks Claude for a ticket draft, prints it and, unless yes, asks
+// for confirmation on the terminal. ok is false when the operator declines.
+func draftTicket(cfg *config.Config, prompt string, yes bool) (tk source.Ticket, ok bool, err error) {
+	if prompt == "-" {
+		if !yes {
+			return tk, false, errors.New("-prompt - reads the request from stdin, so it cannot also ask for confirmation: add -yes")
+		}
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return tk, false, err
+		}
+		prompt = string(b)
+	}
+	fmt.Fprintln(os.Stderr, "Claude is drafting the ticket…")
+	d, err := (&intake.Drafter{Config: cfg}).Draft(context.Background(), prompt)
+	if err != nil {
+		return tk, false, err
+	}
+	tk = d.Ticket(prompt)
+	repo := tk.Repo
+	if repo == "" {
+		repo = "(agent chooses)"
+	}
+	fmt.Printf("project: %s\nrepo:    %s\ntitle:   %s\n\n%s\n", tk.Project, repo, tk.Title, tk.Body)
+	if d.Note != "" {
+		fmt.Printf("\nnote: %s\n", d.Note)
+	}
+	if yes {
+		return tk, true, nil
+	}
+	fmt.Fprint(os.Stderr, "\nSubmit this ticket? [y/N] ")
+	var answer string
+	fmt.Fscanln(os.Stdin, &answer)
+	if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+		fmt.Fprintln(os.Stderr, "not submitted")
+		return tk, false, nil
+	}
+	return tk, true, nil
 }
 
 func cmdDecide(verb string, args []string) error {
@@ -316,7 +393,11 @@ func cmdDecide(verb string, args []string) error {
 	if req == nil {
 		return fmt.Errorf("task %s has no pending approval request", task)
 	}
-	if err := st.Decide(task, req, verb == "approve", *comment); err != nil {
+	text, _, err := refs.Attach(*comment, refs.Dir(st.Home, task))
+	if err != nil {
+		return err
+	}
+	if err := st.Decide(task, req, verb == "approve", text); err != nil {
 		return err
 	}
 	fmt.Printf("%sd %s\n", verb, req.ID)
@@ -337,7 +418,11 @@ func cmdMessage(args []string) error {
 	if !st.Exists(task) {
 		return fmt.Errorf("unknown task %s", task)
 	}
-	return st.SetNudge(task, *text)
+	msg, _, err := refs.Attach(*text, refs.Dir(st.Home, task))
+	if err != nil {
+		return err
+	}
+	return st.SetNudge(task, msg)
 }
 
 // parseWithTask parses flags and returns the task id, accepted before or after the flags.
@@ -364,7 +449,8 @@ func cmdMCP(args []string) error {
 	srv := mcpserver.NewServer(&mcpserver.Handlers{Store: st, Config: cfg, TaskID: *task,
 		Bitbucket: func(ctx context.Context) (*bitbucket.Client, error) { return bitbucketClient(ctx, cfg, "mcp:"+*task) },
 		Splunk:    func(ctx context.Context) (*splunk.Client, error) { return splunkClient(ctx, cfg, "mcp:"+*task) },
-		ArgoCD:    func(ctx context.Context) (*argocd.Client, error) { return argocdClient(ctx, cfg, "mcp:"+*task) }})
+		ArgoCD:    func(ctx context.Context) (*argocd.Client, error) { return argocdClient(ctx, cfg, "mcp:"+*task) },
+		Secret:    secretReader(cfg, "mcp:"+*task)})
 	return srv.Run(context.Background(), &mcp.StdioTransport{})
 }
 

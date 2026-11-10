@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buonnguwaaa/taskpilot/internal/config"
@@ -23,15 +24,51 @@ import (
 
 // Daemon schedules task runs.
 type Daemon struct {
+	// Config is the config at start; the file is watched and reloaded when it
+	// changes (conf returns the current one).
 	Config *config.Config
 	Store  *store.Store
 	Source source.Source
 	Runner *runner.Runner
 	Log    *log.Logger
 
+	cur     atomic.Pointer[config.Config]
+	watch   *config.Watcher
 	mu      sync.Mutex
 	running map[string]bool
 	wg      sync.WaitGroup
+}
+
+// conf returns the current config.
+func (d *Daemon) conf() *config.Config {
+	if c := d.cur.Load(); c != nil {
+		return c
+	}
+	return d.Config
+}
+
+// reloadConfig picks up changes of the config file (a repo or project
+// added, a rule changed). Runs in flight keep the config they started with.
+func (d *Daemon) reloadConfig() {
+	if d.watch == nil {
+		if d.Config == nil || d.Config.Path == "" {
+			return
+		}
+		d.watch = config.NewWatcher(d.Config)
+		if d.Runner != nil && d.Runner.Conf == nil {
+			d.Runner.Conf = d.conf
+		}
+	}
+	c, err := d.watch.Check()
+	switch {
+	case err != nil:
+		d.Log.Printf("config changed but does not load, keeping the previous one: %v", err)
+	case c != nil && len(c.Projects) == 0:
+		d.Log.Printf("config changed but has no projects, keeping the previous one")
+	case c != nil:
+		d.cur.Store(c)
+		d.Log.Printf("config reloaded from %s (%d projects)", c.Path, len(c.Projects))
+	}
 }
 
 // Run loops until ctx is cancelled, then waits for in-flight runs to stop.
@@ -40,7 +77,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.recover(); err != nil {
 		return err
 	}
-	d.Log.Printf("taskpilot daemon started (home %s, source %s, concurrency %d)", d.Store.Home, d.Source.Name(), d.Config.Daemon.Concurrency)
+	d.Log.Printf("taskpilot daemon started (home %s, source %s, concurrency %d)", d.Store.Home, d.Source.Name(), d.conf().Daemon.Concurrency)
 	for {
 		d.Tick(ctx)
 		select {
@@ -48,7 +85,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.Log.Printf("stopping; waiting for %d running task(s)", d.inFlight())
 			d.wg.Wait()
 			return nil
-		case <-time.After(d.Config.Daemon.PollInterval):
+		case <-time.After(d.conf().Daemon.PollInterval):
 		}
 	}
 }
@@ -67,13 +104,17 @@ func (d *Daemon) Once(ctx context.Context) error {
 // Wait blocks until all runs started by Tick have finished (used by tests).
 func (d *Daemon) Wait() { d.wg.Wait() }
 
-// recover parks tasks a previous daemon left mid-run.
+// recover parks tasks a previous daemon left mid-run, and frees the clean
+// worktrees of finished tasks (also those finished before this was automatic).
 func (d *Daemon) recover() error {
 	tasks, err := d.Store.ListTasks()
 	if err != nil {
 		return err
 	}
 	for _, t := range tasks {
+		if t.State == store.StateDone && len(workspace.OpenedRepos(t.Workspace)) > 0 {
+			d.releaseWorktrees(t)
+		}
 		if t.State != store.StateRunning && t.State != store.StatePreparing {
 			continue
 		}
@@ -98,6 +139,9 @@ func (d *Daemon) recover() error {
 		if err := d.Store.SaveTask(t); err != nil {
 			return err
 		}
+		if t.State == store.StateDone {
+			d.releaseWorktrees(t)
+		}
 	}
 	return nil
 }
@@ -107,6 +151,7 @@ func (d *Daemon) Tick(ctx context.Context) {
 	if d.running == nil {
 		d.running = map[string]bool{}
 	}
+	d.reloadConfig()
 	d.ingest(ctx)
 	d.flushOutbox(ctx)
 	tasks, err := d.Store.ListTasks()
@@ -124,7 +169,7 @@ func (d *Daemon) Tick(ctx context.Context) {
 			d.Log.Printf("%s: %v", t.ID, err)
 			continue
 		}
-		if t.State == store.StateQueued && d.inFlight() < d.Config.Daemon.Concurrency && ctx.Err() == nil {
+		if t.State == store.StateQueued && d.inFlight() < d.conf().Daemon.Concurrency && ctx.Err() == nil {
 			d.start(ctx, t)
 		}
 	}
@@ -152,8 +197,8 @@ func (d *Daemon) ingest(ctx context.Context) {
 			Title: tk.Title, Body: tk.Body, Project: tk.Project, RepoHint: tk.Repo,
 			SessionID: newUUID(), CreatedAt: now,
 		}
-		if proj, ok := d.Config.Projects[tk.Project]; !ok {
-			t.LastError = fmt.Sprintf("unknown project %q (configured: %s)", tk.Project, strings.Join(d.Config.ProjectNames(), ", "))
+		if proj, ok := d.conf().Projects[tk.Project]; !ok {
+			t.LastError = fmt.Sprintf("unknown project %q (configured: %s)", tk.Project, strings.Join(d.conf().ProjectNames(), ", "))
 			t.Transition(store.StateFailed, t.LastError)
 		} else if _, ok := proj.Repos[tk.Repo]; tk.Repo != "" && !ok {
 			t.LastError = fmt.Sprintf("repo %q is not part of project %s (repos: %s)", tk.Repo, tk.Project, strings.Join(proj.RepoNames(), ", "))
@@ -182,6 +227,11 @@ func (d *Daemon) advance(t *store.Task) error {
 		if err != nil || req == nil {
 			return err
 		}
+		// The operator may have closed the task (marked it done) since it was
+		// listed; closing decides the pending request, which must not resume it.
+		if cur, err := d.Store.LoadTask(t.ID); err != nil || cur.State != store.StateAwaitApproval {
+			return err
+		}
 		verdict := "APPROVED"
 		next := "Continue the workflow from the step after this gate."
 		if !dec.Approved {
@@ -202,7 +252,7 @@ func (d *Daemon) advance(t *store.Task) error {
 		if err != nil || n == nil {
 			return err
 		}
-		if _, ok := d.Config.Projects[t.Project]; !ok {
+		if _, ok := d.conf().Projects[t.Project]; !ok {
 			return nil // nothing to resume into
 		}
 		if err := d.Store.ArchiveCompletion(t.ID); err != nil {
@@ -253,7 +303,7 @@ func (d *Daemon) start(ctx context.Context, t *store.Task) {
 
 // work runs one turn of a task and parks it in the resulting state.
 func (d *Daemon) work(ctx context.Context, t *store.Task) error {
-	proj := d.Config.Projects[t.Project]
+	proj := d.conf().Projects[t.Project]
 	if t.Workspace == "" || !exists(t.Workspace) {
 		t.Transition(store.StatePreparing, "creating workspace")
 		if err := d.Store.SaveTask(t); err != nil {
@@ -289,12 +339,13 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	if err := d.Store.SaveTask(t); err != nil {
 		return err
 	}
+	model, effort := d.Runner.Profile(t)
 	runID, err := d.Store.StartRun(t.ID, store.RunStart{N: t.Runs, SessionID: t.SessionID, Resume: resume, Trigger: trigger,
-		Prompt: prompt, Model: d.Config.Claude.Model, Effort: d.Config.Claude.Effort})
+		Prompt: prompt, Model: model, Effort: effort})
 	if err != nil {
 		return err
 	}
-	d.Log.Printf("%s: run %d (%s)", t.ID, t.Runs, trigger)
+	d.Log.Printf("%s: run %d (%s, model %s, effort %s)", t.ID, t.Runs, trigger, orDefault(model), orDefault(effort))
 
 	res, runErr := d.Runner.Run(ctx, t, prompt, resume)
 	t.NextPrompt, t.NextTrigger = "", ""
@@ -328,6 +379,7 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 			msg += " PR: " + completion.PRURL
 		}
 		d.report(ctx, t, msg)
+		d.releaseWorktrees(t)
 	case ctx.Err() != nil:
 		t.Transition(store.StateNeedsAttention, "interrupted: taskpilot stopped during the run; send a message (m) to resume")
 	case runErr != nil || (res != nil && res.IsError):
@@ -477,4 +529,25 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func orDefault(s string) string {
+	if s == "" {
+		return "default"
+	}
+	return s
+}
+
+// releaseWorktrees frees the clean worktrees of a finished task so the
+// operator can check its branches out in their own clone.
+func (d *Daemon) releaseWorktrees(t *store.Task) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	kept, err := workspace.Release(ctx, t.Workspace)
+	if err != nil {
+		d.Log.Printf("%s: %v", t.ID, err)
+	}
+	if len(kept) > 0 {
+		d.Log.Printf("%s: done, but worktree(s) with uncommitted changes kept: %s", t.ID, strings.Join(kept, ", "))
+	}
 }

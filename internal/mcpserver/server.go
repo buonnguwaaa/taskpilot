@@ -21,6 +21,7 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
 	"github.com/buonnguwaaa/taskpilot/internal/bitbucket"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
+	"github.com/buonnguwaaa/taskpilot/internal/qcdb"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
 	"github.com/buonnguwaaa/taskpilot/internal/workspace"
@@ -57,6 +58,9 @@ type Handlers struct {
 	Splunk func(ctx context.Context) (*splunk.Client, error)
 	// ArgoCD returns a client for the QC Argo CD instance.
 	ArgoCD func(ctx context.Context) (*argocd.Client, error)
+	// Secret reads a value from the operator's secret store (a QC database
+	// DSN not kept in a repo file); the value never reaches the agent.
+	Secret func(ctx context.Context, name string) (string, error)
 }
 
 // RequestApproval records an approval request for the operator.
@@ -197,9 +201,77 @@ func (h *Handlers) TaskInfo() (string, error) {
 		"gates":             gates,
 		"approval_history":  history,
 		"operator_language": h.Config.OperatorLanguage,
+		"execution_profile": h.profileView(),
 	}
 	b, err := json.MarshalIndent(info, "", "  ")
 	return string(b), err
+}
+
+// profileView tells the agent which model/effort it runs with and what it
+// may pick for the next runs.
+func (h *Handlers) profileView() map[string]any {
+	c := h.Config.Claude
+	v := map[string]any{
+		"current_model":   orDefault(c.Model),
+		"current_effort":  orDefault(c.Effort),
+		"set_by":          "config default",
+		"allowed_models":  c.Models,
+		"allowed_efforts": config.Efforts,
+		"note":            "Pick the profile for the rest of the task with set_execution_profile; it applies from the next run.",
+	}
+	p, err := h.Store.TaskProfile(h.TaskID)
+	if err != nil || p == nil {
+		return v
+	}
+	if p.Model != "" {
+		v["current_model"] = p.Model
+	}
+	if p.Effort != "" {
+		v["current_effort"] = p.Effort
+	}
+	v["set_by"], v["reason"] = p.SetBy, p.Reason
+	if p.SetBy == "operator" {
+		v["note"] = "The operator pinned this profile; do not try to change it."
+	}
+	return v
+}
+
+func orDefault(s string) string {
+	if s == "" {
+		return "Claude Code default"
+	}
+	return s
+}
+
+// SetProfileIn is the input of set_execution_profile.
+type SetProfileIn struct {
+	Model  string `json:"model" jsonschema:"one of task_info.execution_profile.allowed_models"`
+	Effort string `json:"effort" jsonschema:"low, medium, high, xhigh or max"`
+	Reason string `json:"reason" jsonschema:"one or two sentences: the assessment behind the choice (size, risk, ambiguity, kind of work)"`
+}
+
+// SetExecutionProfile records the model and effort for the task's next runs.
+func (h *Handlers) SetExecutionProfile(in SetProfileIn) (string, error) {
+	model, effort := strings.TrimSpace(in.Model), strings.ToLower(strings.TrimSpace(in.Effort))
+	if !h.Config.Claude.AllowsModel(model) {
+		return "", fmt.Errorf("model %q is not allowed; pick one of %s", model, strings.Join(h.Config.Claude.Models, ", "))
+	}
+	if !config.ValidEffort(effort) {
+		return "", fmt.Errorf("effort %q is not valid; pick one of %s", effort, strings.Join(config.Efforts, ", "))
+	}
+	if strings.TrimSpace(in.Reason) == "" {
+		return "", fmt.Errorf("reason is required: say what in the task justifies this profile")
+	}
+	err := h.Store.SetTaskProfile(h.TaskID, &store.Profile{Model: model, Effort: effort, Reason: strings.TrimSpace(in.Reason), SetBy: "agent"})
+	if errors.Is(err, store.ErrProfilePinned) {
+		p, _ := h.Store.TaskProfile(h.TaskID)
+		return fmt.Sprintf("Not changed: the operator pinned model %s, effort %s for this task. Continue with it.", orDefault(p.Model), orDefault(p.Effort)), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Execution profile set: model %s, effort %s. It applies from the next run (after the next gate); "+
+		"this run continues as it started.", model, effort), nil
 }
 
 // OpenRepoIn is the input of open_repo.
@@ -520,6 +592,47 @@ func (h *Handlers) SplunkSearch(ctx context.Context, in SplunkSearchIn) (string,
 	return splunk.Format(query, earliest, events, max), nil
 }
 
+// DBQueryIn is the input of db_query.
+type DBQueryIn struct {
+	SQL     string `json:"sql" jsonschema:"one read-only MySQL statement: SELECT, SHOW, DESCRIBE or EXPLAIN. Always filter (WHERE) and select only the columns you need."`
+	MaxRows int    `json:"max_rows,omitempty" jsonschema:"rows to return (capped by the operator's config, default 200)"`
+}
+
+// DBQuery runs one read-only statement on the task project's QC database.
+func (h *Handlers) DBQuery(ctx context.Context, in DBQueryIn) (string, error) {
+	t, err := h.Store.LoadTask(h.TaskID)
+	if err != nil {
+		return "", err
+	}
+	p := h.Config.Projects[t.Project]
+	if p.QCDB == nil {
+		return "", fmt.Errorf("project %s has no QC database configured; ask the operator if you need data", p.Name)
+	}
+	if err := qcdb.Validate(in.SQL); err != nil {
+		return "", err
+	}
+	dsn, err := qcdb.DSN(ctx, t.Project, p.QCDB, h.Secret)
+	if err != nil {
+		return "", err
+	}
+	max := in.MaxRows
+	if max <= 0 || max > p.QCDB.MaxRows {
+		max = p.QCDB.MaxRows
+	}
+	res, err := qcdb.Query(ctx, dsn, in.SQL, max, p.QCDB.Timeout)
+	rec := &store.DBQuery{At: time.Now().UTC(), Target: qcdb.Target(dsn), Query: strings.TrimSpace(in.SQL)}
+	if err != nil {
+		rec.Error = err.Error()
+	} else {
+		rec.Rows = len(res.Rows)
+	}
+	_ = h.Store.AppendDBQuery(h.TaskID, rec)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("QC database %s (read-only)\n%s", rec.Target, qcdb.Format(res)), nil
+}
+
 // QCLogsIn is the input of qc_logs.
 type QCLogsIn struct {
 	App          string `json:"app" jsonschema:"application name from qc_apps"`
@@ -696,6 +809,31 @@ func NewServer(h *Handlers) *mcp.Server {
 			"QC logs after a deploy. Searches are scoped to the task's project, limited in time range and size, and logged for the operator.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SplunkSearchIn) (*mcp.CallToolResult, any, error) {
 		msg, err := h.SplunkSearch(ctx, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(msg), nil, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "set_execution_profile",
+		Description: "Choose the model and effort for the rest of this task, from your assessment of it (see the workflow " +
+			"skill, 'Execution profile'). Call it once while planning, before requesting the plan gate, and again only if " +
+			"the task turns out much harder or easier. Applies from the next run. The operator sees it and may pin another.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in SetProfileIn) (*mcp.CallToolResult, any, error) {
+		msg, err := h.SetExecutionProfile(in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(msg), nil, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "db_query",
+		Description: "Read-only SQL on the task project's QC database (MySQL): SELECT, SHOW TABLES, DESCRIBE, EXPLAIN. " +
+			"Use it to check data while investigating a bug or verifying a change on QC. Never production. Runs in a read-only " +
+			"transaction with row and time limits; every query is logged for the operator. Prefer SHOW TABLES / DESCRIBE first, " +
+			"then narrow SELECTs with WHERE and LIMIT.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in DBQueryIn) (*mcp.CallToolResult, any, error) {
+		msg, err := h.DBQuery(ctx, in)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -7,7 +7,7 @@ claude:
   bin: claude
   model: ""                   # empty = Claude Code default
   effort: ""                  # low | medium | high | xhigh | max
-  max_budget_usd: 2           # per run (one turn between two gates)
+  # max_budget_usd: 5         # optional cap per run (one turn between two gates); unset = no cap
   permission_mode: dontAsk    # only pre-approved tools run; nothing prompts
   setting_sources: ""         # e.g. "project,local" to ignore ~/.claude settings
   extra_args: []
