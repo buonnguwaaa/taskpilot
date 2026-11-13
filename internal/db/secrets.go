@@ -107,26 +107,6 @@ func (d *DB) Meta(ctx context.Context, name string) (*SecretMeta, error) {
 	return buildMeta(name, kind, desc, updated, expires), nil
 }
 
-// ListSecrets returns metadata of every secret, sorted by name.
-func (d *DB) ListSecrets(ctx context.Context) ([]SecretMeta, error) {
-	rows, err := d.QueryContext(ctx,
-		`SELECT name, kind, coalesce(description, ''), updated_at, expires_at FROM secrets ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []SecretMeta
-	for rows.Next() {
-		var name, kind, desc, updated string
-		var expires sql.NullString
-		if err := rows.Scan(&name, &kind, &desc, &updated, &expires); err != nil {
-			return nil, err
-		}
-		out = append(out, *buildMeta(name, kind, desc, updated, expires))
-	}
-	return out, rows.Err()
-}
-
 // DeleteSecret removes a secret (bindings cascade) and logs it.
 func (d *DB) DeleteSecret(ctx context.Context, name, actor string) error {
 	res, err := d.ExecContext(ctx, `DELETE FROM secrets WHERE name = ?`, name)

@@ -9,6 +9,10 @@ the task, the plan and the gates; you own only the part you were given.
 
 - Change only the files in your scope. If the work needs a change elsewhere,
   stop and report it instead of making it: another agent may own that file.
+- Write the smallest change that fully does your part (the `ponytail` skill):
+  reuse the repo's helpers and the standard library, no abstraction, option or
+  "for later" code nobody asked for. Check new non-trivial logic with one small
+  local test and leave it untracked: tests are never committed (the operator's rule).
 - Follow the repo's conventions (read neighbouring code first). Change files
   with Edit/Write, never with shell redirection.
 - Run the verify or test command you were given for your part and fix what you

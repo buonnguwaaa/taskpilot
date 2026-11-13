@@ -13,12 +13,15 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -88,6 +91,14 @@ type Task struct {
 	persisted int // history entries already stored
 }
 
+// WorkBranch is the task's work branch (the provisional tp/<id> until set).
+func (t *Task) WorkBranch() string {
+	if t.Branch != "" {
+		return t.Branch
+	}
+	return "tp/" + t.ID
+}
+
 // Transition moves the task to state s and records it in History.
 func (t *Task) Transition(s State, note string) {
 	now := time.Now().UTC()
@@ -103,6 +114,50 @@ type ApprovalRequest struct {
 	Summary   string    `json:"summary"`
 	Details   string    `json:"details,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// Questions the operator answers by picking options (may be empty).
+	Questions []Question `json:"questions,omitempty"`
+}
+
+// QuestionGate is the pseudo-gate of a request that only asks questions
+// (MCP tool ask_operator): answering it resumes the agent.
+const QuestionGate = "question"
+
+// Question is a multiple-choice question for the operator, as Claude Code's
+// AskUserQuestion: the operator picks one option (or several when Multi), or
+// writes another answer.
+type Question struct {
+	Question string   `json:"question"`
+	Header   string   `json:"header,omitempty"`
+	Options  []Option `json:"options"`
+	Multi    bool     `json:"multiSelect,omitempty"`
+}
+
+// Option is one choice of a Question.
+type Option struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// ValidateQuestions checks what an agent sends: 1–4 questions, 2–6 labelled
+// options each.
+func ValidateQuestions(qs []Question) error {
+	if len(qs) > 4 {
+		return fmt.Errorf("at most 4 questions per request (got %d)", len(qs))
+	}
+	for i, q := range qs {
+		if strings.TrimSpace(q.Question) == "" {
+			return fmt.Errorf("question %d is empty", i+1)
+		}
+		if len(q.Options) < 2 || len(q.Options) > 6 {
+			return fmt.Errorf("question %d needs 2 to 6 options (got %d); the operator can always write another answer", i+1, len(q.Options))
+		}
+		for j, o := range q.Options {
+			if strings.TrimSpace(o.Label) == "" {
+				return fmt.Errorf("question %d, option %d has no label", i+1, j+1)
+			}
+		}
+	}
+	return nil
 }
 
 // Decision is the operator's answer to an ApprovalRequest.
@@ -376,6 +431,23 @@ func (s *Store) ListTasks() ([]*Task, error) {
 
 // AddRequest records a new approval request for gate and returns it.
 func (s *Store) AddRequest(id, gate, summary, details string) (*ApprovalRequest, error) {
+	return s.AddRequestWithQuestions(id, gate, summary, details, nil)
+}
+
+// AddRequestWithQuestions records a request that also asks the operator
+// multiple-choice questions.
+func (s *Store) AddRequestWithQuestions(id, gate, summary, details string, qs []Question) (*ApprovalRequest, error) {
+	if err := ValidateQuestions(qs); err != nil {
+		return nil, err
+	}
+	qjson := ""
+	if len(qs) > 0 {
+		b, err := json.Marshal(qs)
+		if err != nil {
+			return nil, err
+		}
+		qjson = string(b)
+	}
 	tx, err := s.DB.BeginTx(bg(), nil)
 	if err != nil {
 		return nil, err
@@ -385,9 +457,9 @@ func (s *Store) AddRequest(id, gate, summary, details string) (*ApprovalRequest,
 	if err := tx.QueryRow(`SELECT count(*) FROM approvals WHERE task_id = ? AND gate = ?`, id, gate).Scan(&n); err != nil {
 		return nil, err
 	}
-	r := &ApprovalRequest{ID: fmt.Sprintf("%s-%d", gate, n+1), Gate: gate, Summary: summary, Details: details, CreatedAt: time.Now().UTC()}
-	if _, err := tx.Exec(`INSERT INTO approvals (task_id, id, gate, attempt, summary, details, created_at) VALUES (?,?,?,?,?,?,?)`,
-		id, r.ID, gate, n+1, summary, details, ts(r.CreatedAt)); err != nil {
+	r := &ApprovalRequest{ID: fmt.Sprintf("%s-%d", gate, n+1), Gate: gate, Summary: summary, Details: details, CreatedAt: time.Now().UTC(), Questions: qs}
+	if _, err := tx.Exec(`INSERT INTO approvals (task_id, id, gate, attempt, summary, details, created_at, questions) VALUES (?,?,?,?,?,?,?,?)`,
+		id, r.ID, gate, n+1, summary, details, ts(r.CreatedAt), qjson); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return nil, fmt.Errorf("task %s already has a request waiting for the operator", id)
 		}
@@ -398,7 +470,7 @@ func (s *Store) AddRequest(id, gate, summary, details string) (*ApprovalRequest,
 
 // Requests returns all approval requests, oldest first.
 func (s *Store) Requests(id string) ([]*ApprovalRequest, error) {
-	rows, err := s.DB.QueryContext(bg(), `SELECT id, gate, summary, details, created_at FROM approvals WHERE task_id = ? ORDER BY rowid`, id)
+	rows, err := s.DB.QueryContext(bg(), `SELECT id, gate, summary, details, created_at, questions FROM approvals WHERE task_id = ? ORDER BY rowid`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -406,11 +478,12 @@ func (s *Store) Requests(id string) ([]*ApprovalRequest, error) {
 	var out []*ApprovalRequest
 	for rows.Next() {
 		var r ApprovalRequest
-		var created string
-		if err := rows.Scan(&r.ID, &r.Gate, &r.Summary, &r.Details, &created); err != nil {
+		var created, qs string
+		if err := rows.Scan(&r.ID, &r.Gate, &r.Summary, &r.Details, &created, &qs); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = parseTS(created)
+		r.Questions = parseQuestions(qs)
 		out = append(out, &r)
 	}
 	return out, rows.Err()
@@ -454,9 +527,9 @@ func (s *Store) Decide(id string, req *ApprovalRequest, approved bool, comment s
 // PendingRequest returns the request waiting for the operator, or nil.
 func (s *Store) PendingRequest(id string) (*ApprovalRequest, error) {
 	var r ApprovalRequest
-	var created string
-	err := s.DB.QueryRowContext(bg(), `SELECT id, gate, summary, details, created_at FROM approvals
-		WHERE task_id = ? AND decision IS NULL ORDER BY rowid LIMIT 1`, id).Scan(&r.ID, &r.Gate, &r.Summary, &r.Details, &created)
+	var created, qs string
+	err := s.DB.QueryRowContext(bg(), `SELECT id, gate, summary, details, created_at, questions FROM approvals
+		WHERE task_id = ? AND decision IS NULL ORDER BY rowid LIMIT 1`, id).Scan(&r.ID, &r.Gate, &r.Summary, &r.Details, &created, &qs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -464,7 +537,17 @@ func (s *Store) PendingRequest(id string) (*ApprovalRequest, error) {
 		return nil, err
 	}
 	r.CreatedAt = parseTS(created)
+	r.Questions = parseQuestions(qs)
 	return &r, nil
+}
+
+func parseQuestions(s string) []Question {
+	if s == "" {
+		return nil
+	}
+	var qs []Question
+	_ = json.Unmarshal([]byte(s), &qs)
+	return qs
 }
 
 // GateApproved reports whether any request for gate has been approved.
@@ -666,6 +749,19 @@ func (s *Store) PullRequestInto(id, repo, target string) (*PullRequest, error) {
 	return nil, nil
 }
 
+// CreatedPRs keeps the PRs that exist on Bitbucket (not pending), optionally
+// only those of repo and/or into dest.
+func CreatedPRs(prs []*PullRequest, repo, dest string) []*PullRequest {
+	var out []*PullRequest
+	for _, pr := range prs {
+		if pr.Pending || pr.ID <= 0 || repo != "" && pr.Repo != repo || dest != "" && pr.Destination != dest {
+			continue
+		}
+		out = append(out, pr)
+	}
+	return out
+}
+
 // AppendSplunkQuery records one agent search.
 func (s *Store) AppendSplunkQuery(id string, q *SplunkQuery) error {
 	_, err := s.DB.ExecContext(bg(), `INSERT INTO splunk_queries (task_id, at, query, earliest, latest, events, error) VALUES (?,?,?,?,?,?,?)`,
@@ -756,26 +852,6 @@ func (s *Store) AppendDBQuery(id string, q *DBQuery) error {
 	return err
 }
 
-// DBQueries lists a task's QC database queries, oldest first.
-func (s *Store) DBQueries(id string) ([]*DBQuery, error) {
-	rows, err := s.DB.QueryContext(bg(), `SELECT at, target, query, rows, error FROM db_queries WHERE task_id = ? ORDER BY id`, id)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*DBQuery
-	for rows.Next() {
-		var q DBQuery
-		var at string
-		if err := rows.Scan(&at, &q.Target, &q.Query, &q.Rows, &q.Error); err != nil {
-			return nil, err
-		}
-		q.At = parseTS(at)
-		out = append(out, &q)
-	}
-	return out, rows.Err()
-}
-
 // Profile is the model and effort a task runs with. The agent sets it after
 // assessing the task; the operator can pin one, which the agent cannot change.
 type Profile struct {
@@ -829,4 +905,463 @@ func (s *Store) SetTaskProfile(id string, p *Profile) error {
 func (s *Store) ClearTaskProfile(id string) error {
 	_, err := s.DB.ExecContext(bg(), `DELETE FROM task_profiles WHERE task_id = ?`, id)
 	return err
+}
+
+// VaultRead is an audit record of one agent read of the QC Vault (no values).
+type VaultRead struct {
+	At     time.Time
+	Action string // list, get
+	Path   string
+	Keys   int
+	Error  string
+}
+
+// AppendVaultRead records one agent read of the QC Vault.
+func (s *Store) AppendVaultRead(id string, r *VaultRead) error {
+	_, err := s.DB.ExecContext(bg(), `INSERT INTO vault_reads (task_id, at, action, path, keys, error) VALUES (?,?,?,?,?,?)`,
+		id, ts(r.At), r.Action, r.Path, r.Keys, r.Error)
+	return err
+}
+
+// VaultReads lists a task's QC Vault reads, oldest first.
+func (s *Store) VaultReads(id string) ([]*VaultRead, error) {
+	rows, err := s.DB.QueryContext(bg(), `SELECT at, action, path, keys, error FROM vault_reads WHERE task_id = ? ORDER BY id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*VaultRead
+	for rows.Next() {
+		var r VaultRead
+		var at string
+		if err := rows.Scan(&at, &r.Action, &r.Path, &r.Keys, &r.Error); err != nil {
+			return nil, err
+		}
+		r.At = parseTS(at)
+		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
+// RunTime is the total time the agent ran on a task (all runs).
+func (s *Store) RunTime(id string) time.Duration {
+	var ms sql.NullInt64
+	_ = s.DB.QueryRowContext(bg(), `SELECT sum(duration_ms) FROM runs WHERE task_id = ?`, id).Scan(&ms)
+	return time.Duration(ms.Int64) * time.Millisecond
+}
+
+// ---- production error scans ------------------------------------------------------
+
+// ErrorScan is one scheduled scan of a project's production errors.
+type ErrorScan struct {
+	ID         int64
+	Project    string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Earliest   time.Time
+	Latest     time.Time
+	Groups     int
+	New        int
+	Error      string
+}
+
+// Suggestion is a production error group kept for the operator to act on.
+type Suggestion struct {
+	ID          int64
+	Project     string
+	Service     string
+	Signature   string
+	Status      string // new, dismissed, snoozed, task
+	SnoozeUntil time.Time
+	TaskID      string
+	Count       int // over all scans
+	LastCount   int // in the latest scan that saw it
+	FirstSeen   time.Time
+	LastSeen    time.Time
+	Sample      string
+	Caller      string
+	Prefix      string
+	RequestID   string
+	Stacktrace  string
+	FlowID      int64 // 0 = no flow
+}
+
+// LastScan returns the project's latest finished scan, or nil.
+func (s *Store) LastScan(project string) (*ErrorScan, error) { return s.lastScan(project, false) }
+
+// LastGoodScan returns the project's latest scan that succeeded, or nil.
+func (s *Store) LastGoodScan(project string) (*ErrorScan, error) { return s.lastScan(project, true) }
+
+func (s *Store) lastScan(project string, okOnly bool) (*ErrorScan, error) {
+	var sc ErrorScan
+	var started, finished, earliest, latest string
+	cond := ""
+	if okOnly {
+		cond = " AND error = ''"
+	}
+	err := s.DB.QueryRowContext(bg(), `SELECT id, project, started_at, coalesce(finished_at, ''), earliest, latest, groups, new, error
+		FROM error_scans WHERE project = ? AND finished_at IS NOT NULL`+cond+` ORDER BY started_at DESC, id DESC LIMIT 1`, project).
+		Scan(&sc.ID, &sc.Project, &started, &finished, &earliest, &latest, &sc.Groups, &sc.New, &sc.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sc.StartedAt, sc.FinishedAt, sc.Earliest, sc.Latest = parseTS(started), parseTS(finished), parseTS(earliest), parseTS(latest)
+	return &sc, nil
+}
+
+// StartScan records the start of a scan over [earliest, latest).
+func (s *Store) StartScan(project string, earliest, latest time.Time) (int64, error) {
+	res, err := s.DB.ExecContext(bg(), `INSERT INTO error_scans (project, started_at, earliest, latest) VALUES (?,?,?,?)`,
+		project, ts(time.Now()), ts(earliest), ts(latest))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// FinishScan records the outcome of a scan.
+func (s *Store) FinishScan(id int64, groups, fresh int, scanErr error) error {
+	msg := ""
+	if scanErr != nil {
+		msg = scanErr.Error()
+	}
+	_, err := s.DB.ExecContext(bg(), `UPDATE error_scans SET finished_at = ?, groups = ?, new = ?, error = ? WHERE id = ?`,
+		ts(time.Now()), groups, fresh, msg, id)
+	return err
+}
+
+// UpsertSuggestion records a group seen by scan scanID. A new group, or one
+// whose snooze is over, becomes (again) a suggestion to show: fresh=true.
+// Dismissed groups and groups with a task only get their counts updated.
+func (s *Store) UpsertSuggestion(g *Suggestion, scanID int64, now time.Time) (fresh bool, err error) {
+	tx, err := s.DB.BeginTx(bg(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var id int64
+	defer func() {
+		if err == nil {
+			g.ID = id
+		}
+	}()
+	var status, snooze string
+	err = tx.QueryRow(`SELECT id, status, coalesce(snooze_until, '') FROM error_suggestions WHERE project = ? AND service = ? AND signature = ?`,
+		g.Project, g.Service, g.Signature).Scan(&id, &status, &snooze)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		var res sql.Result
+		res, err = tx.Exec(`INSERT INTO error_suggestions (project, service, signature, count, last_count, first_seen, last_seen,
+			sample, caller, prefix, request_id, stacktrace, scan_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			g.Project, g.Service, g.Signature, g.LastCount, g.LastCount, ts(g.FirstSeen), ts(g.LastSeen),
+			g.Sample, g.Caller, g.Prefix, g.RequestID, g.Stacktrace, scanID)
+		if err == nil {
+			id, err = res.LastInsertId()
+		}
+		fresh = true
+	case err != nil:
+		return false, err
+	default:
+		next := status
+		if status == "snoozed" && !parseTS(snooze).After(now) {
+			next, fresh = "new", true
+		}
+		_, err = tx.Exec(`UPDATE error_suggestions SET status = ?, count = count + ?, last_count = ?, last_seen = ?, sample = ?,
+			caller = ?, prefix = ?, request_id = ?, stacktrace = ?, scan_id = ? WHERE id = ?`,
+			next, g.LastCount, g.LastCount, ts(g.LastSeen), g.Sample, g.Caller, g.Prefix, g.RequestID, g.Stacktrace, scanID, id)
+	}
+	if err != nil {
+		return false, err
+	}
+	return fresh, tx.Commit()
+}
+
+// Suggestions lists a project's suggestions to act on ("" = every project):
+// status new, most frequent in their latest scan first.
+func (s *Store) Suggestions(project string) ([]*Suggestion, error) {
+	q := `SELECT id, project, service, signature, status, coalesce(snooze_until, ''), coalesce(task_id, ''), count, last_count,
+		first_seen, last_seen, sample, caller, prefix, request_id, stacktrace, coalesce(flow_id, 0) FROM error_suggestions WHERE status = 'new'`
+	var args []any
+	if project != "" {
+		q += ` AND project = ?`
+		args = append(args, project)
+	}
+	rows, err := s.DB.QueryContext(bg(), q+` ORDER BY last_count DESC, id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Suggestion
+	for rows.Next() {
+		var g Suggestion
+		var snooze, first, last string
+		if err := rows.Scan(&g.ID, &g.Project, &g.Service, &g.Signature, &g.Status, &snooze, &g.TaskID, &g.Count, &g.LastCount,
+			&first, &last, &g.Sample, &g.Caller, &g.Prefix, &g.RequestID, &g.Stacktrace, &g.FlowID); err != nil {
+			return nil, err
+		}
+		g.SnoozeUntil, g.FirstSeen, g.LastSeen = parseTS(snooze), parseTS(first), parseTS(last)
+		out = append(out, &g)
+	}
+	return out, rows.Err()
+}
+
+// SetSuggestion changes a suggestion's status: dismissed (never again),
+// snoozed until a time, or task (a task was created from it: taskID).
+func (s *Store) SetSuggestion(id int64, status string, until time.Time, taskID string) error {
+	var snooze any
+	if !until.IsZero() {
+		snooze = ts(until)
+	}
+	var task any
+	if taskID != "" {
+		task = taskID
+	}
+	_, err := s.DB.ExecContext(bg(), `UPDATE error_suggestions SET status = ?, snooze_until = ?, task_id = coalesce(?, task_id) WHERE id = ?`,
+		status, snooze, task, id)
+	return err
+}
+
+// ErrorFlow is the suggestions of one failing path (see internal/scan).
+type ErrorFlow struct {
+	ID      int64 // 0: a suggestion on its own
+	Title   string
+	Cause   string
+	How     string // request_id, claude
+	Members []*Suggestion
+}
+
+// Total is the members' count in their latest scan.
+func (f *ErrorFlow) Total() int {
+	n := 0
+	for _, m := range f.Members {
+		n += m.LastCount
+	}
+	return n
+}
+
+// SaveFlow records a flow of scan scanID over suggestions ids.
+func (s *Store) SaveFlow(project string, scanID int64, title, cause, how string, ids []int64) error {
+	tx, err := s.DB.BeginTx(bg(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO error_flows (project, scan_id, title, cause, how, created_at) VALUES (?,?,?,?,?,?)`,
+		project, scanID, title, cause, how, ts(time.Now()))
+	if err != nil {
+		return err
+	}
+	fid, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE error_suggestions SET flow_id = ? WHERE id = ?`, fid, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SuggestionFlows lists the waiting suggestions grouped by flow, the biggest
+// first (a suggestion without a flow is a flow of its own).
+func (s *Store) SuggestionFlows(project string) ([]*ErrorFlow, error) {
+	gs, err := s.Suggestions(project)
+	if err != nil {
+		return nil, err
+	}
+	var out []*ErrorFlow
+	byID := map[int64]*ErrorFlow{}
+	for _, g := range gs {
+		if g.FlowID == 0 {
+			out = append(out, &ErrorFlow{Members: []*Suggestion{g}})
+			continue
+		}
+		f := byID[g.FlowID]
+		if f == nil {
+			f = &ErrorFlow{ID: g.FlowID}
+			if err := s.DB.QueryRowContext(bg(), `SELECT title, cause, how FROM error_flows WHERE id = ?`, g.FlowID).
+				Scan(&f.Title, &f.Cause, &f.How); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			byID[g.FlowID] = f
+			out = append(out, f)
+		}
+		f.Members = append(f.Members, g)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Total() > out[j].Total() })
+	return out, nil
+}
+
+// ---- task assessment -----------------------------------------------------------------
+
+// Task levels, easiest first (see the workflow skill, "Execution profile").
+var Levels = []string{"light", "standard", "hard", "hardest"}
+
+// Task kinds.
+var Kinds = []string{"feature", "bugfix", "investigation", "improvement", "refactor", "config", "test", "docs", "ops", "other"}
+
+// Assessment is the agent's view of a task: how hard and what kind of work.
+type Assessment struct {
+	Level     string
+	Kind      string
+	Reason    string
+	SetBy     string // "agent" (default) or "estimate" (Claude, from the ticket)
+	UpdatedAt time.Time
+}
+
+// SetAssessment records the task's assessment (empty fields keep the old
+// value). An estimate never replaces an existing assessment; the agent's
+// replaces an estimate.
+func (s *Store) SetAssessment(id string, a *Assessment) error {
+	by := a.SetBy
+	if by == "" {
+		by = "agent"
+	}
+	q := `INSERT INTO task_assessments (task_id, level, kind, reason, set_by, updated_at) VALUES (?,?,?,?,?,?)
+		ON CONFLICT (task_id) DO UPDATE SET level = coalesce(nullif(excluded.level, ''), level),
+		kind = coalesce(nullif(excluded.kind, ''), kind), reason = coalesce(nullif(excluded.reason, ''), reason),
+		set_by = excluded.set_by, updated_at = excluded.updated_at`
+	if by == "estimate" {
+		q = `INSERT INTO task_assessments (task_id, level, kind, reason, set_by, updated_at) VALUES (?,?,?,?,?,?)
+		ON CONFLICT (task_id) DO NOTHING`
+	}
+	_, err := s.DB.ExecContext(bg(), q, id, a.Level, a.Kind, a.Reason, by, ts(time.Now()))
+	return err
+}
+
+// TaskAssessment returns the task's assessment, or nil.
+func (s *Store) TaskAssessment(id string) (*Assessment, error) {
+	var a Assessment
+	var at string
+	err := s.DB.QueryRowContext(bg(), `SELECT level, kind, reason, set_by, updated_at FROM task_assessments WHERE task_id = ?`, id).
+		Scan(&a.Level, &a.Kind, &a.Reason, &a.SetBy, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.UpdatedAt = parseTS(at)
+	return &a, nil
+}
+
+// ---- conversation --------------------------------------------------------------------
+
+// RunPrompt is what taskpilot sent the agent at the start of a run.
+type RunPrompt struct {
+	ID        int64
+	N         int
+	Trigger   string // initial, approval, rejection, operator_message
+	Prompt    string
+	Model     string
+	Effort    string
+	StartedAt time.Time
+	EndedAt   time.Time
+	Outcome   string
+	CostUSD   float64
+	ResumeAt  string // the session entry it continued from ("" = unknown)
+	Revoked   bool   // the operator took back what started it
+}
+
+// RunPrompts lists the task's runs, oldest first.
+func (s *Store) RunPrompts(id string) ([]*RunPrompt, error) {
+	rows, err := s.DB.QueryContext(bg(), `SELECT id, n, trigger, prompt, model, effort, started_at, coalesce(ended_at, ''),
+		coalesce(outcome, ''), cost_usd, resume_at, revoked_at IS NOT NULL FROM runs WHERE task_id = ? ORDER BY n, id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*RunPrompt
+	for rows.Next() {
+		var r RunPrompt
+		var started, ended string
+		if err := rows.Scan(&r.ID, &r.N, &r.Trigger, &r.Prompt, &r.Model, &r.Effort, &started, &ended, &r.Outcome, &r.CostUSD,
+			&r.ResumeAt, &r.Revoked); err != nil {
+			return nil, err
+		}
+		r.StartedAt, r.EndedAt = parseTS(started), parseTS(ended)
+		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
+// OperatorMessage is a message the operator sent to the agent.
+type OperatorMessage struct {
+	Text     string
+	At       time.Time
+	Consumed bool
+}
+
+// OperatorMessages lists the task's operator messages, oldest first.
+func (s *Store) OperatorMessages(id string) ([]*OperatorMessage, error) {
+	rows, err := s.DB.QueryContext(bg(), `SELECT message, created_at, consumed_at IS NOT NULL FROM operator_messages WHERE task_id = ? ORDER BY id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*OperatorMessage
+	for rows.Next() {
+		var m OperatorMessage
+		var at string
+		if err := rows.Scan(&m.Text, &at, &m.Consumed); err != nil {
+			return nil, err
+		}
+		m.At = parseTS(at)
+		out = append(out, &m)
+	}
+	return out, rows.Err()
+}
+
+// ---- graphify nudges ---------------------------------------------------------------
+
+// graphify markers live in the task dir: the run in which the agent last
+// queried the code graph, and the run it was last reminded in.
+func (s *Store) graphifyMarker(id, name string) string {
+	return filepath.Join(s.TaskDir(id), "graphify."+name)
+}
+
+func (s *Store) markerRun(id, name string) int {
+	b, err := os.ReadFile(s.graphifyMarker(id, name))
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func (s *Store) setMarker(id, name string, run int) error {
+	if err := os.MkdirAll(s.TaskDir(id), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.graphifyMarker(id, name), []byte(strconv.Itoa(run)), 0o644)
+}
+
+// MarkGraphifyUsed records that the agent queried the code graph in the task's current run.
+func (s *Store) MarkGraphifyUsed(id string) error {
+	t, err := s.LoadTask(id)
+	if err != nil {
+		return err
+	}
+	return s.setMarker(id, "used", t.Runs)
+}
+
+// GraphifyNudge reports whether the agent should be reminded of the code
+// graph now (no query and no reminder yet in the current run), and records
+// the reminder when it should.
+func (s *Store) GraphifyNudge(id string) bool {
+	t, err := s.LoadTask(id)
+	if err != nil {
+		return false
+	}
+	if s.markerRun(id, "used") == t.Runs || s.markerRun(id, "nudged") == t.Runs {
+		return false
+	}
+	return s.setMarker(id, "nudged", t.Runs) == nil
 }

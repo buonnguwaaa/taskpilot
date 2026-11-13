@@ -54,7 +54,8 @@ func TestTaskGroups(t *testing.T) {
 	if m.tasks.current().ID != "t3" {
 		t.Fatalf("cursor on %s", m.tasks.current().ID)
 	}
-	// Clicking a row maps through the headers: row 0 header, 1 t4, 2 t2, 3 header, 4 t3.
+	// Clicking a line maps through the headers and the two-line entries:
+	// 0 header, 1-2 t4, 3-4 t2, 5 header, 6-7 t3.
 	click := func(row int) string {
 		tm, _ := m.Update(tea.MouseMsg{X: 2, Y: listTop + row, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 		mm := tm.(Model)
@@ -63,7 +64,10 @@ func TestTaskGroups(t *testing.T) {
 	if got := click(1); got != "t4" {
 		t.Fatalf("click row 1 → %s", got)
 	}
-	if got := click(3); got != "t3" {
+	if got := click(4); got != "t2" {
+		t.Fatalf("click line 4 (t2's second line) → %s", got)
+	}
+	if got := click(5); got != "t3" {
 		t.Fatal("clicking a header must not move the cursor")
 	}
 }

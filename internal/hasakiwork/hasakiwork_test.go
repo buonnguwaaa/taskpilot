@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -130,7 +132,6 @@ func (s staticToken) Token(context.Context) (string, error) { return string(s), 
 
 func TestClient(t *testing.T) {
 	var lastAuth, lastLocale, lastPath string
-	var form map[string][]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lastAuth, lastLocale, lastPath = r.Header.Get("Authorization"), r.Header.Get("X-Locale"), r.URL.Path
 		switch {
@@ -148,10 +149,6 @@ func TestClient(t *testing.T) {
 			io.WriteString(w, `{"message":"Success","status":1,"code":200,"data":{"id":7,"code":"HSK-1","name":"n","note":"mô tả","status":0}}`)
 		case r.URL.Path == "/api/v2/task/comment" && r.Method == http.MethodGet:
 			io.WriteString(w, `{"status":200,"message":"OK","data":[{"id":1,"comment":"hi"}]}`)
-		case r.URL.Path == "/api/v2/task/comment" && r.Method == http.MethodPost:
-			r.ParseMultipartForm(1 << 20)
-			form = r.MultipartForm.Value
-			io.WriteString(w, `{"status":200,"message":"OK","data":{"id":2}}`)
 		case r.URL.Path == "/api/hr/projects/1":
 			io.WriteString(w, `{"message":"The token has been blacklisted","status":0}`)
 		default:
@@ -178,12 +175,6 @@ func TestClient(t *testing.T) {
 	comments, err := c.Comments(ctx, 7)
 	if err != nil || len(comments) != 1 {
 		t.Fatalf("comments=%v err=%v", comments, err)
-	}
-	if err := c.AddComment(ctx, 43149, 7, "xin chào"); err != nil {
-		t.Fatal(err)
-	}
-	if form["obj_id"][0] != "7" || form["type"][0] != "2" || form["comment"][0] != "xin chào" || form["user_id"][0] != "43149" {
-		t.Fatalf("comment form = %v", form)
 	}
 	if _, err := c.Task(ctx, 1); err == nil {
 		t.Fatal("expected error")
@@ -233,5 +224,49 @@ func TestCreateTask(t *testing.T) {
 	}
 	if _, err := c.CreateTask(context.Background(), NewTask{Name: "n"}); err == nil {
 		t.Error("project is required")
+	}
+}
+
+func TestDownloadFile(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Path
+		if r.Header.Get("Authorization") != "" {
+			t.Error("media files are public: no token must be sent")
+		}
+		io.WriteString(w, "PNG")
+	}))
+	defer srv.Close()
+	c := &Client{MediaURL: srv.URL + "/production/hr/", HTTP: srv.Client()}
+	dir := t.TempDir()
+	for i, want := range []string{"Flow-Replace-SKU.png", "Flow-Replace-SKU-2.png"} {
+		p, err := c.DownloadFile(context.Background(), "task/26/11/12/15/Flow-Replace-SKU_2026-11-12_152833.png", dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p != filepath.Join(dir, want) {
+			t.Fatalf("download %d saved as %s, want %s", i, p, want)
+		}
+	}
+	if got != "/production/hr/task/26/11/12/15/Flow-Replace-SKU_2026-11-12_152833.png" {
+		t.Fatalf("path = %s", got)
+	}
+	for in, want := range map[string]string{"task/a/../../x_2026-01-02_030405.pdf": "x.pdf", "task/..": "file", "a/b.xlsx": "b.xlsx"} {
+		if g := FileName(in); g != want {
+			t.Errorf("FileName(%q) = %q, want %q", in, g, want)
+		}
+	}
+}
+
+func TestDownloadFileNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	c := &Client{MediaURL: srv.URL, HTTP: srv.Client()}
+	dir := t.TempDir()
+	if _, err := c.DownloadFile(context.Background(), "task/x.png", dir); err == nil {
+		t.Fatal("404 accepted")
+	}
+	if es, _ := os.ReadDir(dir); len(es) != 0 {
+		t.Fatalf("left %d files behind", len(es))
 	}
 }

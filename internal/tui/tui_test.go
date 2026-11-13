@@ -7,14 +7,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
+	"github.com/buonnguwaaa/taskpilot/internal/claudeai"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
 	"github.com/buonnguwaaa/taskpilot/internal/intake"
@@ -28,8 +31,37 @@ type fakeHW struct {
 	tasks    []hasakiwork.Task
 	created  *[]hasakiwork.NewTask // CreateTask calls, when set
 	assigned *[][2]int64           // AssignStaff calls (task, staff)
+	reports  *[]fakeReport         // Report calls
 	epics    map[int64]map[hasakiwork.EpicKind]*hasakiwork.Epic
 }
+
+type fakeReport struct {
+	task, staff int64
+	result      string
+	actual      int // minutes
+	status      int
+}
+
+func (f fakeHW) Report(_ context.Context, task, staff int64, result string, actual, status int) error {
+	if f.reports == nil {
+		return errors.New("Report not expected")
+	}
+	*f.reports = append(*f.reports, fakeReport{task, staff, result, actual, status})
+	return nil
+}
+
+func (f fakeHW) DownloadFile(_ context.Context, path, dir string) (string, error) {
+	if strings.Contains(path, "missing") {
+		return "", errors.New("HTTP 404")
+	}
+	dst := filepath.Join(dir, hasakiwork.FileName(path))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dst, os.WriteFile(dst, []byte(path), 0o644)
+}
+
+func (f fakeHW) FileURL(path string) string { return "https://media.test/" + path }
 
 func (f fakeHW) Profile(context.Context) (*hasakiwork.Profile, error) {
 	return &hasakiwork.Profile{ID: 43149, StaffID: 39324}, nil
@@ -62,6 +94,7 @@ func (f fakeHW) Task(_ context.Context, id int64) (*hasakiwork.Task, error) {
 	for _, t := range f.tasks {
 		if t.ID == id {
 			t.Note = "Mô tả của task " + t.Code
+			t.NoteFiles = []string{"task/26/11/12/15/flow_2026-11-12_152833.png"}
 			return &t, nil
 		}
 	}
@@ -141,7 +174,7 @@ func drain(t *testing.T, m Model, cmd tea.Cmd) Model {
 	for i := 0; cmd != nil && i < 10; i++ {
 		msg := cmd()
 		switch msg.(type) {
-		case hwTasksMsg, hwDetailMsg, cmdOutputMsg:
+		case hwTasksMsg, hwDetailMsg, cmdOutputMsg, infoMsg:
 		default:
 			return m
 		}
@@ -209,7 +242,7 @@ func TestDispatchHasakiTaskWithKeysAndMouse(t *testing.T) {
 		t.Fatalf("clicking the header should switch tab, tab=%d", m.tab)
 	}
 	m = drain(t, m, cmd)
-	if len(m.hw.list) != 2 || !strings.Contains(m.View(), "Mô tả của task HSK-AAA") {
+	if len(m.hw.list) != 2 || !strings.Contains(ansi.Strip(m.View()), "Mô tả của task HSK-AAA") {
 		t.Fatalf("list/detail not loaded:\n%s", m.View())
 	}
 	m, cmd = press(t, m, "j")
@@ -231,13 +264,18 @@ func TestDispatchHasakiTaskWithKeysAndMouse(t *testing.T) {
 	m, _ = press(t, m, "tab", "right") // repo: agent tự chọn → bom-api
 	m, _ = press(t, m, "tab")
 	m = typeText(m, "ưu tiên sửa backend")
-	m, _ = press(t, m, "ctrl+s")
+	m, cmd = press(t, m, "ctrl+s")
 	if m.modal != nil {
 		t.Fatalf("form error: %s", m.modal.err)
 	}
+	m = drain(t, m, cmd)
+	if !strings.Contains(m.msg, "đã giao HSK-AAA cho agent (1 tệp đính kèm)") {
+		t.Fatalf("msg = %q", m.msg)
+	}
 	tk := readTicket(t, inbox)
 	if tk.ID != "HSK-AAA" || tk.Source != "hw" || tk.Project != "bom" || tk.Repo != "bom-api" ||
-		!strings.Contains(tk.Body, "Mô tả của task HSK-AAA") || !strings.Contains(tk.Body, "ưu tiên sửa backend") {
+		!strings.Contains(tk.Body, "Mô tả của task HSK-AAA") || !strings.Contains(tk.Body, "ưu tiên sửa backend") ||
+		!strings.Contains(tk.Body, "/refs/hw-HSK-AAA/flow.png") {
 		t.Fatalf("ticket = %+v", tk)
 	}
 	created := &store.Task{ID: "hw-HSK-AAA", Title: "Sửa logic MO", Project: "bom"}
@@ -338,7 +376,7 @@ func TestMouseSelectsTaskRow(t *testing.T) {
 		st.SaveTask(tk)
 	}
 	m.reloadTasks()
-	m, _ = click(m, 3, 6) // y=3: "Đang làm" header, tasks at y=4..6
+	m, _ = click(m, 3, 9) // y=3: "Đang làm" header, tasks at y=4-5, 6-7, 8-9
 	if c := m.tasks.current(); c == nil || c.ID != m.tasks.list[2].ID {
 		t.Fatalf("clicked row 2, cursor=%d", m.tasks.cursor)
 	}
@@ -346,11 +384,37 @@ func TestMouseSelectsTaskRow(t *testing.T) {
 
 func TestHWTicketBody(t *testing.T) {
 	body := hwTicketBody(&hasakiwork.Task{ID: 7, Code: "HSK-1", Note: "  làm X  ", Project: &hasakiwork.Ref{Name: "BOM"},
-		Milestone: &hasakiwork.Ref{Name: "Sprint 10"}}, "chú ý Y")
+		Milestone: &hasakiwork.Ref{Name: "Sprint 10"}}, "chú ý Y", nil)
 	for _, want := range []string{"HSK-1 (id 7) — project BOM", "Sprint: Sprint 10", "Description:\nlàm X", "Operator notes:\nchú ý Y"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestHWTicketBodyListsAttachedFiles(t *testing.T) {
+	tk := &hasakiwork.Task{ID: 7, Code: "HSK-1", Note: "Prototype: [https://claude.ai/artifact/AbC_1?sk=k](https://claude.ai/artifact/AbC_1?sk=k) và https://claude.ai/artifact/Bad", NoteFiles: []string{"task/26/11/12/15/spec_2026-11-12_152833.pdf", "task/x/missing.png"}}
+	dir := t.TempDir()
+	files := hwDownloadFiles(fakeHW{}, tk, dir)
+	var fetched []string
+	files = append(files, fetchArtifacts(func(_ context.Context, link, d string) (*claudeai.Artifact, error) {
+		fetched = append(fetched, link)
+		if strings.Contains(link, "Bad") {
+			return nil, claudeai.ErrUnauthorized
+		}
+		return &claudeai.Artifact{URL: link, Title: "Proto", Files: []string{filepath.Join(d, "claude-artifact-AbC_1", "project", "Main.dc.html")}}, nil
+	}, tk.Note, dir)...)
+	if len(fetched) != 2 {
+		t.Fatalf("fetched %v (the markdown link repeats the same artifact)", fetched)
+	}
+	body := hwTicketBody(tk, "", files)
+	for _, want := range []string{`claude.ai artifact "Proto"`, "\n  - " + filepath.Join(dir, "claude-artifact-AbC_1", "project", "Main.dc.html"), "https://claude.ai/artifact/Bad (could not download: claude.ai rejected", "Files attached to or linked from the task", filepath.Join(dir, "spec.pdf"), "https://media.test/task/x/missing.png (could not download: HTTP 404"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q:\n%s", want, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "spec.pdf")); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -397,12 +461,12 @@ func TestLogsProductionTab(t *testing.T) {
 	defer srv.Close()
 	m, _ := logsModel(t, srv.URL)
 
-	m, _ = press(t, m, "3", "e") // Logs opens on QC; e switches to Production
+	m, _ = press(t, m, "3") // Logs opens on Production
 	if m.tab != tabLogs || m.logs.env != envProd || len(m.logProjects()) != 1 || !strings.Contains(m.View(), "Số lỗi") || !strings.Contains(m.View(), "Nhóm lỗi") {
 		t.Fatalf("logs tab (plm must be hidden: no_logs):\n%s", m.View())
 	}
 	// A saved stats search runs with the prod filter; its rows come from /results.
-	m, cmd := press(t, m, "j", "j", "enter") // past the grouping and the investigation entries
+	m, cmd := press(t, m, "j", "j", "j", "j", "enter") // past the 4 shared actions
 	m = drainLogs(t, m, cmd)
 	if len(sent) != 1 || sent[0] != "search kubernetes.namespace_name=bom-prod level=error | stats count by kubernetes.container_name @-1h→now" {
 		t.Fatalf("sent = %q", sent)
@@ -485,7 +549,7 @@ func TestLogsErrorGroupsToTask(t *testing.T) {
 	}))
 	defer srv.Close()
 	m, _ := logsModel(t, srv.URL)
-	m, _ = press(t, m, "3", "e")
+	m, _ = press(t, m, "3")
 	m, cmd := press(t, m, "g")
 	m = drainLogs(t, m, cmd)
 	if len(sent) != 1 || !strings.Contains(sent[0], "by service, sig") || !strings.HasSuffix(sent[0], "@-24h") || strings.Contains(sent[0], "[") {
@@ -527,7 +591,7 @@ func TestLogsAskClaude(t *testing.T) {
 		asked = lc
 		return &splgen.Result{SPL: "kubernetes.container_name=bom-worker level=error | stats count by caller", Earliest: "@d", Explanation: "lỗi worker hôm nay theo caller"}, nil
 	}
-	m, _ = press(t, m, "3", "e", "a")
+	m, _ = press(t, m, "3", "a")
 	if m.modal == nil {
 		t.Fatal("a opens the question form")
 	}
@@ -613,7 +677,7 @@ func TestLogsQCWithArgoCD(t *testing.T) {
 		return &argocd.Client{BaseURL: srv.URL, Token: "t"}, nil
 	}
 
-	m, cmd := press(t, m, "3")
+	m, cmd := press(t, m, "3", "e")
 	m = drainAny(t, m, cmd)
 	if m.logs.env != envQC || len(m.qcApps()) != 2 || !strings.Contains(m.View(), "bom-worker-qc") || strings.Contains(m.View(), "hsk-pdp-backend-qc") {
 		t.Fatalf("QC view for bom (plm app must not show):\n%s", m.View())
@@ -624,14 +688,25 @@ func TestLogsQCWithArgoCD(t *testing.T) {
 		t.Fatalf("plm apps = %v", apps)
 	}
 	m, _ = press(t, m, "left")
-	// Enter loads logs of the selected app's Deployment.
+	// The shared actions come first; the apps follow under their section title.
+	for _, want := range []string{itemGroups, itemInvestigate, itemBuilder, "Ứng dụng QC"} {
+		if !strings.Contains(m.View(), want) {
+			t.Fatalf("QC list misses %q:\n%s", want, m.View())
+		}
+	}
+	// Enter on an app loads the logs of its Deployment, shown like Production lines.
+	m, _ = press(t, m, "j", "j", "j")
+	if c := m.qcCurrent(); c == nil || c.Name != "bom-api-qc" {
+		t.Fatalf("cursor on %v", c)
+	}
 	m, cmd = press(t, m, "enter")
 	m = drainAny(t, m, cmd)
-	if !strings.Contains(m.View(), "MO-77 failed") || !strings.Contains(logQueries[0], "resourceName=bom-api-qc") {
-		t.Fatalf("logs:\n%s\n%v", m.View(), logQueries)
+	if v := m.View(); !strings.Contains(v, "MO-77 failed") || !strings.Contains(v, "ERROR") || !strings.Contains(logQueries[0], "resourceName=bom-api-qc") {
+		t.Fatalf("logs:\n%s\n%v", v, logQueries)
 	}
-	// Mouse: click the second app row (y=5: header, border, env line, project line, row0=4).
-	m, _ = click(m, 3, 5)
+	// Mouse: rows start at y=6 (header, border, env, project, time, rule); app rows
+	// follow the tools title, the 3 actions, a blank and the apps title: bom-worker-qc is y=13.
+	m, _ = click(m, 3, 13)
 	if c := m.qcCurrent(); c == nil || c.Name != "bom-worker-qc" {
 		t.Fatalf("click selected %v", c)
 	}
@@ -665,7 +740,7 @@ func drainAny(t *testing.T, m Model, cmd tea.Cmd) Model {
 	for i := 0; cmd != nil && i < 10; i++ {
 		msg := cmd()
 		switch msg.(type) {
-		case qcAppsMsg, qcLogsMsg, qcSyncMsg, logsResultMsg, hwTasksMsg, hwDetailMsg:
+		case qcAppsMsg, qcResultMsg, qcSyncMsg, logsResultMsg, hwTasksMsg, hwDetailMsg:
 		default:
 			return m
 		}
@@ -870,5 +945,83 @@ func TestPinProfile(t *testing.T) {
 	m, _ = press(t, m, "left", "left", "left", "tab", "left", "ctrl+s")
 	if p, _ := st.TaskProfile("mock-e"); p != nil {
 		t.Fatalf("unpin must clear the profile, got %+v", p)
+	}
+}
+
+func TestRowOffsetKeepsCursorVisible(t *testing.T) {
+	rows := []listRow{{task: -1}, {task: 0}, {task: 1}, {task: 2}, {task: -1}, {task: 3}}
+	for cursor, want := range map[int]int{0: 0, 2: 0, 3: 1} {
+		tt := &tasksTab{cursor: cursor}
+		if got := tt.rowOffset(rows, 5); got != want {
+			t.Errorf("cursor %d: offset %d, want %d", cursor, got, want)
+		}
+	}
+}
+
+func TestLogsClickWithoutProductionLogs(t *testing.T) {
+	m, _, _ := newTest(t)
+	m.tab = tabLogs
+	if len(m.d.Config.LogProjects()) != 0 {
+		t.Skip("test config has production logs")
+	}
+	m, _ = click(m, 5, 5) // used to panic: prodRows dereferenced a nil project
+	_ = m.View()
+}
+
+func TestWorkflowSteps(t *testing.T) {
+	marks := func(ss []step) string {
+		var b strings.Builder
+		for _, s := range ss {
+			b.WriteString(stepLooks[s.state].mark)
+		}
+		return b.String()
+	}
+	req := func(id, gate string) *store.ApprovalRequest { return &store.ApprovalRequest{ID: id, Gate: gate} }
+	ok := func(id string) *store.Decision { return &store.Decision{RequestID: id, Approved: true} }
+	no := func(id string) *store.Decision { return &store.Decision{RequestID: id} }
+	running := &store.Task{State: store.StateRunning}
+	pr := []*store.PullRequest{{Repo: "a", Destination: "release/qc"}}
+	for name, c := range map[string]struct {
+		t       *store.Task
+		reqs    []*store.ApprovalRequest
+		decs    map[string]*store.Decision
+		pending *store.ApprovalRequest
+		prs     []*store.PullRequest
+		want    string
+	}{
+		"new":             {running, nil, nil, nil, nil, "●○○○○○"},
+		"plan waiting":    {&store.Task{State: store.StateAwaitApproval}, []*store.ApprovalRequest{req("plan-1", "plan")}, nil, req("plan-1", "plan"), nil, "⏸○○○○○"},
+		"plan rejected":   {running, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": no("plan-1")}, nil, nil, "↺○○○○○"},
+		"coding":          {running, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": ok("plan-1")}, nil, nil, "✓●○○○○"},
+		"question":        {&store.Task{State: store.StateAwaitApproval}, []*store.ApprovalRequest{req("plan-1", "plan"), req("q-1", store.QuestionGate)}, map[string]*store.Decision{"plan-1": ok("plan-1")}, req("q-1", store.QuestionGate), nil, "✓?○○○○"},
+		"opening PRs":     {running, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1")}, nil, nil, "✓✓✓●○○"},
+		"qc rejected":     {running, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr"), req("qc-1", "qc")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1"), "qc-1": no("qc-1")}, nil, pr, "✓✓✓✓↺○"},
+		"stopped":         {&store.Task{State: store.StateNeedsAttention}, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": ok("plan-1")}, nil, nil, "✓✗○○○○"},
+		"done without qc": {&store.Task{State: store.StateDone}, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1")}, nil, pr, "✓✓✓✓–✓"},
+	} {
+		if got := marks(workflowSteps(c.t, c.reqs, c.decs, c.pending, c.prs)); got != c.want {
+			t.Errorf("%s: %s, want %s", name, got, c.want)
+		}
+	}
+	if bar := workflowBar(workflowSteps(running, nil, nil, nil, nil), 80); !strings.Contains(bar, "0/6") || !strings.Contains(bar, "agent đang làm: Plan") {
+		t.Errorf("bar = %q", bar)
+	}
+}
+
+func TestTaskDetailShowsTheReasonOnce(t *testing.T) {
+	m, st, _ := newTest(t)
+	tk := &store.Task{ID: "mock-r", Title: "x", Project: "bom"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	const reason = "Thay đổi trải dài 3 repo, rủi ro dữ liệu BOM."
+	st.SetAssessment(tk.ID, &store.Assessment{Level: "hard", Kind: "feature", Reason: reason})
+	st.SetTaskProfile(tk.ID, &store.Profile{Model: "opus", Effort: "high", Reason: reason, SetBy: "agent"})
+	m.reloadTasks()
+	if n := strings.Count(m.taskDetail(tk), "rủi ro dữ liệu BOM"); n != 1 {
+		t.Fatalf("reason shown %d times", n)
+	}
+	st.SetTaskProfile(tk.ID, &store.Profile{Model: "opus", Reason: "cần opus cho migration", SetBy: "agent"})
+	if d := m.taskDetail(tk); !strings.Contains(d, "cần opus cho migration") {
+		t.Fatal("a different profile reason must still show")
 	}
 }

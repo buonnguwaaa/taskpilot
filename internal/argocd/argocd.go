@@ -6,7 +6,6 @@ package argocd
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -420,29 +419,6 @@ func (c *Client) Sync(ctx context.Context, name string) error {
 // AppURL is the application's page in the Argo CD UI.
 func AppURL(base, name string) string {
 	return strings.TrimRight(base, "/") + "/applications/" + url.PathEscape(name)
-}
-
-// TokenExpiry reads the exp claim of an Argo CD JWT (nil: no expiry; ok=false: not a JWT).
-func TokenExpiry(token string) (exp *time.Time, ok bool) {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) != 3 {
-		return nil, false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, false
-	}
-	var c struct {
-		Exp int64 `json:"exp"`
-	}
-	if json.Unmarshal(payload, &c) != nil {
-		return nil, false
-	}
-	if c.Exp == 0 {
-		return nil, true
-	}
-	t := time.Unix(c.Exp, 0).UTC()
-	return &t, true
 }
 
 // Match returns the apps that belong to a taskpilot project: listed explicitly,

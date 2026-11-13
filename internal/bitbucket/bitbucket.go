@@ -93,7 +93,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		}
 		return &APIError{Status: resp.StatusCode, Message: msg}
 	}
-	if out == nil {
+	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 	return json.Unmarshal(raw, out)
@@ -187,6 +187,86 @@ func (c *Client) FindOpenPR(ctx context.Context, r RepoRef, source, dest string)
 	return &page.Values[0], nil
 }
 
+var prURLRe = regexp.MustCompile(`bitbucket\.org/([^/]+)/([^/]+)/pull-requests/(\d+)`)
+
+// ParsePRURL extracts the repository and id from a PR web link
+// (https://bitbucket.org/ws/repo/pull-requests/12).
+func ParsePRURL(link string) (RepoRef, int, error) {
+	m := prURLRe.FindStringSubmatch(link)
+	if m == nil {
+		return RepoRef{}, 0, fmt.Errorf("not a Bitbucket pull request link: %q", link)
+	}
+	var id int
+	fmt.Sscan(m[3], &id)
+	return RepoRef{Workspace: m[1], Slug: m[2]}, id, nil
+}
+
+// GetPR reads one pull request.
+func (c *Client) GetPR(ctx context.Context, r RepoRef, id int) (*PullRequest, error) {
+	var pr PullRequest
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repositories/%s/%s/pullrequests/%d", r.Workspace, r.Slug, id), nil, &pr); err != nil {
+		return nil, err
+	}
+	return &pr, nil
+}
+
+// MergeInput describes a merge. An empty Strategy uses the repository's
+// default merge strategy.
+type MergeInput struct {
+	Strategy          string // merge_commit, squash or fast_forward
+	Message           string
+	CloseSourceBranch bool
+}
+
+// MergePR merges an open pull request. Agents reach it only through the
+// merge_pull_request tool, which checks the operator asked for the merge.
+// Bitbucket may finish a large merge asynchronously (HTTP 202): the returned
+// PR is then nil and the merge completes on the server.
+func (c *Client) MergePR(ctx context.Context, r RepoRef, id int, in MergeInput) (*PullRequest, error) {
+	body := map[string]any{"close_source_branch": in.CloseSourceBranch}
+	if in.Strategy != "" {
+		body["merge_strategy"] = in.Strategy
+	}
+	if in.Message != "" {
+		body["message"] = in.Message
+	}
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/merge", r.Workspace, r.Slug, id), body, &raw); err != nil {
+		return nil, err
+	}
+	var pr PullRequest
+	if json.Unmarshal(raw, &pr) != nil || pr.ID == 0 {
+		return nil, nil
+	}
+	return &pr, nil
+}
+
+// DeclinePR declines (closes without merging) an open pull request.
+func (c *Client) DeclinePR(ctx context.Context, r RepoRef, id int) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/repositories/%s/%s/pullrequests/%d/decline", r.Workspace, r.Slug, id), map[string]any{}, nil)
+}
+
+// MergeByURL merges the PR behind a web link after checking it is still open.
+// done is false when Bitbucket accepted the merge but finishes it later.
+func (c *Client) MergeByURL(ctx context.Context, link string, in MergeInput) (done bool, err error) {
+	ref, id, err := ParsePRURL(link)
+	if err != nil {
+		return false, err
+	}
+	pr, err := c.GetPR(ctx, ref, id)
+	if err != nil {
+		return false, err
+	}
+	if pr.State != "OPEN" {
+		return false, fmt.Errorf("PR #%d of %s is %s, not OPEN", id, ref, pr.State)
+	}
+	merged, err := c.MergePR(ctx, ref, id, in)
+	if err != nil {
+		return false, err
+	}
+	return merged != nil, nil
+}
+
 // RecentMerged returns the latest merged PRs (source and destination only).
 func (c *Client) RecentMerged(ctx context.Context, r RepoRef, n int) ([]PullRequest, error) {
 	q := url.Values{"state": {"MERGED"}, "pagelen": {fmt.Sprint(n)},
@@ -198,19 +278,6 @@ func (c *Client) RecentMerged(ctx context.Context, r RepoRef, n int) ([]PullRequ
 		return nil, err
 	}
 	return page.Values, nil
-}
-
-// RecentDestinations counts the destination branches of the latest merged PRs.
-func (c *Client) RecentDestinations(ctx context.Context, r RepoRef, n int) (map[string]int, error) {
-	prs, err := c.RecentMerged(ctx, r, n)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]int{}
-	for _, p := range prs {
-		out[p.Destination.Branch.Name]++
-	}
-	return out, nil
 }
 
 var longLived = regexp.MustCompile(`^(main|master|develop|dev|release/.+|hotfix/?$|.*-qc$|.*-prod$)$`)

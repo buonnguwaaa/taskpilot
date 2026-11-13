@@ -130,3 +130,61 @@ func TestIsEpic(t *testing.T) {
 		t.Fatal("IsEpic: only names tagged [EPIC]")
 	}
 }
+
+func TestReportWritesResultThenStatus(t *testing.T) {
+	var calls []string
+	var result string
+	var status map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/hr/projects/mass-update-field-task-input":
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+				var b map[string]any
+				json.NewDecoder(r.Body).Decode(&b)
+				calls = append(calls, fmt.Sprintf("field:%v=%v", b["field"], b["value"]))
+				io.WriteString(w, okJSON(`true`))
+				return
+			}
+			r.ParseMultipartForm(1 << 20)
+			calls = append(calls, "result:"+r.FormValue("id")+":"+r.FormValue("field"))
+			result = r.FormValue("value[configs][virtual_text]")
+			io.WriteString(w, okJSON(`true`))
+		case "/api/hr/projects/task-input/555":
+			calls = append(calls, "detail")
+			io.WriteString(w, okJSON(`{"id":555,"code":"HSK-X","staff":[{"id":901,"staff_id":11},{"id":902,"staff_id":39324}]}`))
+		case "/api/hr/projects/update-assign-status":
+			calls = append(calls, "status")
+			json.NewDecoder(r.Body).Decode(&status)
+			io.WriteString(w, okJSON(`true`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(staticToken("tok"))
+	c.BaseURL = srv.URL + "/api"
+	ctx := context.Background()
+
+	if err := c.Report(ctx, 555, 39324, "Đã chặn gen WO <SKU>\nPR #286\n\nCòn lại: không", 150, StatusWaitingApproval); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(calls, ",") != "result:555:data,field:reality_hours=150,detail,status" {
+		t.Fatalf("calls = %v", calls)
+	}
+	if result != "<p>Đã chặn gen WO &lt;SKU&gt;<br>PR #286</p><p>Còn lại: không</p>" {
+		t.Fatalf("result html = %q", result)
+	}
+	if fmt.Sprint(status) != "map[assign_id:902 status:5 task_id:555]" {
+		t.Fatalf("status payload = %v", status)
+	}
+	// Not an assignee: the result is written, the status is not.
+	calls = nil
+	if err := c.Report(ctx, 555, 77, "x", 0, StatusFinished); err == nil || !strings.Contains(err.Error(), "không nằm trong danh sách người thực hiện") {
+		t.Fatalf("not assigned: %v", err)
+	}
+	// Status 0: result only.
+	calls = nil
+	if err := c.Report(ctx, 555, 39324, "x", 0, 0); err != nil || strings.Join(calls, ",") != "result:555:data" {
+		t.Fatalf("result only: %v %v", calls, err)
+	}
+}

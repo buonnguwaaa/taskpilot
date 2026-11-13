@@ -132,12 +132,29 @@ func shortenURLs(s string, max int) (string, []link) {
 		}
 		l := link{label: shortenURL(u, max), url: u}
 		b.WriteString(rest[:i])
-		b.WriteString(l.label)
+		b.WriteString(unbreakable(l.label))
 		rest = rest[i+len(u):]
 		links = append(links, l)
 	}
 	b.WriteString(rest)
 	return b.String(), links
+}
+
+// nbHyphen is U+2011, a hyphen word wrapping does not break at. Labels
+// are wrapped with it so a link never splits over lines (terminals open
+// only the piece clicked), then it is put back (restoreLabels).
+const nbHyphen = "\u2011"
+
+func unbreakable(label string) string { return strings.ReplaceAll(label, "-", nbHyphen) }
+
+// restoreLabels puts the real hyphens back in the wrapped labels.
+func restoreLabels(s string, links []link) string {
+	for _, l := range links {
+		if nb := unbreakable(l.label); nb != l.label {
+			s = strings.ReplaceAll(s, nb, l.label)
+		}
+	}
+	return s
 }
 
 // shortenURL fits u into max columns: drop the scheme, then keep the host and

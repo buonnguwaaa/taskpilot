@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
+	"github.com/buonnguwaaa/taskpilot/internal/claudeai"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/desktop"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
@@ -25,17 +26,22 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
+	"github.com/buonnguwaaa/taskpilot/internal/worklog"
 )
 
 // HW is the part of the Hasaki Work client the TUI uses.
 type HW interface {
 	MyTasks(ctx context.Context, statusFilter string) ([]hasakiwork.Task, error)
 	Task(ctx context.Context, id int64) (*hasakiwork.Task, error)
-	// Used by key h in the Tasks tab (create a task on Hasaki Work).
+	// Used by key h in the Tasks tab (create a task on Hasaki Work, report).
 	Profile(ctx context.Context) (*hasakiwork.Profile, error)
 	CurrentEpics(ctx context.Context, projectID int64, mine []hasakiwork.Task) (map[hasakiwork.EpicKind]*hasakiwork.Epic, error)
 	CreateTask(ctx context.Context, t hasakiwork.NewTask) (*hasakiwork.Created, error)
 	AssignStaff(ctx context.Context, taskID int64, staffIDs ...int64) error
+	Report(ctx context.Context, taskID, staffID int64, result string, realityMinutes, status int) error
+	// DownloadFile saves a task file (Task.NoteFiles) into dir.
+	DownloadFile(ctx context.Context, path, dir string) (string, error)
+	FileURL(path string) string
 }
 
 // Herdr is the part of the herdr client the TUI uses.
@@ -69,12 +75,23 @@ type Deps struct {
 	Splunk func(ctx context.Context) (*splunk.Client, error)
 	// ArgoCD returns a client for the QC environment (nil: not configured).
 	ArgoCD func(ctx context.Context) (*argocd.Client, error)
+	// ClaudeArtifact downloads a claude.ai artifact (prototype) linked from a
+	// task into dir; nil when not wired.
+	ClaudeArtifact func(ctx context.Context, link, dir string) (*claudeai.Artifact, error)
 	// AuthStatus returns the lines of the status page's login section.
 	AuthStatus func() []string
 	OpenURL    func(string) error
 	Copy       func(string) error
+	// OpenEditor opens a directory in the operator's IDE (key w).
+	OpenEditor func(dir string) error
 	// Draft turns a free-form prompt into a ticket draft (nil: "N" is unavailable).
 	Draft func(ctx context.Context, prompt string) (*intake.Draft, error)
+	// WorkLog drafts the name and result of a Hasaki Work report (nil: the
+	// forms are prefilled without Claude).
+	WorkLog func(ctx context.Context, in worklog.Input) (*worklog.Draft, error)
+	// Assess estimates the level and kind of a task the agent has not
+	// assessed (nil: not shown until the agent does).
+	Assess func(ctx context.Context, in worklog.AssessInput) (*worklog.Assessment, error)
 	// SPLGen writes a Splunk search from a question (nil: "Hỏi bằng lời" is unavailable).
 	SPLGen func(ctx context.Context, lc splgen.Context, question string) (*splgen.Result, error)
 }
@@ -126,6 +143,8 @@ type Model struct {
 	// mouseOff hands the mouse back to the terminal (F2), so text can be
 	// selected and copied; clicks and the wheel then do nothing in the TUI.
 	mouseOff bool
+	prefs    uiPrefs
+	dragging bool // the panel divider is being dragged (split.go)
 
 	width, height int
 	tab           tabID
@@ -157,6 +176,13 @@ func New(d Deps) Model {
 	if d.Copy == nil {
 		d.Copy = desktop.Copy
 	}
+	if d.OpenEditor == nil {
+		editor := ""
+		if d.Config != nil {
+			editor = d.Config.Editor
+		}
+		d.OpenEditor = func(dir string) error { return openEditor(editor, dir) }
+	}
 	ci := textinput.New()
 	ci.Prompt = ":"
 	ci.CharLimit = 2000
@@ -167,6 +193,7 @@ func New(d Deps) Model {
 	m.logs.vp = viewport.New(60, 20)
 	m.logs.intro = true
 	m.stVP = viewport.New(100, 20)
+	m.loadPrefs()
 	m.resize()
 	m.reloadTasks()
 	m.refreshBanner()
@@ -194,7 +221,6 @@ func (m *Model) refreshBanner() {
 
 // ---- layout ---------------------------------------------------------------
 
-func (m Model) listWidth() int   { return max(34, m.width*2/5) }
 func (m Model) innerHeight() int { return max(3, m.height-4) } // header + footer + box borders
 
 // listRows is how many list entries fit under a list box's title line.
@@ -210,11 +236,13 @@ func (m *Model) resize() {
 	m.hw.vp.Width, m.hw.vp.Height = dw, h
 	m.logs.vp.Width, m.logs.vp.Height = dw, h
 	if m.logs.intro {
-		m.logs.prodBody = dimStyle.Render(wrap("Chọn một truy vấn bên trái rồi Enter (hoặc click lần hai).\n\n"+
-			"/  tìm tự do (bộ lọc prod của project được tự thêm vào)\n"+
-			"t  đổi khoảng thời gian\n"+
-			"i  kiến thức log production của project: namespace, trường log, request_id, cách điều tra\n"+
-			"o  mở truy vấn vừa chạy trên Splunk Web · c copy SPL", dw))
+		m.logs.prodBody = logsIntro("Chọn một truy vấn bên trái rồi Enter (hoặc click lần hai).", [][2]string{
+			{"/", "tìm tự do (bộ lọc prod của project được tự thêm vào)"},
+			{"t", "đổi khoảng thời gian"},
+			{"i", "kiến thức log production của project: namespace, trường log, request_id, cách điều tra"},
+			{"o", "mở truy vấn vừa chạy trên Splunk Web"},
+			{"c", "copy SPL"},
+		}, dw)
 	}
 	if m.logs.env == envProd {
 		if m.logs.intro {
@@ -224,9 +252,9 @@ func (m *Model) resize() {
 	} else {
 		m.refreshQC()
 	}
-	m.stVP.Width, m.stVP.Height = max(20, m.width-4), h
+	m.stVP.Width, m.stVP.Height = max(20, m.width-1), h+2
 	m.refreshTaskDetail(true)
-	m.refreshHWDetail(true)
+	m.refreshHWDetail()
 	m.refreshStatus()
 }
 
@@ -245,6 +273,11 @@ func (m Model) tabAt(x int) (tabID, bool) {
 
 func (m Model) tabLabel(t tabID) string {
 	label := fmt.Sprintf(" %d %s ", int(t)+1, tabNames[t])
+	if t == tabLogs {
+		if n := m.logs.suggestions; n > 0 {
+			label = fmt.Sprintf(" 3 Logs (%d đề xuất) ", n)
+		}
+	}
 	if t == tabTasks {
 		if n := m.tasks.needsYou; n > 0 {
 			label = fmt.Sprintf(" 1 Tasks (%d cần bạn) ", n)
@@ -267,6 +300,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.msg = string(msg)
 		m.reloadTasks()
 		return m, nil
+	case qcResultMsg:
+		return m.onQCResult(msg)
+	case qcStartedMsg:
+		m.logs.qc.view, m.logs.qc.fetching = msg.view, true
+		m.refreshQC()
+		return m, nil
+	case workDraftMsg:
+		return m.onWorkDraft(msg)
+	case assessedMsg:
+		return m.onAssessed(msg)
+	case otherAnswerMsg:
+		return m.onOtherAnswer(msg)
 	case investigateMsg:
 		if m.modal != nil {
 			return m, nil
@@ -280,17 +325,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onHWEpics(msg)
 	case hwPushedMsg:
 		delete(m.tasks.hwPushing, msg.taskID)
+		delete(m.tasks.workDrafts, msg.taskID) // the next report drafts again
 		m.msg = msg.msg
 		m.reloadTasks()
 		return m, nil
+	case undoRequestedMsg:
+		return m.onUndoRequested(msg)
 	case tickMsg:
+		m.logs.suggestions = m.suggestionCount("")
 		m.reloadConfig()
 		m.reloadTasks()
 		m.refreshBanner()
 		if m.tab == tabStatus {
 			m.refreshStatus()
 		}
-		return m, tick()
+		mm, cmd := m.assessNext()
+		return mm, tea.Batch(tick(), cmd)
 
 	case execDoneMsg:
 		if msg.takeover != "" {
@@ -339,14 +389,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onLogsResult(msg)
 	case qcAppsMsg:
 		return m.onQCApps(msg)
-	case qcLogsMsg:
-		return m.onQCLogs(msg)
 	case qcSyncMsg:
 		return m.onQCSync(msg)
-	case qcFilterMsg:
-		m.logs.qc.filter = string(msg)
-		m.refreshQC()
-		return m, nil
 
 	case tea.MouseMsg:
 		return m.onMouse(msg)
@@ -398,6 +442,13 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.tab == tabTasks && m.tasks.searching {
 		return m.searchKey(k) // typed text, not shortcuts
 	}
+	// Questions waiting in the Tasks tab: digits pick, ←/→ change question,
+	// 0 writes another answer, Enter sends (before the digits switch tabs).
+	if m.tab == tabTasks {
+		if mm, cmd, ok := m.inlineKey(k); ok {
+			return mm, cmd
+		}
+	}
 
 	switch k.String() {
 	case "f2":
@@ -408,6 +459,10 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.msg = "đã bật lại chuột trong TUI (giữ Shift khi kéo để vẫn bôi đen được)"
 		return m, tea.EnableMouseCellMotion
+	case "<", ">", "=":
+		if mm, ok := m.splitKey(k.String()); ok {
+			return mm, nil
+		}
 	case "ctrl+c", "q":
 		return m.quit()
 	case "1", "2", "3", "4":
@@ -497,6 +552,9 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.modal != nil || m.conf != nil || m.palette {
 		return m, nil
 	}
+	if mm, ok := m.onDividerDrag(ev); ok {
+		return mm, nil
+	}
 	wheel := ev.Button == tea.MouseButtonWheelUp || ev.Button == tea.MouseButtonWheelDown
 	up := ev.Button == tea.MouseButtonWheelUp
 	if ev.Action != tea.MouseActionPress && !wheel {
@@ -517,11 +575,7 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabTasks:
 		if wheel && !inList {
-			if up {
-				m.tasks.vp.ScrollUp(3)
-			} else {
-				m.tasks.vp.ScrollDown(3)
-			}
+			scroll(&m.tasks.vp, up)
 			return m, nil
 		}
 		if wheel {
@@ -530,25 +584,21 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		if inList && ev.Button == tea.MouseButtonLeft && row >= 0 && row < m.listRows() {
 			all := m.tasks.rows()
-			if i := m.tasks.rowOffset(all, m.listRows()) + row; i < len(all) && all[i].task >= 0 {
-				m.tasks.cursor = all[i].task
+			if lines := m.tasks.listLayout(all, m.listRows()); row < len(lines) && all[lines[row].row].task >= 0 {
+				m.tasks.cursor = all[lines[row].row].task
 				m.refreshTaskDetail(false)
 			}
 		}
 	case tabHasaki:
 		if wheel && !inList {
-			if up {
-				m.hw.vp.ScrollUp(3)
-			} else {
-				m.hw.vp.ScrollDown(3)
-			}
+			scroll(&m.hw.vp, up)
 			return m, nil
 		}
 		if wheel {
 			return m.moveHW(map[bool]int{true: -1, false: 1}[up])
 		}
 		if inList && ev.Button == tea.MouseButtonLeft && row >= 0 && row < m.listRows() {
-			if i := m.hw.offset(m.listRows()) + row; i < len(m.hw.list) {
+			if i := m.hw.offset(m.listRows()) + row/taskEntryLines; i < len(m.hw.list) {
 				if i == m.hw.cursor {
 					return m.dispatchHW() // click the selected row again to dispatch
 				}
@@ -558,52 +608,55 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	case tabLogs:
 		if wheel && !inList {
-			if up {
-				m.logs.vp.ScrollUp(3)
-			} else {
-				m.logs.vp.ScrollDown(3)
-			}
+			scroll(&m.logs.vp, up)
 			return m, nil
 		}
-		// List rows start at y=4: header, box border, environment line, project line.
-		r := ev.Y - 4
 		if !inList || ev.Button != tea.MouseButtonLeft {
 			return m, nil
 		}
 		if ev.Y == 2 {
 			return m.switchEnv()
 		}
+		// Same layout for both environments (logs_common.go).
 		if m.logs.env == envQC {
-			if r >= 0 && r < len(m.qcApps()) {
-				if r == m.logs.qc.cursor {
-					return m.loadQCLogs()
+			if i := m.logsRowAt(m.qcRows(), m.logs.qc.row, ev.Y); i >= 0 {
+				if i == m.logs.qc.row {
+					return m.qcRunRow()
 				}
-				m.logs.qc.cursor = r
+				m.logs.qc.row, m.logs.qc.groupsFocus = i, false
+				if m.qcCurrent() != nil {
+					m.logs.qc.view = qcViewApp
+				}
 				m.refreshQC()
 			}
-		} else if r >= 0 && r < len(m.logItems()) {
-			if r == m.logs.cursor {
+		} else if i := m.logsRowAt(m.prodRows(), m.logs.cursor, ev.Y); i >= 0 {
+			if i == m.logs.cursor {
 				return m.runLogItem()
 			}
-			m.logs.cursor = r
+			m.logs.cursor, m.logs.groupsFocus = i, false
 		}
 	case tabStatus:
 		if wheel {
-			if up {
-				m.stVP.ScrollUp(3)
-			} else {
-				m.stVP.ScrollDown(3)
-			}
+			scroll(&m.stVP, up)
 		}
 	}
 	return m, nil
+}
+
+// scroll moves a viewport by the mouse wheel.
+func scroll(vp *viewport.Model, up bool) {
+	if up {
+		vp.ScrollUp(3)
+	} else {
+		vp.ScrollDown(3)
+	}
 }
 
 // ---- command line -----------------------------------------------------------
 
 var interactiveCommands = map[string]bool{
 	"auth login": true, "auth set-token": true, "auth set-cookie": true, "auth bitbucket": true, "auth splunk": true,
-	"auth argocd": true,
+	"auth argocd": true, "auth vault": true, "auth kafka": true, "auth claude": true,
 }
 
 func (m Model) onPaletteKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -730,7 +783,7 @@ func (m Model) View() string {
 	case tabLogs:
 		body = m.logsView()
 	case tabStatus:
-		body = boxStyle.Width(m.width - 2).Height(m.innerHeight()).Render(m.stVP.View())
+		body = lipgloss.NewStyle().Width(m.width).Height(m.stVP.Height).Render(m.stVP.View()) // the cards have their own frames
 	}
 	footer := m.footerView()
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -805,31 +858,40 @@ func (m Model) footerView() string {
 	keys := ""
 	switch m.tab {
 	case tabTasks:
-		keys = "↑↓ chọn · a duyệt · A duyệt+ghi chú · x từ chối · m nhắn · p PR · h đẩy lên Hasaki Work · o làm tay · v hoạt động · / tìm · e model · c xong · d xoá · n task mới · N task từ prompt · f lọc"
+		keys = "↑↓ chọn · n task mới · d xoá · c xong · a duyệt · x từ chối · m nhắn · u thu hồi · t trò chuyện · Enter cuộn chi tiết · / tìm · p PR · h Hasaki Work · A duyệt+ghi chú · H subtask · o làm tay · v hoạt động · w/W xem code · e model · N task từ prompt · f lọc"
+		if p := m.tasks.pending; p != nil && len(p.Questions) > 0 {
+			keys = "câu hỏi: " + inlineKeys(p) + " · ↑↓ task khác"
+		}
+		if m.tasks.focus {
+			keys = "chi tiết: j/k ↑↓ cuộn · PgUp/PgDn nửa trang · g/G đầu/cuối · t Tổng quan/Trò chuyện · Esc/← về danh sách"
+		}
 		if m.tasks.drafting {
 			keys = "Claude đang soạn task từ prompt… · " + keys
 		}
 	case tabHasaki:
 		keys = "↑↓ chọn · Enter giao cho agent · n tạo subtask · s lọc trạng thái · r tải lại"
 	case tabLogs:
+		common := "↑↓ chọn · Enter chạy · g nhóm lỗi · n điều tra · / tìm · t/T thời gian · r chạy lại · c copy"
 		if m.logs.env == envQC {
-			keys = "e Production · ←/→ project · ↑↓ app · Enter log · / lọc · t thời gian · o Argo CD · S sync · r tải lại"
+			keys = "e Production · ←/→ project · " + common + " · o Argo CD · S sync"
 		} else {
-			keys = "e QC · ←/→ project · ↑↓ chọn · Enter chạy · g nhóm lỗi · n điều tra · / tìm theo điều kiện · a hỏi bằng lời · t/T thời gian · o Splunk Web · c copy · i kiến thức"
-			if m.logs.groupsFocus {
-				keys = "nhóm lỗi: ↑↓ chọn · Enter xem log · n điều tra · f sửa ngay · s chỉ service này · t thời gian · r chạy lại · esc về danh sách"
-			}
-			if m.logs.generating {
-				keys = "Claude đang viết SPL… · " + keys
-			}
-			if m.logs.running {
-				keys = "đang tìm trên Splunk… · " + keys
-			}
+			keys = "e QC · ←/→ project · " + common + " · a hỏi bằng lời · o Splunk Web · i kiến thức"
+		}
+		if m.logs.suggFocus {
+			keys = "đề xuất: " + suggestKeys
+		} else if m.logs.groupsFocus || m.logs.qc.groupsFocus {
+			keys = "nhóm lỗi: ↑↓ chọn · Enter xem log · n điều tra · f sửa ngay · s chỉ service này · esc về danh sách"
+		}
+		if m.logs.generating {
+			keys = "Claude đang viết SPL… · " + keys
+		}
+		if m.logs.running || m.logs.qc.fetching {
+			keys = "đang đọc log… · " + keys
 		}
 	case tabStatus:
-		keys = "l Hasaki · s/S Splunk (S: tạo token) · a Argo CD · t dán token · b Bitbucket · d doctor · r làm mới"
+		keys = "l Hasaki · s/S Splunk (S: tạo token) · a Argo CD · v Vault QC · K Kafka UI · t dán token · b Bitbucket · d doctor · r làm mới"
 	}
-	keys += " · 1-4 tab · : lệnh · F2 bôi đen · ? trợ giúp · q thoát"
+	keys += " · 1-4 tab · </> độ rộng panel · : lệnh · F2 bôi đen · ? trợ giúp · q thoát"
 	if m.mouseOff {
 		keys = "[chuột: bôi đen, F2 tắt] · " + keys
 	}
@@ -843,16 +905,27 @@ func (m Model) helpView() string {
 	h := `taskpilot — làm mọi thứ bằng phím hoặc chuột
 
 Chung      1 2 3 4 / Tab: đổi tab (hoặc click tên tab) · : gõ lệnh taskpilot bất kỳ
+           < > thu hẹp / mở rộng panel bên trái · = về mặc định · hoặc kéo đường chia giữa hai panel bằng chuột (được nhớ)
            F2 bật/tắt chuột trong TUI: tắt để kéo bôi đen và copy (hoặc giữ Shift khi kéo)
            ? trợ giúp · q thoát
 
 Tasks      ↑↓ / click: chọn task · cuộn chuột bên phải: đọc plan/diff dài
+           Enter / → : chuyển phím sang khung chi tiết (j/k cuộn, g/G đầu/cuối, Esc/← quay lại) · Space/PgDn cuộn nửa trang
+           t Tổng quan ⇄ Trò chuyện: toàn bộ hội thoại với agent theo từng lượt chạy (agent viết gì, làm gì,
+             hỏi/xin duyệt gì, bạn trả lời/duyệt/nhắn gì) · Level (● Nhẹ/Trung bình/Khó/Rất khó) và loại task do agent đánh giá
            a duyệt yêu cầu đang chờ · A duyệt kèm ghi chú · x từ chối kèm nhận xét
            m nhắn agent (task đang dừng) · p mở PR / trang tạo PR · v mở/thu gọn Hoạt động
-           h tạo task trên Hasaki Work từ task này: chọn dự án + nhập tên, EPIC (DEV / Improve / Issue Production)
+           u thu hồi tin nhắn / quyết định cuối bạn gửi, bất cứ lúc nào: dừng lượt agent đang chạy, tua session về trước nó,
+             rồi mở lại form với nội dung cũ để sửa (file agent đã sửa trong lượt đó vẫn còn)
+           h Hasaki Work: task tạo trong taskpilot → tạo task trên Work (EPIC, sprint, giao cho bạn) và ghi kết quả + đánh hoàn thành/chờ duyệt;
+             task lấy từ Work → tạo SUBTASK dưới nó, giao cho bạn, ghi kết quả + giờ thực tế, đánh hoàn thành subtask
+             (task cha giữ nguyên) · H tạo nhiều subtask trống cho task lấy từ Work
+           (tạo task:) chọn dự án + nhập tên, EPIC (DEV / Improve / Issue Production)
              và sprint hiện tại được điền tự động, task giao cho bạn
            o làm tay trong session của agent · n tạo task mới · f chỉ hiện task cần bạn
            / tìm task (theo id, tên, project, nhánh, ticket; gõ không dấu được) · Esc xoá bộ lọc
+           w mở workspace của task trong Cursor/VS Code (xem thay đổi của agent, không cần checkout nhánh)
+           W chuyển repo chính của bạn sang commit mới nhất của task (detached; repo phải sạch); W lần nữa: cập nhật / quay về
            e chọn model/effort cho task (ghim, hoặc để agent tự chọn sau khi đánh giá task)
            c đánh dấu task xong bằng tay (kèm ghi chú) · d xoá task (hỏi lại trước; xoá cả workspace, giữ nhánh git và PR)
            danh sách chia hai nhóm: Đang làm ở trên, Đã xong ở dưới
@@ -862,15 +935,14 @@ Hasaki     ↑↓ / click: chọn task · Enter (hoặc click lần 2): giao cho
            n tạo subtask dưới task đang chọn (mỗi dòng một subtask, cùng dự án + sprint, giao cho bạn)
            s đổi bộ lọc (đang mở / chờ duyệt / đã xong) · r tải lại
 
-Logs       e đổi môi trường: QC (Argo CD, cả 3 project) ↔ Production (Splunk, bom + payment)
-  QC       ←/→ project · ↑↓ app · Enter xem log pod · / lọc · t khoảng thời gian
-           o mở app trên Argo CD · S sync (hỏi xác nhận) · r tải lại trạng thái
-  Prod     ←/→ project · ↑↓ truy vấn · Enter chạy (hỏi tham số) · t/T thời gian (15 phút … hôm nay, hôm qua, 7 ngày)
-           g nhóm lỗi theo service: ↑↓ chọn nhóm · Enter xem log · n tạo task điều tra · f tạo task sửa ngay · s chỉ service đó
-           n điều tra sự cố: từ nhóm lỗi, từ kết quả tìm log, hoặc từ mô tả triệu chứng (mục 🔎) — agent tìm nguyên nhân gốc
-             trên Splunk + code + DB QC, báo cáo ở cổng plan, chỉ sửa khi bạn duyệt
-           / tìm theo điều kiện (service, mức, chuỗi, request_id → tự sinh SPL) · a hỏi bằng lời (Claude viết SPL)
-           o mở trên Splunk Web · c copy SPL · r chạy lại · i kiến thức log production
+Logs       e đổi môi trường: QC (Argo CD, cả 3 project) ↔ Production (Splunk, bom + payment) — cùng bố cục, cùng phím:
+           ←/→ project · ↑↓ chọn · Enter chạy · t/T thời gian (15 phút … hôm nay, hôm qua, 7 ngày) · r chạy lại · c copy
+           g nhóm lỗi theo service: ↑↓ chọn nhóm · Enter xem log · n điều tra · f sửa ngay · s chỉ service đó · esc
+           n điều tra sự cố: từ nhóm lỗi, từ log đang xem, hoặc mục 🔎 (mô tả triệu chứng) — agent tìm nguyên nhân gốc,
+             báo cáo ở cổng plan, chỉ sửa khi bạn duyệt
+           / tìm theo điều kiện: service, mức, chuỗi, request_id
+  QC       log đọc từ Argo CD (không có trên Splunk) · danh sách app: Enter xem log pod · S sync · o mở Argo CD
+  Prod     truy vấn có sẵn (hỏi tham số) · a hỏi bằng lời (Claude viết SPL) · o Splunk Web · i kiến thức log
 
 Status     l đăng nhập Hasaki Work · s đăng nhập Splunk · S đăng nhập + tạo token Splunk · t dán JWT · b lưu token Bitbucket · d doctor
            : splunk search "<SPL>" -earliest -1h   tự tìm log
@@ -893,7 +965,7 @@ var (
 	boxStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 	modalStyle     = lipgloss.NewStyle().Border(lipgloss.ThickBorder()).BorderForeground(lipgloss.Color("12")).Padding(1, 2)
 	tabStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
-	activeTabStyle = lipgloss.NewStyle().Bold(true).Reverse(true)
+	activeTabStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12"))
 	stateColors    = map[store.State]string{
 		store.StateQueued:         "12",
 		store.StatePreparing:      "12",

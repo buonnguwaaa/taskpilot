@@ -211,10 +211,8 @@ func MergeCookies(header string, updates []*http.Cookie) string {
 // Status summarizes the stored credentials without revealing them.
 type Status struct {
 	TokenExpiresAt *time.Time
-	TokenUpdatedAt time.Time
 	HasToken       bool
 	HasCookie      bool
-	CookieUpdated  time.Time
 	CookieExpires  *time.Time
 }
 
@@ -262,12 +260,12 @@ func round(d time.Duration) string {
 func ReadStatus(ctx context.Context, d *db.DB) (Status, error) {
 	var s Status
 	if m, err := d.Meta(ctx, SecretToken); err == nil {
-		s.HasToken, s.TokenExpiresAt, s.TokenUpdatedAt = true, m.ExpiresAt, m.UpdatedAt
+		s.HasToken, s.TokenExpiresAt = true, m.ExpiresAt
 	} else if !errors.Is(err, db.ErrNoSecret) {
 		return s, err
 	}
 	if m, err := d.Meta(ctx, SecretCookie); err == nil {
-		s.HasCookie, s.CookieUpdated, s.CookieExpires = true, m.UpdatedAt, m.ExpiresAt
+		s.HasCookie, s.CookieExpires = true, m.ExpiresAt
 	} else if !errors.Is(err, db.ErrNoSecret) {
 		return s, err
 	}

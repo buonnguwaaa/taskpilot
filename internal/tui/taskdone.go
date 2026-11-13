@@ -40,8 +40,8 @@ func (m Model) markDone(t *store.Task) (tea.Model, tea.Cmd) {
 		}
 		return func() tea.Msg { return releaseMsg(id, ws) }, nil
 	})
-	f.hint = "Task chuyển sang done; agent không chạy tiếp. Worktree sạch được gỡ để bạn checkout được nhánh của task trong repo của mình;" +
-		" worktree còn thay đổi chưa commit thì giữ lại. Nhánh và commit vẫn còn nguyên.\nGhi chú dùng làm tóm tắt hoàn thành (và mô tả khi bấm h đẩy lên Hasaki Work)."
+	f.hint = "Task chuyển sang done; agent không chạy tiếp. Worktree được giữ (để quay lại làm tiếp) nhưng chuyển sang detached, nên bạn checkout được nhánh của task trong repo của mình;" +
+		" worktree còn thay đổi chưa commit thì vẫn giữ nhánh. Nhắn lại task thì worktree tự gắn về nhánh.\nGhi chú dùng làm tóm tắt hoàn thành (và mô tả khi bấm h đẩy lên Hasaki Work)."
 	if m.tasks.pending != nil && m.tasks.current() == t {
 		f.hint += fmt.Sprintf("\nYêu cầu %s đang chờ duyệt sẽ được đóng.", m.tasks.pending.ID)
 	}
@@ -50,18 +50,19 @@ func (m Model) markDone(t *store.Task) (tea.Model, tea.Cmd) {
 	return m, f.start()
 }
 
-// releaseMsg frees the clean worktrees of a task marked done and reports it.
+// releaseMsg frees the branches of a task marked done (its worktrees stay,
+// detached) and reports it.
 func releaseMsg(id, ws string) tea.Msg {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	kept, err := workspace.Release(ctx, ws)
+	kept, err := workspace.Detach(ctx, ws)
 	switch {
 	case err != nil:
-		return infoMsg("đã đánh dấu xong " + id + ", nhưng gỡ worktree lỗi: " + err.Error())
+		return infoMsg("đã đánh dấu xong " + id + ", nhưng nhả nhánh lỗi: " + err.Error())
 	case len(kept) > 0:
-		return infoMsg(fmt.Sprintf("đã đánh dấu xong %s; giữ worktree còn thay đổi chưa commit: %s", id, strings.Join(kept, ", ")))
+		return infoMsg(fmt.Sprintf("đã đánh dấu xong %s; repo còn thay đổi chưa commit vẫn giữ nhánh: %s", id, strings.Join(kept, ", ")))
 	}
-	return infoMsg("đã đánh dấu xong " + id + " và trả nhánh lại (gỡ worktree)")
+	return infoMsg("đã đánh dấu xong " + id + " và nhả nhánh (worktree vẫn giữ, detached)")
 }
 
 // closeTask moves a parked task to done. The state changes first: once done,

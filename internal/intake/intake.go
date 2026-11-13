@@ -6,17 +6,15 @@
 package intake
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/buonnguwaaa/taskpilot/internal/config"
+	"github.com/buonnguwaaa/taskpilot/internal/oneshot"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 )
 
@@ -88,9 +86,12 @@ func (d *Drafter) Draft(ctx context.Context, prompt string) (*Draft, error) {
 	defer cancel()
 	run := d.Run
 	if run == nil {
-		run = d.exec
+		run = func(ctx context.Context, args []string, stdin string) ([]byte, error) {
+			return oneshot.Exec(ctx, d.Config.Claude.Bin, args, stdin, Timeout)
+		}
 	}
-	out, err := run(ctx, d.args(), d.userPrompt(prompt))
+	c := d.Config.Claude
+	out, err := run(ctx, oneshot.Args(schema, systemPrompt, c.Model, c.SettingSources), d.userPrompt(prompt))
 	if err != nil {
 		return nil, err
 	}
@@ -100,26 +101,6 @@ func (d *Drafter) Draft(ctx context.Context, prompt string) (*Draft, error) {
 	}
 	d.validate(dr)
 	return dr, nil
-}
-
-func (d *Drafter) args() []string {
-	c := d.Config.Claude
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--json-schema", schema,
-		"--system-prompt", systemPrompt,
-		"--tools", "",
-		"--no-session-persistence",
-		"--disable-slash-commands",
-	}
-	if c.Model != "" {
-		args = append(args, "--model", c.Model)
-	}
-	if c.SettingSources != "" {
-		args = append(args, "--setting-sources", c.SettingSources)
-	}
-	return args
 }
 
 // userPrompt lists the projects and repos (with their descriptions) so the
@@ -147,49 +128,16 @@ func (d *Drafter) userPrompt(prompt string) string {
 	return b.String()
 }
 
-func (d *Drafter) exec(ctx context.Context, args []string, stdin string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, d.Config.Claude.Bin, args...)
-	// A neutral directory: no project CLAUDE.md or settings of wherever taskpilot was started.
-	cmd.Dir = os.TempDir()
-	cmd.Stdin = strings.NewReader(stdin)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("claude quá thời gian (%s)", Timeout)
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = strings.TrimSpace(string(out))
-		}
-		return nil, fmt.Errorf("claude: %w: %s", err, truncate(msg, 300))
-	}
-	return out, nil
-}
-
 // parse reads `--output-format json`: the draft is in structured_output, or,
 // on older CLIs, as JSON text in result.
 func parse(out []byte) (*Draft, error) {
-	var res struct {
-		IsError          bool            `json:"is_error"`
-		Subtype          string          `json:"subtype"`
-		Result           string          `json:"result"`
-		StructuredOutput json.RawMessage `json:"structured_output"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &res); err != nil {
-		return nil, fmt.Errorf("đọc kết quả claude: %w", err)
-	}
-	if res.IsError {
-		return nil, fmt.Errorf("claude báo lỗi (%s): %s", res.Subtype, truncate(res.Result, 300))
-	}
-	raw := []byte(res.StructuredOutput)
-	if len(raw) == 0 || string(raw) == "null" {
-		raw = []byte(extractObject(res.Result))
+	raw, result, err := oneshot.Answer(out)
+	if err != nil {
+		return nil, err
 	}
 	var dr Draft
 	if err := json.Unmarshal(raw, &dr); err != nil {
-		return nil, fmt.Errorf("claude không trả về bản nháp hợp lệ: %s", truncate(res.Result, 200))
+		return nil, fmt.Errorf("claude không trả về bản nháp hợp lệ: %s", oneshot.Clip(result, 200))
 	}
 	dr.Project, dr.Repo = strings.TrimSpace(dr.Project), strings.TrimSpace(dr.Repo)
 	dr.Title, dr.Body, dr.Note = strings.TrimSpace(dr.Title), strings.TrimSpace(dr.Body), strings.TrimSpace(dr.Note)
@@ -197,15 +145,6 @@ func parse(out []byte) (*Draft, error) {
 		return nil, errors.New("claude trả về bản nháp rỗng")
 	}
 	return &dr, nil
-}
-
-// extractObject returns the outermost {...} of s (tolerates code fences).
-func extractObject(s string) string {
-	i, j := strings.Index(s, "{"), strings.LastIndex(s, "}")
-	if i < 0 || j < i {
-		return s
-	}
-	return s[i : j+1]
 }
 
 func (d *Drafter) validate(dr *Draft) {
@@ -229,12 +168,4 @@ func (d *Drafter) validate(dr *Draft) {
 		}
 		dr.Repo = ""
 	}
-}
-
-func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "…"
-	}
-	return s
 }

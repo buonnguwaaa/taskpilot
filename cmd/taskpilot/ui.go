@@ -5,28 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
 	"github.com/buonnguwaaa/taskpilot/internal/bitbucket"
+	"github.com/buonnguwaaa/taskpilot/internal/claudeai"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/daemon"
 	"github.com/buonnguwaaa/taskpilot/internal/db"
-	"github.com/buonnguwaaa/taskpilot/internal/gate"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
 	"github.com/buonnguwaaa/taskpilot/internal/herdr"
 	"github.com/buonnguwaaa/taskpilot/internal/intake"
 	"github.com/buonnguwaaa/taskpilot/internal/logring"
-	"github.com/buonnguwaaa/taskpilot/internal/plugin"
-	"github.com/buonnguwaaa/taskpilot/internal/runner"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/tui"
+	"github.com/buonnguwaaa/taskpilot/internal/worklog"
 )
 
 // cmdTUI runs the interactive console. Unless another process already holds
@@ -62,6 +59,15 @@ func cmdTUI(args []string) error {
 	deps := tui.Deps{
 		Config: cfg, Store: st, HW: hw, Inbox: inbox, Exe: exe,
 		Draft: (&intake.Drafter{Config: cfg}).Draft,
+		ClaudeArtifact: func(ctx context.Context, link, dir string) (*claudeai.Artifact, error) {
+			f, err := claudeFetcher(ctx, cfg, "tui")
+			if err != nil {
+				return nil, err
+			}
+			return f.Fetch(ctx, link, dir)
+		},
+		WorkLog: (&worklog.Drafter{Config: cfg}).Draft,
+		Assess:  (&worklog.Drafter{Config: cfg}).Assess,
 		SPLGen: func(ctx context.Context, lc splgen.Context, q string) (*splgen.Result, error) {
 			return (&splgen.Generator{Config: cfg}).Generate(ctx, lc, q)
 		},
@@ -79,7 +85,7 @@ func cmdTUI(args []string) error {
 			return s.Summary(now), warn
 		},
 		AuthStatus: func() []string {
-			return append(authLines(ctx, d), splunkStatus(ctx, cfg, d), argocdStatus(ctx, cfg, d))
+			return append(authLines(ctx, d), splunkStatus(ctx, cfg, d), argocdStatus(ctx, cfg, d), vaultStatus(ctx, cfg, d), kafkaStatus(ctx, cfg, d), jenkinsStatus(ctx, cfg, d), claudeStatus(ctx, d))
 		},
 		Splunk: func(ctx context.Context) (*splunk.Client, error) { return splunkClient(ctx, cfg, "operator:tui") },
 		ArgoCD: func(ctx context.Context) (*argocd.Client, error) { return argocdClient(ctx, cfg, "operator:tui") },
@@ -96,16 +102,6 @@ func cmdTUI(args []string) error {
 	var stop context.CancelFunc
 	done := make(chan struct{})
 	close(done)
-	// Refuse to run next to a daemon from before the SQLite store, and only then
-	// move file-based tasks into the database.
-	if err := refuseOldDaemon(cfg.Home); err != nil {
-		return err
-	}
-	if ids, err := st.ImportLegacy(); err != nil {
-		return fmt.Errorf("import file-based tasks: %w", err)
-	} else if len(ids) > 0 {
-		fmt.Fprintf(os.Stderr, "taskpilot: đã chuyển %d task dạng file vào database: %s\n", len(ids), strings.Join(ids, ", "))
-	}
 	if !*noDaemon && len(cfg.Projects) > 0 && hc != nil && !*embedded {
 		if err := startDaemonInHerdr(ctx, hc, cfg, exe); err != nil {
 			fmt.Fprintf(os.Stderr, "taskpilot: không mở được daemon trong tab herdr (%v); chạy daemon bên trong TUI\n", err)
@@ -127,21 +123,9 @@ func cmdTUI(args []string) error {
 				return err
 			}
 			defer logFile.Close()
-			src, err := source.New(cfg.Source)
+			dm, err := newDaemon(cfg, st, exe, io.MultiWriter(logFile, ring))
 			if err != nil {
 				return err
-			}
-			pluginDir, err := plugin.Materialize(cfg.Home)
-			if err != nil {
-				return err
-			}
-			if _, err := gate.Compile(cfg.Rules); err != nil {
-				return err
-			}
-			dm := &daemon.Daemon{
-				Config: cfg, Store: st, Source: src,
-				Runner: &runner.Runner{Config: cfg, Store: st, PluginDir: pluginDir, Exe: exe},
-				Log:    log.New(io.MultiWriter(logFile, ring), "", log.LstdFlags),
 			}
 			var dctx context.Context
 			dctx, stop = context.WithCancel(ctx)
@@ -249,20 +233,4 @@ func startDaemonInHerdr(ctx context.Context, hc *herdr.Client, cfg *config.Confi
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("daemon in herdr pane %s did not start within 15s (look at that tab)", pane)
-}
-
-// refuseOldDaemon fails when a daemon from before the SQLite store holds the
-// scheduler lock (it would keep writing task state to files). The lock is only
-// probed: if it is free it is released immediately.
-func refuseOldDaemon(home string) error {
-	release, err := daemon.Lock(home)
-	switch {
-	case err == nil:
-		release()
-		return nil
-	case errors.Is(err, daemon.ErrLocked):
-		return daemon.CheckOwner(home)
-	default:
-		return err
-	}
 }

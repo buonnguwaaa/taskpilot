@@ -12,6 +12,10 @@ import (
 // the workflow skill keys on it.
 const InvestigationMarker = "Task type: production investigation"
 
+// QCInvestigationMarker opens the body of a QC investigation ticket (logs
+// from Argo CD instead of Splunk).
+const QCInvestigationMarker = "Task type: QC investigation"
+
 // isoLayout is the absolute time form splunk_search accepts.
 const isoLayout = "2006-01-02T15:04:05"
 
@@ -81,6 +85,8 @@ func AbsoluteWindow(earliest, latest string, now time.Time) (string, string) {
 // Investigation is what the operator saw, turned into a ticket for an agent
 // that investigates the production issue before anything is changed.
 type Investigation struct {
+	// Env is "QC" for the QC environment (logs from Argo CD); "" = production.
+	Env     string
 	Project string
 	Symptom string // in the operator's words; may be empty when a group says it all
 	Service string // container, "" when unknown
@@ -89,9 +95,11 @@ type Investigation struct {
 
 	Earliest, Latest string // absolute ISO (see AbsoluteWindow)
 
-	Group   *ErrorGroup // the error group it started from, if any
-	SPL     string      // the search it started from, if any
-	Samples []string    // a few log lines as shown in the TUI
+	Group   *ErrorGroup  // the error group it started from, if any
+	Flow    string       // the failing path the group belongs to, if known
+	Related []ErrorGroup // the other groups of that path
+	SPL     string       // the search it started from, if any
+	Samples []string     // a few log lines as shown in the TUI
 }
 
 // Title is a short ticket title.
@@ -110,20 +118,33 @@ func (in Investigation) Title() string {
 	if in.Service != "" {
 		svc = in.Service + ": "
 	}
-	return clip("Điều tra prod "+svc+strings.TrimSpace(what), 100)
+	env := "prod"
+	if in.Env == "QC" {
+		env = "QC"
+	}
+	return clip("Điều tra "+env+" "+svc+strings.TrimSpace(what), 100)
 }
 
 // Body is the ticket description: the evidence the operator had, where to
 // search, and what the investigation must deliver.
 func (in Investigation) Body() string {
 	var b strings.Builder
-	b.WriteString(InvestigationMarker + " (điều tra sự cố production)\n\n")
+	qc := in.Env == "QC"
+	if qc {
+		b.WriteString(QCInvestigationMarker + " (điều tra lỗi trên môi trường QC)\n\n")
+	} else {
+		b.WriteString(InvestigationMarker + " (điều tra sự cố production)\n\n")
+	}
 	b.WriteString("## Triệu chứng\n")
 	if s := strings.TrimSpace(in.Symptom); s != "" {
 		b.WriteString(s + "\n")
 	}
 	if g := in.Group; g != nil {
-		fmt.Fprintf(&b, "Nhóm lỗi trên Splunk: service `%s`, %d lần", g.Service, g.Count)
+		source := "Nhóm lỗi trên Splunk: service"
+		if qc {
+			source = "Nhóm lỗi trong log QC (Argo CD): app"
+		}
+		fmt.Fprintf(&b, "%s `%s`, %d lần", source, g.Service, g.Count)
 		if !g.First.IsZero() {
 			fmt.Fprintf(&b, " (lần đầu %s, gần nhất %s)", g.First.Local().Format("2006-01-02 15:04:05"), g.Last.Local().Format("2006-01-02 15:04:05"))
 		}
@@ -141,6 +162,9 @@ func (in Investigation) Body() string {
 			fmt.Fprintf(&b, "- Stacktrace (rút gọn):\n```\n%s\n```\n", clip(st, 1500))
 		}
 	}
+	if in.Flow != "" || len(in.Related) > 0 {
+		b.WriteString(FlowSection(in.Flow, in.Related))
+	}
 	b.WriteString("\n## Phạm vi\n")
 	fmt.Fprintf(&b, "- Dự án: %s", in.Project)
 	if in.Service != "" {
@@ -151,7 +175,13 @@ func (in Investigation) Body() string {
 	if in.Latest == "" || in.Latest == "now" {
 		window = in.Earliest + " → lúc tạo task"
 	}
-	fmt.Fprintf(&b, "- Khoảng thời gian (giờ địa phương): %s. Dùng đúng các mốc này với splunk_search (earliest/latest), mở rộng nếu cần tìm lúc bắt đầu.\n", window)
+	if qc {
+		fmt.Fprintf(&b, "- Khoảng thời gian (giờ địa phương): %s.\n", window)
+		b.WriteString("- Log QC không có trên Splunk: đọc bằng qc_logs (app, filter, since_minutes tối đa 1440) — chỉ có log của pod đang chạy, " +
+			"pod restart thì log cũ mất. qc_apps cho biết revision/image đang chạy trên QC; db_query đọc DB QC.\n")
+	} else {
+		fmt.Fprintf(&b, "- Khoảng thời gian (giờ địa phương): %s. Dùng đúng các mốc này với splunk_search (earliest/latest), mở rộng nếu cần tìm lúc bắt đầu.\n", window)
+	}
 	if ids := strings.TrimSpace(in.IDs); ids != "" {
 		fmt.Fprintf(&b, "- Mã liên quan do operator cung cấp: %s\n", ids)
 	}
@@ -159,7 +189,11 @@ func (in Investigation) Body() string {
 		fmt.Fprintf(&b, "- Log production của dự án: `%s` (splunk_search tự thêm bộ lọc của dự án).\n", in.Filter)
 	}
 	if spl := strings.TrimSpace(in.SPL); spl != "" {
-		fmt.Fprintf(&b, "\n## Truy vấn đã chạy\n```\n%s\n```\n", spl)
+		head := "Truy vấn đã chạy"
+		if qc {
+			head = "Tìm kiếm đã chạy (Argo CD)"
+		}
+		fmt.Fprintf(&b, "\n## %s\n```\n%s\n```\n", head, spl)
 	}
 	if len(in.Samples) > 0 {
 		b.WriteString("\n## Dòng log mẫu\n```\n")
@@ -171,6 +205,7 @@ func (in Investigation) Body() string {
 	b.WriteString(`
 ## Cần làm (điều tra trước, chưa sửa)
 1. Dựng lại diễn biến từ log: lỗi bắt đầu từ lúc nào, tần suất, service nào gọi service nào (theo request_id / mã giao dịch qua các service).
+   Trên QC: kiểm tra trước bản đang deploy (qc_apps) có đúng code cần test không.
 2. Đọc code tại caller/prefix để hiểu lỗi phát sinh ở đâu và vì sao; đối chiếu dữ liệu trên DB QC (db_query) và log QC nếu giúp tái hiện.
 3. Kết luận nguyên nhân gốc kèm bằng chứng (dòng log, path:line, kết quả truy vấn), và ảnh hưởng: bao nhiêu request/đơn/giao dịch, khách có bị ảnh hưởng không.
 4. Gửi báo cáo ở cổng plan: nguyên nhân, ảnh hưởng, đề xuất sửa (hoặc xử lý vận hành), rủi ro. Chỉ sửa code sau khi plan được duyệt.

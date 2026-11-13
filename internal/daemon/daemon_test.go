@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ func newHarness(t *testing.T) *harness {
 	cfgPath := filepath.Join(dir, "config.yaml")
 	yaml := fmt.Sprintf(`home: %s
 claude: {bin: %s}
+cursor: {bin: %s}
 daemon: {concurrency: 2}
 source: {type: mock, dir: %s}
 projects:
@@ -52,7 +54,7 @@ projects:
     name: Demo
     repos:
       api: {path: %s, base: main, verify: "true"}
-`, filepath.Join(dir, "home"), fake, filepath.Join(dir, "inbox"), repo)
+`, filepath.Join(dir, "home"), fake, fake, filepath.Join(dir, "inbox"), repo)
 	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,9 @@ func TestHappyPathThroughBothGates(t *testing.T) {
 
 	h.decide(id, true, "")
 	h.step()
-	h.expect(id, store.StateAwaitApproval, "pr-1")
+	if tk := h.expect(id, store.StateAwaitApproval, "pr-1"); tk.Branch != "feat/fix-it--DEMO_FN_0001" {
+		t.Fatalf("branch named by the agent during the run was lost: %q", tk.Branch)
+	}
 
 	h.decide(id, true, "ship it")
 	h.step()
@@ -337,14 +341,16 @@ func TestRecoverParksInterruptedTasks(t *testing.T) {
 }
 
 // stopDuringRun starts the task's run and stops taskpilot while it is running.
-func (h *harness) stopDuringRun(id string) {
+// stopDuringRun starts the task's run and stops the daemon while the agent
+// is still running, once ready (if given) also holds.
+func (h *harness) stopDuringRun(id string, ready ...func() bool) {
 	h.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	h.d.Tick(ctx)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if tk, err := h.st.LoadTask(id); err == nil && tk.State == store.StateRunning {
-			if _, err := os.Stat(filepath.Join(h.st.TaskDir(id), "fake-args.log")); err == nil {
+			if _, err := os.Stat(filepath.Join(h.st.TaskDir(id), "fake-args.log")); err == nil && (len(ready) == 0 || ready[0]()) {
 				break
 			}
 		}
@@ -382,7 +388,11 @@ func TestStopDuringRunThenResumeWithMessage(t *testing.T) {
 func TestStopRightAfterTheAgentReachedAGate(t *testing.T) {
 	h := newHarness(t)
 	h.src.Submit(source.Ticket{ID: "S2", Title: "SLOW-AFTER-GATE", Project: "demo"})
-	h.stopDuringRun("mock-S2")
+	// Stop only once the agent has recorded its request (it keeps running after).
+	h.stopDuringRun("mock-S2", func() bool {
+		p, _ := h.st.PendingRequest("mock-S2")
+		return p != nil
+	})
 	// The request was recorded before the stop: the task waits at the gate, so approving it resumes it.
 	h.expect("mock-S2", store.StateAwaitApproval, "plan-1")
 	h.decide("mock-S2", true, "")
@@ -416,7 +426,7 @@ func TestDoneTasksReleaseWorktreesAtStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := workspace.OpenRepo(context.Background(), ws, "mock-old", "api", repo); err != nil {
+	if _, err := workspace.OpenRepo(context.Background(), ws, workspace.Branch("mock-old"), "api", repo); err != nil {
 		t.Fatal(err)
 	}
 	tk := &store.Task{ID: "mock-old", Title: "x", Project: "demo", Workspace: ws, Branch: workspace.Branch("mock-old")}
@@ -426,8 +436,77 @@ func TestDoneTasksReleaseWorktreesAtStart(t *testing.T) {
 	if err := h.d.Once(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := workspace.OpenedRepos(ws); len(got) != 0 {
-		t.Fatalf("worktrees still held: %v", got)
+	if got := workspace.OpenedRepos(ws); len(got) != 1 {
+		t.Fatalf("the worktree stays for when the task is resumed: %v", got)
 	}
+	// ...detached, so the operator can check the branch out in their clone.
 	mustGit(t, repo.Path, "checkout", "-q", workspace.Branch("mock-old"))
+}
+
+// An answered question resumes the agent with the answers, not as a gate decision.
+func TestAnsweredQuestionResumesWithAnswers(t *testing.T) {
+	h := newHarness(t)
+	tk := &store.Task{ID: "mock-ask", Title: "x", Project: "demo"}
+	tk.Transition(store.StateAwaitApproval, "")
+	h.st.SaveTask(tk)
+	q := []store.Question{{Question: "Port?", Options: []store.Option{{Label: ":3905"}, {Label: ":3910"}}}}
+	r, err := h.st.AddRequestWithQuestions("mock-ask", store.QuestionGate, "Port?", "", q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.st.Decide("mock-ask", r, true, "Q1: Port?\n→ :3905")
+	got := h.task("mock-ask")
+	if err := h.d.advance(got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateQueued || !strings.Contains(got.NextPrompt, "answered your question(s)") ||
+		!strings.Contains(got.NextPrompt, "→ :3905") || strings.Contains(got.NextPrompt, "APPROVED") {
+		t.Fatalf("state=%s prompt=%q", got.State, got.NextPrompt)
+	}
+}
+
+type countScanner struct{ n atomic.Int32 }
+
+func (c *countScanner) Tick(context.Context) { c.n.Add(1) }
+
+func TestTickRunsTheScanner(t *testing.T) {
+	h := newHarness(t)
+	sc := &countScanner{}
+	h.d.Scanner = sc
+	h.step()
+	h.step()
+	if sc.n.Load() != 2 {
+		t.Fatalf("scanner ticks = %d", sc.n.Load())
+	}
+}
+
+// When Claude hits a usage limit, the daemon retries the same turn on Cursor
+// (fresh session) and pins the task to Cursor for later resumes.
+func TestClaudeQuotaFallsBackToCursor(t *testing.T) {
+	h := newHarness(t)
+	h.src.Submit(source.Ticket{ID: "TQ", Title: "QUOTA hit please", Body: "QUOTA", Project: "demo"})
+	const id = "mock-TQ"
+	h.step()
+	tk := h.expect(id, store.StateAwaitApproval, "plan-1")
+	if tk.Runs != 2 {
+		t.Fatalf("runs = %d, want 2 (claude quota + cursor retry)", tk.Runs)
+	}
+	w, err := h.st.TaskWorker(id)
+	if err != nil || w == nil || w.Agent != config.AgentCursor {
+		t.Fatalf("sticky worker = %+v %v", w, err)
+	}
+	if latch, _ := h.st.ClaudeQuotaLatch(); latch == nil {
+		t.Fatal("expected home-wide Claude quota latch")
+	}
+	runs, err := h.st.Runs(id)
+	if err != nil || len(runs) != 2 || runs[0].Outcome != "interrupted" || runs[1].Trigger != "operator_message" {
+		t.Fatalf("runs = %+v %v", runs, err)
+	}
+	if !strings.HasPrefix(tk.SessionID, "cursor-") {
+		t.Fatalf("session should be Cursor's, got %q", tk.SessionID)
+	}
+	args, _ := os.ReadFile(filepath.Join(h.st.TaskDir(id), "fake-args.log"))
+	if !strings.Contains(string(args), "--approve-mcps") {
+		t.Fatalf("cursor retry must use Cursor flags: %s", args)
+	}
 }

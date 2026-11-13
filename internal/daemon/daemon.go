@@ -31,13 +31,24 @@ type Daemon struct {
 	Source source.Source
 	Runner *runner.Runner
 	Log    *log.Logger
+	// Scanner, when set, runs the scheduled production error scans.
+	Scanner interface{ Tick(ctx context.Context) }
+	// Indexer, when set, keeps the graphify graphs up to date.
+	Indexer interface{ Tick(ctx context.Context) }
 
-	cur     atomic.Pointer[config.Config]
-	watch   *config.Watcher
-	mu      sync.Mutex
-	running map[string]bool
+	cur      atomic.Pointer[config.Config]
+	scanning atomic.Bool
+	indexing atomic.Bool
+	watch    *config.Watcher
+	mu       sync.Mutex
+	running  map[string]bool
+	// cancels stop a task's run (the operator took back what started it).
+	cancels map[string]context.CancelFunc
 	wg      sync.WaitGroup
 }
+
+// CurrentConfig returns the config in use (reloaded when the file changes).
+func (d *Daemon) CurrentConfig() *config.Config { return d.conf() }
 
 // conf returns the current config.
 func (d *Daemon) conf() *config.Config {
@@ -152,6 +163,8 @@ func (d *Daemon) Tick(ctx context.Context) {
 		d.running = map[string]bool{}
 	}
 	d.reloadConfig()
+	d.scan(ctx)
+	d.index(ctx)
 	d.ingest(ctx)
 	d.flushOutbox(ctx)
 	tasks, err := d.Store.ListTasks()
@@ -162,7 +175,24 @@ func (d *Daemon) Tick(ctx context.Context) {
 	// Oldest first so earlier tickets get slots first.
 	for i := len(tasks) - 1; i >= 0; i-- {
 		t := tasks[i]
-		if d.isRunning(t.ID) || d.Store.TakenOver(t.ID) {
+		if d.Store.TakenOver(t.ID) {
+			continue
+		}
+		// The operator takes back the message or decision that started the
+		// latest run: stop it first, then rewind (before any new input).
+		if d.Store.UndoRequested(t.ID) {
+			if d.isRunning(t.ID) {
+				d.stopRun(t.ID)
+			} else if err := d.undo(t); err != nil {
+				d.Log.Printf("%s: take back: %v", t.ID, err)
+				if cur, lerr := d.Store.LoadTask(t.ID); lerr == nil {
+					cur.LastError = "không thu hồi được: " + err.Error()
+					_ = d.Store.SaveTask(cur)
+				}
+			}
+			continue
+		}
+		if d.isRunning(t.ID) {
 			continue
 		}
 		if err := d.advance(t); err != nil {
@@ -244,6 +274,15 @@ func (d *Daemon) advance(t *store.Task) error {
 		}
 		t.NextPrompt = fmt.Sprintf("[taskpilot] The operator %s request %s (gate %q). Operator comment: %s\n%s",
 			verdict, req.ID, req.Gate, comment, next)
+		if req.Gate == store.QuestionGate { // ask_operator: an answer, not a gate decision
+			if dec.Approved {
+				t.NextPrompt = fmt.Sprintf("[taskpilot] The operator answered your question(s) (request %s):\n%s\n"+
+					"Continue from where you asked, following these answers. Do not ask the same question again.", req.ID, comment)
+			} else {
+				t.NextPrompt = fmt.Sprintf("[taskpilot] The operator did not pick an answer to request %s and replied: %s\n"+
+					"Take this into account and continue; ask again (with better options) only if you really cannot proceed.", req.ID, comment)
+			}
+		}
 		t.NextTrigger = map[bool]string{true: "approval", false: "rejection"}[dec.Approved]
 		t.Transition(store.StateQueued, fmt.Sprintf("%s %s", strings.ToLower(verdict), req.ID))
 		return d.Store.SaveTask(t)
@@ -258,7 +297,11 @@ func (d *Daemon) advance(t *store.Task) error {
 		if err := d.Store.ArchiveCompletion(t.ID); err != nil {
 			return err
 		}
-		t.NextPrompt = "[taskpilot] Message from the operator: " + n.Message
+		msg := "[taskpilot] Message from the operator: " + n.Message
+		if t.NextPrompt != "" { // not sent yet (e.g. the worktrees could not be re-attached): keep it
+			msg = t.NextPrompt + "\n\n" + msg
+		}
+		t.NextPrompt = msg
 		t.NextTrigger = "operator_message"
 		t.Transition(store.StateQueued, "resumed by operator message")
 		return d.Store.SaveTask(t)
@@ -283,9 +326,23 @@ func (d *Daemon) lastDecision(id string) (*store.ApprovalRequest, *store.Decisio
 	return nil, nil, nil
 }
 
+// stopRun cancels the task's run in progress.
+func (d *Daemon) stopRun(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c := d.cancels[id]; c != nil {
+		c()
+	}
+}
+
 func (d *Daemon) start(ctx context.Context, t *store.Task) {
+	ctx, cancel := context.WithCancel(ctx)
 	d.mu.Lock()
 	d.running[t.ID] = true
+	if d.cancels == nil {
+		d.cancels = map[string]context.CancelFunc{}
+	}
+	d.cancels[t.ID] = cancel
 	d.mu.Unlock()
 	d.wg.Add(1)
 	go func() {
@@ -293,7 +350,9 @@ func (d *Daemon) start(ctx context.Context, t *store.Task) {
 		defer func() {
 			d.mu.Lock()
 			delete(d.running, t.ID)
+			delete(d.cancels, t.ID)
 			d.mu.Unlock()
+			cancel()
 		}()
 		if err := d.work(ctx, t); err != nil {
 			d.Log.Printf("%s: %v", t.ID, err)
@@ -316,6 +375,15 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 			return d.Store.SaveTask(t)
 		}
 		t.Workspace, t.Branch = ws, workspace.Branch(t.ID)
+		// A new task starts from the latest branches: bring the graphify
+		// graphs (release/prod, release/qc) up to date before its first run.
+		if r, ok := d.Indexer.(interface {
+			Refresh(ctx context.Context, project string) []string
+		}); ok && d.Indexer != nil {
+			for _, n := range r.Refresh(ctx, t.Project) {
+				t.History = append(t.History, store.Event{At: time.Now().UTC(), State: store.StatePreparing, Note: n})
+			}
+		}
 		if t.RepoHint != "" {
 			if err := d.openWithBaseline(ctx, t, proj, t.RepoHint); err != nil {
 				t.LastError = err.Error()
@@ -323,12 +391,17 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 				return d.Store.SaveTask(t)
 			}
 		}
+	} else if err := d.attachWorktrees(ctx, t, proj); err != nil {
+		// The prompt stays in NextPrompt: the next message is appended to it.
+		t.LastError = err.Error()
+		t.Transition(store.StateNeedsAttention, "không gắn lại được worktree:\n"+err.Error())
+		return d.Store.SaveTask(t)
 	}
 
 	resume := t.Runs > 0
 	prompt, trigger := t.NextPrompt, t.NextTrigger
 	if prompt == "" {
-		prompt, trigger = initialPrompt(t, proj), "initial"
+		prompt, trigger = initialPrompt(t, proj, graphOn(d.conf(), t.Project)), "initial"
 	}
 	if trigger == "" {
 		trigger = "operator_message"
@@ -339,22 +412,29 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	if err := d.Store.SaveTask(t); err != nil {
 		return err
 	}
+	kind := d.Runner.KindFor(t)
 	model, effort := d.Runner.Profile(t)
+	// The session entry this run continues from, so it can be taken back:
+	// after a take-back the entry before it, else the session's last one.
+	resumeAt, from := "", ""
+	if resume && kind != config.AgentCursor {
+		resumeAt = d.Store.ResumeAt(t.ID)
+		if from = resumeAt; from == "" {
+			from = lastEntry(d.Store.EventsPath(t.ID))
+		}
+	}
 	runID, err := d.Store.StartRun(t.ID, store.RunStart{N: t.Runs, SessionID: t.SessionID, Resume: resume, Trigger: trigger,
-		Prompt: prompt, Model: model, Effort: effort})
+		Prompt: prompt, Model: model, Effort: effort, ResumeAt: from})
 	if err != nil {
 		return err
 	}
-	d.Log.Printf("%s: run %d (%s, model %s, effort %s)", t.ID, t.Runs, trigger, orDefault(model), orDefault(effort))
+	d.Log.Printf("%s: run %d (%s, agent %s, model %s, effort %s)", t.ID, t.Runs, trigger, kind, orDefault(model), orDefault(effort))
 
 	res, runErr := d.Runner.Run(ctx, t, prompt, resume)
-	t.NextPrompt, t.NextTrigger = "", ""
-	if res != nil {
-		t.CostUSD += res.CostUSD
-		if res.Text != "" {
-			t.LastResult = res.Text
-		}
+	if resumeAt != "" { // the session now continues from there
+		_ = d.Store.SetResumeAt(t.ID, "")
 	}
+	applyRunResult(t, res)
 
 	pending, err := d.Store.PendingRequest(t.ID)
 	if err != nil {
@@ -364,6 +444,63 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	if err != nil {
 		return err
 	}
+
+	if pending == nil && completion == nil && ctx.Err() == nil && d.shouldFallbackToCursor(kind, res, runErr) {
+		reason := quotaReason(res, runErr)
+		d.Log.Printf("%s: Claude quota (%s); falling back to Cursor", t.ID, reason)
+		// "interrupted": this Claude attempt is abandoned so we can retry on Cursor.
+		// (runs.outcome CHECK does not allow a dedicated quota_fallback value.)
+		end := store.RunEnd{Outcome: "interrupted", Error: "quota_fallback: " + reason, IsError: true}
+		if res != nil {
+			end.Subtype, end.NumTurns, end.CostUSD = res.Subtype, res.NumTurns, res.CostUSD
+			end.InputTokens, end.OutputTokens = res.InputTokens, res.OutputTokens
+			end.CacheReadTokens, end.CacheWriteTokens = res.CacheReadTokens, res.CacheWriteTokens
+		}
+		if err := d.Store.FinishRun(runID, end, toolCallsOf(res)); err != nil {
+			return err
+		}
+		resets := time.Time{}
+		if res != nil {
+			resets = res.Quota.Resets
+		}
+		if resets.IsZero() {
+			resets = time.Now().UTC().Add(runner.DefaultQuotaLatch)
+		}
+		_ = d.Store.SetClaudeQuotaLatch(resets, reason)
+		_ = d.Store.SetTaskWorker(t.ID, config.AgentCursor, reason)
+		d.report(ctx, t, "taskpilot: Claude hết quota — chuyển sang Cursor Agent: "+reason)
+
+		// Cursor cannot resume a Claude session: start a fresh chat with the
+		// same operator prompt plus a short note about the switch.
+		t.SessionID = ""
+		prompt = cursorFallbackPrompt(reason, prompt)
+		// runs.trigger CHECK: initial|approval|rejection|operator_message
+		trigger = "operator_message"
+		resume = false
+		t.Runs++
+		t.LastError = ""
+		t.Transition(store.StateRunning, fmt.Sprintf("run %d (cursor fallback)", t.Runs))
+		if err := d.Store.SaveTask(t); err != nil {
+			return err
+		}
+		model, effort = d.Runner.Profile(t)
+		runID, err = d.Store.StartRun(t.ID, store.RunStart{N: t.Runs, SessionID: t.SessionID, Resume: false, Trigger: trigger,
+			Prompt: prompt, Model: model, Effort: effort})
+		if err != nil {
+			return err
+		}
+		d.Log.Printf("%s: run %d (cursor fallback after Claude quota, model %s)", t.ID, t.Runs, orDefault(model))
+		res, runErr = d.Runner.RunKind(ctx, t, prompt, false, config.AgentCursor)
+		applyRunResult(t, res)
+		if pending, err = d.Store.PendingRequest(t.ID); err != nil {
+			return err
+		}
+		if completion, err = d.Store.Completion(t.ID); err != nil {
+			return err
+		}
+	}
+
+	t.NextPrompt, t.NextTrigger = "", ""
 	switch {
 	case pending != nil:
 		t.Transition(store.StateAwaitApproval, fmt.Sprintf("gate %s: %s", pending.Gate, pending.Summary))
@@ -389,12 +526,20 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 		} else if res.Subtype != "" {
 			reason = "run ended with " + res.Subtype
 		}
+		if res != nil && res.Text != "" && reason == "run ended with "+res.Subtype {
+			reason = res.Text
+		}
 		t.LastError = reason
 		t.Transition(store.StateNeedsAttention, reason)
 	default:
 		t.Transition(store.StateNeedsAttention, "agent ended its turn without requesting approval or completing")
 	}
 	d.Log.Printf("%s: -> %s", t.ID, t.State)
+	// The agent may have renamed the work branch (set_branch, saved by the MCP
+	// process) during the run: keep it rather than this run's stale copy.
+	if cur, err := d.Store.LoadTask(t.ID); err == nil {
+		t.Branch = cur.Branch
+	}
 	if err := d.Store.SaveTask(t); err != nil {
 		return err
 	}
@@ -405,14 +550,80 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	if runErr != nil {
 		end.Error = runErr.Error()
 	}
-	var calls []store.ToolCall
 	if res != nil {
 		end.Subtype, end.IsError, end.NumTurns, end.CostUSD = res.Subtype, res.IsError, res.NumTurns, res.CostUSD
 		end.InputTokens, end.OutputTokens = res.InputTokens, res.OutputTokens
 		end.CacheReadTokens, end.CacheWriteTokens = res.CacheReadTokens, res.CacheWriteTokens
-		calls = res.ToolCalls
 	}
-	return d.Store.FinishRun(runID, end, calls)
+	return d.Store.FinishRun(runID, end, toolCallsOf(res))
+}
+
+func applyRunResult(t *store.Task, res *runner.Result) {
+	if res == nil {
+		return
+	}
+	// Cursor assigns the chat id on the first run; Claude uses the
+	// predetermined --session-id. Keep whichever the agent reported.
+	if res.SessionID != "" {
+		t.SessionID = res.SessionID
+	}
+	t.CostUSD += res.CostUSD
+	if res.Text != "" {
+		t.LastResult = res.Text
+	}
+}
+
+func toolCallsOf(res *runner.Result) []store.ToolCall {
+	if res == nil {
+		return nil
+	}
+	return res.ToolCalls
+}
+
+func quotaReason(res *runner.Result, runErr error) string {
+	if res != nil && res.Quota.Reason != "" {
+		return res.Quota.Reason
+	}
+	if res != nil {
+		if reason, ok := runner.ParseQuotaReason(res.Text); ok {
+			return reason
+		}
+	}
+	if runErr != nil {
+		if reason, ok := runner.ParseQuotaReason(runErr.Error()); ok {
+			return reason
+		}
+		return runErr.Error()
+	}
+	return "Claude usage limit"
+}
+
+func (d *Daemon) shouldFallbackToCursor(kind string, res *runner.Result, runErr error) bool {
+	if kind != config.AgentClaude || !d.conf().Cursor.FallbackEnabled() {
+		return false
+	}
+	hit := res != nil && res.Quota.Hit
+	if !hit && res != nil {
+		_, hit = runner.ParseQuotaReason(res.Text)
+	}
+	if !hit && runErr != nil {
+		_, hit = runner.ParseQuotaReason(runErr.Error())
+	}
+	if !hit {
+		return false
+	}
+	if !d.Runner.CursorAvailable() {
+		d.Log.Printf("Claude quota hit but Cursor binary %q not found; not falling back", d.Runner.BinFor(config.AgentCursor))
+		return false
+	}
+	return true
+}
+
+func cursorFallbackPrompt(reason, original string) string {
+	return fmt.Sprintf("[taskpilot] Claude Code hit a usage/quota limit (%s). "+
+		"Continuing this task on Cursor Agent in a fresh session. "+
+		"Workspace, gates and approvals are unchanged — call task_info, then continue.\n\n%s",
+		reason, original)
 }
 
 // outboxMaxAttempts bounds delivery retries of one report.
@@ -469,7 +680,7 @@ func (d *Daemon) inFlight() int {
 // baseline verify result, as the open_repo tool would.
 func (d *Daemon) openWithBaseline(ctx context.Context, t *store.Task, proj config.Project, name string) error {
 	repo := proj.Repos[name]
-	o, err := workspace.OpenRepo(ctx, t.Workspace, t.ID, name, repo)
+	o, err := workspace.OpenRepo(ctx, t.Workspace, t.WorkBranch(), name, repo)
 	if err != nil {
 		return err
 	}
@@ -484,7 +695,12 @@ func (d *Daemon) openWithBaseline(ctx context.Context, t *store.Task, proj confi
 		Output: r.Output, DurationMS: r.Duration.Milliseconds(), At: time.Now().UTC()})
 }
 
-func initialPrompt(t *store.Task, proj config.Project) string {
+// graphOn reports whether the project has graphify graphs.
+func graphOn(cfg *config.Config, project string) bool {
+	return cfg != nil && cfg.Graphify != nil && len(cfg.ProjectGraphLines(project)) > 0
+}
+
+func initialPrompt(t *store.Task, proj config.Project, graph bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[taskpilot] New task %s.\n\n", t.ID)
 	fmt.Fprintf(&b, "Ticket %s: %s\n", t.TicketID, t.Title)
@@ -493,7 +709,8 @@ func initialPrompt(t *store.Task, proj config.Project) string {
 	}
 	fmt.Fprintf(&b, "\n%s\n\n", strings.TrimSpace(t.Body))
 	fmt.Fprintf(&b, "Project %s. The current directory is the task workspace %s. Open the repos the task needs with the\n", proj.Name, t.Workspace)
-	fmt.Fprintf(&b, "open_repo tool; each becomes ./<repo> on branch %s. Writes are only allowed inside the workspace.\n", t.Branch)
+	fmt.Fprintf(&b, "open_repo tool; each becomes ./<repo> on the provisional branch %s. Writes are only allowed inside the workspace.\n", t.Branch)
+	fmt.Fprintf(&b, "Before the first commit, name the branch by the team convention (task_info.branch_convention): set_branch, or git branch -m in each repo.\n")
 	b.WriteString("Repos of this project:\n")
 	for _, name := range proj.RepoNames() {
 		r := proj.Repos[name]
@@ -511,6 +728,11 @@ func initialPrompt(t *store.Task, proj config.Project) string {
 		for _, f := range proj.ContextFiles {
 			fmt.Fprintf(&b, "  - %s\n", f)
 		}
+	}
+	if graph {
+		b.WriteString("\nThe graphify tool has graphs of these repos, joined across repos by their gRPC calls. Use it before searching " +
+			"the code: links for a service or gRPC method, affected on each function you plan to change (line task, and qc), " +
+			"then read what it points to. The plan lists the callers it found.\n")
 	}
 	b.WriteString("\nLoad the taskpilot:workflow skill and follow it. Start by calling the task_info tool.\n")
 	return b.String()
@@ -538,16 +760,52 @@ func orDefault(s string) string {
 	return s
 }
 
-// releaseWorktrees frees the clean worktrees of a finished task so the
-// operator can check its branches out in their own clone.
+// releaseWorktrees frees the branches of a finished task so the operator can
+// check them out in their own clone: the worktrees stay (detached at the same
+// commit) for when the task is resumed.
 func (d *Daemon) releaseWorktrees(t *store.Task) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	kept, err := workspace.Release(ctx, t.Workspace)
+	kept, err := workspace.Detach(ctx, t.Workspace)
 	if err != nil {
 		d.Log.Printf("%s: %v", t.ID, err)
 	}
 	if len(kept) > 0 {
-		d.Log.Printf("%s: done, but worktree(s) with uncommitted changes kept: %s", t.ID, strings.Join(kept, ", "))
+		d.Log.Printf("%s: done, but worktree(s) with uncommitted changes keep their branch: %s", t.ID, strings.Join(kept, ", "))
 	}
+}
+
+// attachWorktrees puts a resumed task's worktrees back on its branch (and
+// re-creates those removed by older versions) before the agent runs.
+func (d *Daemon) attachWorktrees(ctx context.Context, t *store.Task, proj config.Project) error {
+	actx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	return workspace.Attach(actx, t.Workspace, t.Branch, proj.Repos)
+}
+
+// index refreshes the graphify graphs in the background, one pass at a time.
+func (d *Daemon) index(ctx context.Context) {
+	if d.Indexer == nil || !d.indexing.CompareAndSwap(false, true) {
+		return
+	}
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		defer d.indexing.Store(false)
+		d.Indexer.Tick(ctx)
+	}()
+}
+
+// scan starts the due production error scans in the background (a slow
+// Splunk search must not hold the scheduling loop); one at a time.
+func (d *Daemon) scan(ctx context.Context) {
+	if d.Scanner == nil || !d.scanning.CompareAndSwap(false, true) {
+		return
+	}
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		defer d.scanning.Store(false)
+		d.Scanner.Tick(ctx)
+	}()
 }

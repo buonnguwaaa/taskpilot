@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 )
@@ -44,15 +45,30 @@ func TestCheck(t *testing.T) {
 		{SPL: "| inputlookup x"},
 	}
 	for _, r := range bad {
-		if err := Check(r); err == nil {
+		if err := Check(r, 7*24*time.Hour); err == nil {
 			t.Errorf("%+v accepted", r)
 		}
 	}
 	r := &Result{SPL: " level=error ", Latest: "now"}
-	if err := Check(r); err != nil || r.Earliest != "-1h" || r.Latest != "" || r.SPL != "level=error" {
+	if err := Check(r, 7*24*time.Hour); err != nil || r.Earliest != "-1h" || r.Latest != "" || r.SPL != "level=error" {
 		t.Fatalf("defaults: %+v %v", r, err)
 	}
-	if err := Check(&Result{SPL: "x", Earliest: "-1d@d", Latest: "@d"}); err != nil {
+	if err := Check(&Result{SPL: "x", Earliest: "-1d@d", Latest: "@d"}, 7*24*time.Hour); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCheckUnlimited(t *testing.T) {
+	for _, e := range []string{"0", "-90d", "-1y@y"} {
+		err := Check(&Result{SPL: "x", Earliest: e}, 0)
+		if (e == "-1y@y") != (err != nil) { // y is not a Splunk unit we accept
+			t.Errorf("unlimited %s: %v", e, err)
+		}
+	}
+	if err := Check(&Result{SPL: "x", Earliest: "0"}, 7*24*time.Hour); err == nil {
+		t.Error("all time must be refused under a limit")
+	}
+	if err := Check(&Result{SPL: "x", Earliest: "-8d"}, 7*24*time.Hour); err == nil {
+		t.Error("-8d must be refused under 7d")
 	}
 }

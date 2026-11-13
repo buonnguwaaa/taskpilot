@@ -111,6 +111,7 @@ func TestValidate(t *testing.T) {
 		`x | outputlookup evil.csv`, `x | collect index=summary`, `x | delete`, `x | sendemail to=a@b`,
 		`x | script python run.py`, `x | append [search index=secret]`, `x [search index=secret | fields id]`,
 		`| rest /services/authentication/users`, `x | join id [search index=hr]`, `x |  MAP search="search y"`,
+		"x | summaryindex index=summary", "x | dump basefilename=a", "x `evil_macro`",
 	}
 	for _, q := range bad {
 		if err := Validate(q); err == nil {
@@ -225,7 +226,7 @@ func TestPlaceholdersExpandAndWebURL(t *testing.T) {
 	if _, err := Expand(`{code}`, map[string]string{}); err == nil {
 		t.Error("missing value accepted")
 	}
-	u := WebURL("https://siem.hasaki.work", "en-US", "level=error", "-1h")
+	u := WebURLRange("https://siem.hasaki.work", "en-US", "level=error", "-1h", "")
 	if !strings.HasPrefix(u, "https://siem.hasaki.work/en-US/app/search/search?") || !strings.Contains(u, "q=search+level%3Derror") || !strings.Contains(u, "earliest=-1h") {
 		t.Fatalf("url = %s", u)
 	}

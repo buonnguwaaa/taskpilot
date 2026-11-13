@@ -99,8 +99,8 @@ func (m Model) pushToHW(t *store.Task) (tea.Model, tea.Cmd) {
 	case m.d.HW == nil:
 		m.msg = "chưa đăng nhập Hasaki Work: vào tab 4 Status và bấm l"
 		return m, nil
-	case t.Source == hwSource: // already on Hasaki Work: add subtasks under it instead
-		return m.subtaskFromLocal(t.TicketID)
+	case t.Source == hwSource: // already on Hasaki Work: report the result on it
+		return m.reportForm(t)
 	case m.tasks.hwPushing[t.ID]:
 		m.msg = "đang tạo task trên Hasaki Work…"
 		return m, nil
@@ -109,6 +109,9 @@ func (m Model) pushToHW(t *store.Task) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.tasks.hwEpics != nil && time.Since(m.tasks.hwEpicsAt) < hwEpicsTTL {
+		if m.needDraft(t) {
+			return m.draftWork(t, "")
+		}
 		return m.hwPushForm(t)
 	}
 	if m.tasks.hwEpicsLoading {
@@ -165,6 +168,9 @@ func (m Model) onHWEpics(msg hwEpicsMsg) (tea.Model, tea.Cmd) {
 		m.msg = "đã tìm xong EPIC: bấm h lần nữa để tạo task"
 		return m, nil
 	}
+	if m.needDraft(t) {
+		return m.draftWork(t, "")
+	}
 	return m.hwPushForm(t)
 }
 
@@ -176,6 +182,7 @@ func (m Model) hwPushForm(t *store.Task) (tea.Model, tea.Cmd) {
 	}
 	id, hw, cfg, st, pushing := t.ID, m.d.HW, m.d.Config, m.d.Store, m.tasks.hwPushing
 	epics, staffID := m.tasks.hwEpics, m.tasks.hwStaffID
+	draft, draftErr := m.workDraft(t)
 	prev := ""
 	if m.tasks.hwLink != nil {
 		prev = m.tasks.hwLink.Code
@@ -186,6 +193,11 @@ func (m Model) hwPushForm(t *store.Task) (tea.Model, tea.Cmd) {
 			return nil, errors.New("chọn dự án")
 		}
 		nt, err := parseNewHWTask(v, p.HasakiProjectID)
+		if err != nil {
+			return nil, err
+		}
+		result, status := strings.TrimSpace(v["result"]), reportStatus(v["status"])
+		actual, err := parseActualHours(v["actual"])
 		if err != nil {
 			return nil, err
 		}
@@ -235,10 +247,18 @@ func (m Model) hwPushForm(t *store.Task) (tea.Model, tea.Cmd) {
 			if err := hw.AssignStaff(ctx, c.ID, staffID); err != nil {
 				return hwPushedMsg{id, done + " nhưng giao cho bạn lỗi: " + err.Error()}
 			}
-			return hwPushedMsg{id, done + " và giao cho bạn"}
+			done += " và giao cho bạn"
+			if result != "" {
+				if err := hw.Report(ctx, c.ID, staffID, result, actual, status); err != nil {
+					return hwPushedMsg{id, done + ", nhưng " + err.Error()}
+				}
+				done += reportedSuffix(status)
+			}
+			return hwPushedMsg{id, done}
 		}, nil
 	})
-	f.hint = "Ghi thật lên Hasaki Work: task nằm dưới EPIC và sprint của loại đã chọn, giao cho bạn."
+	f.hint = "Ghi thật lên Hasaki Work: task nằm dưới EPIC và sprint của loại đã chọn, giao cho bạn; rồi ghi kết quả, giờ thực tế và trạng thái." +
+		agentTimeHint(st, t)
 	if l := m.tasks.hwLink; l != nil {
 		f.hint += fmt.Sprintf("\n⚠ Task này đã đẩy lên Hasaki Work: %s (%s). Gửi sẽ tạo thêm một task MỚI; task cũ giữ nguyên (huỷ trên web nếu không cần).",
 			l.Code, l.CreatedAt.Local().Format("02/01 15:04"))
@@ -246,16 +266,24 @@ func (m Model) hwPushForm(t *store.Task) (tea.Model, tea.Cmd) {
 	if t.State != store.StateDone {
 		f.hint += "\nLưu ý: task chưa xong (" + string(t.State) + ")."
 	}
-	note := ""
-	if c, _ := st.Completion(t.ID); c != nil {
-		note = c.Summary
+	note := strings.TrimSpace(t.Body)
+	if r := []rune(note); len(r) > 3000 {
+		note = string(r[:3000]) + "…"
 	}
 	f.addSelect("project", "Dự án", m.hwProjectOptions, t.Project)
-	f.addText("name", "Tên task", t.Title, true)
+	name, result := t.Title, workResult(st, t)
+	if draft != nil {
+		name, result = draft.Name, withPRLinks(draft.Result, st, t)
+	}
+	f.hint += draftNote(draftErr, draft != nil)
+	f.addText("name", "Tên task", name, true)
 	f.addSelect("kind", "Loại (EPIC)", m.hwKindOptions, string(guessEpicKind(t)))
 	f.addArea("note", "Mô tả (không bắt buộc)", note, false)
 	f.addText("hours", "Giờ dự kiến", "8", false)
 	f.addText("deadline", "Deadline (YYYY-MM-DD)", time.Now().Format("2006-01-02"), false)
+	f.addArea("result", "Kết quả công việc (ghi lên task; để trống = không ghi)", result, false)
+	f.addText("actual", "Giờ thực tế (giờ; để trống = không ghi)", "8", false)
+	f.addSelect("status", "Trạng thái sau khi ghi kết quả", reportStatusOptions, defaultReportStatus(t))
 	f.addText("epic", "EPIC khác: id hoặc link task (để trống = dùng EPIC theo Loại)", "", false)
 	m.modal = f
 	m.msg = "tạo task trên Hasaki Work cho " + t.ID + " (Ctrl+S gửi, Esc huỷ)"

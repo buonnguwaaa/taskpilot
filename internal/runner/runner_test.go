@@ -2,6 +2,8 @@ package runner
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -90,9 +92,59 @@ func TestParseEvent(t *testing.T) {
 	res := &Result{}
 	parseEvent([]byte(`{"type":"system","subtype":"init","session_id":"abc"}`), res)
 	parseEvent([]byte(`not json`), res)
-	parseEvent([]byte(`{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":"","total_cost_usd":1.2,"session_id":"abc"}`), res)
-	if res.SessionID != "abc" || !res.IsError || res.Subtype != "error_max_budget_usd" || res.CostUSD != 1.2 {
+	parseEvent([]byte(`{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":"","total_cost_usd":1.2,"session_id":"abc","usage":{"input_tokens":3,"output_tokens":4}}`), res)
+	if res.SessionID != "abc" || !res.IsError || res.Subtype != "error_max_budget_usd" || res.CostUSD != 1.2 || res.InputTokens != 3 || res.OutputTokens != 4 {
 		t.Fatalf("%+v", res)
+	}
+	res2 := &Result{}
+	parseEvent([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"pong","session_id":"cur","usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":5,"cacheWriteTokens":1}}`), res2)
+	if res2.SessionID != "cur" || res2.InputTokens != 10 || res2.OutputTokens != 2 || res2.CacheReadTokens != 5 || res2.CacheWriteTokens != 1 {
+		t.Fatalf("cursor usage: %+v", res2)
+	}
+}
+
+func TestCursorArgs(t *testing.T) {
+	ws := t.TempDir()
+	cfg := &config.Config{
+		Path:             "/etc/tp.yaml",
+		OperatorLanguage: "Vietnamese",
+		Agent:            config.AgentCursor,
+		Cursor:           config.Cursor{Bin: "agent", Model: "composer-2"},
+		Claude:           config.Claude{Model: "sonnet"},
+	}
+	r := &Runner{Config: cfg, PluginDir: "/p", Exe: "/bin/tp"}
+	task := &store.Task{ID: "mock-1", SessionID: "sid", Workspace: ws}
+	proj := config.Project{}
+
+	args, err := r.Args(task, proj, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-p", "--force", "--approve-mcps", "--trust", "--workspace " + ws, "--plugin-dir /p", "--model composer-2"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in %v", want, args)
+		}
+	}
+	if strings.Contains(joined, "--resume") || strings.Contains(joined, "--session-id") {
+		t.Fatalf("fresh cursor run must not resume: %v", args)
+	}
+	if _, err := os.Stat(filepath.Join(ws, ".cursor", "mcp.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(ws, ".cursor", "hooks.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "AGENTS.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	args, err = r.Args(task, proj, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argValue(args, "--resume") != "sid" {
+		t.Fatalf("resume: %v", args)
 	}
 }
 
@@ -154,5 +206,31 @@ func TestArgsUseTaskProfile(t *testing.T) {
 	}
 	if err := st.SetTaskProfile("mock-p", &store.Profile{Model: "opus", Effort: "max", SetBy: "agent"}); err != store.ErrProfilePinned {
 		t.Fatalf("the agent cannot override a pinned profile: %v", err)
+	}
+}
+
+func TestSummarizeGraphify(t *testing.T) {
+	if s := summarize([]byte(`{"action":"affected","text":"bom-report::x","line":"qc"}`)); s != "affected bom-report::x" {
+		t.Fatalf("summary = %q", s)
+	}
+}
+
+func TestGraphifyNoteInEveryRun(t *testing.T) {
+	cfg := &config.Config{OperatorLanguage: "Vietnamese", Claude: config.Claude{Bin: "claude", PermissionMode: "dontAsk"},
+		Graphify: &config.Graphify{Lines: map[string]string{"prod": "release/prod"}},
+		Projects: map[string]config.Project{"bom": {Repos: map[string]config.Repo{"api": {}}}, "x": {}}}
+	r := &Runner{Config: cfg, PluginDir: "/p", Exe: "/bin/tp"}
+	task := &store.Task{ID: "mock-1", Project: "bom", SessionID: "11111111-1111-4111-8111-111111111111"}
+	for _, resume := range []bool{false, true} {
+		args, err := r.Args(task, cfg.Projects["bom"], resume)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p := argValue(args, "--append-system-prompt"); !strings.Contains(p, "BEFORE grepping") || !strings.Contains(p, `select:mcp__taskpilot__graphify`) {
+			t.Fatalf("resume=%v: %q", resume, p)
+		}
+	}
+	if r.graphifyNote("x", "graphify") != "" {
+		t.Fatal("a project without graphs gets no note")
 	}
 }

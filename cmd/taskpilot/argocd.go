@@ -15,6 +15,7 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/db"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
+	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 )
 
 // argocdClient builds a client from the stored token.
@@ -22,15 +23,7 @@ func argocdClient(ctx context.Context, cfg *config.Config, consumer string) (*ar
 	if cfg.ArgoCD.URL == "" {
 		return nil, errors.New("argocd.url is not set in the taskpilot config")
 	}
-	d, err := db.Open(ctx, cfg.Home)
-	if err != nil {
-		return nil, err
-	}
-	defer d.Close()
-	tok, meta, err := d.Resolve(ctx, argocd.SecretToken, consumer)
-	if errors.Is(err, db.ErrNoSecret) {
-		return nil, argocd.ErrNoCredentials
-	}
+	tok, meta, err := storedSecret(ctx, cfg, argocd.SecretToken, consumer, argocd.ErrNoCredentials)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +67,7 @@ func authArgoCD(ctx context.Context, cfg *config.Config, d *db.DB, paste bool, t
 		if err := ch.Open(sctx, cfg.ArgoCD.URL+cfg.ArgoCD.LoginPath); err != nil {
 			return err
 		}
+		defer closeChrome(ch)
 		fmt.Println("Chrome (profile riêng của taskpilot) đã mở Argo CD. Đăng nhập trên cửa sổ đó…")
 		wctx, cancel := context.WithTimeout(sctx, timeout)
 		defer cancel()
@@ -98,11 +92,6 @@ func authArgoCD(ctx context.Context, cfg *config.Config, d *db.DB, paste bool, t
 			}
 		}
 		tok = strings.Join(parts, "")
-		defer func() {
-			if err := ch.Close(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not close Chrome (%v); close it yourself so the debug port goes away\n", err)
-			}
-		}()
 	}
 	if tok == "" {
 		return errors.New("no token")
@@ -111,7 +100,7 @@ func authArgoCD(ctx context.Context, cfg *config.Config, d *db.DB, paste bool, t
 	if err != nil {
 		return fmt.Errorf("check against %s: %w", cfg.ArgoCD.URL, err)
 	}
-	exp, _ := argocd.TokenExpiry(tok)
+	exp, _ := splunk.TokenExpiry(tok) // the same JWT exp reader
 	if err := d.SetPlain(ctx, argocd.SecretToken, tok, "Argo CD QC session token", exp, "operator"); err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -22,9 +23,20 @@ func (m Model) profileLine(t *store.Task) string {
 			effort = p.Effort
 		}
 		who = map[string]string{"agent": "agent chọn", "operator": "bạn ghim"}[p.SetBy]
+	} else if a, _ := m.d.Store.TaskAssessment(t.ID); a != nil {
+		if lp, ok := c.ForLevel(a.Level); ok {
+			if lp.Model != "" {
+				model = lp.Model
+			}
+			if lp.Effort != "" {
+				effort = lp.Effort
+			}
+			who = "theo level " + levelLabels[a.Level]
+		}
 	}
 	s := fmt.Sprintf("model %s · effort %s (%s · e đổi)", orDefaultVI(model), orDefaultVI(effort), who)
-	if p != nil && p.Reason != "" {
+	// The agent often gives the same reason for the assessment, shown above.
+	if a, _ := m.d.Store.TaskAssessment(t.ID); p != nil && p.Reason != "" && (a == nil || strings.TrimSpace(a.Reason) != strings.TrimSpace(p.Reason)) {
 		s += "\n" + p.Reason
 	}
 	return s

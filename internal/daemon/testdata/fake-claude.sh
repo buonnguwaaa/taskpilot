@@ -26,17 +26,37 @@ request() { # id gate attempt
     "$TASKPILOT_TASK_ID" "$1" "$2" "$3" "fake $2" NOW
 }
 
+is_cursor=0
+for a in "$@"; do
+  case "$a" in --approve-mcps) is_cursor=1 ;; esac
+done
+
 case "$prompt" in
   *"SLOW-AFTER-GATE"*) request plan-1 plan 1; sleep 30 & wait ;;
   *"SLOW"*) sleep 30 & wait ;;
   *"REJECTED request plan-1"*) request plan-2 plan 2 ;;
-  *"APPROVED request plan-"*) request pr-1 pr 1 ;;
+  *"APPROVED request plan-"*) # set_branch (the MCP process saves it), then the pr gate
+    sql "UPDATE tasks SET branch = ? WHERE id = ?" "feat/fix-it--DEMO_FN_0001" "$TASKPILOT_TASK_ID"
+    request pr-1 pr 1 ;;
   *"APPROVED request pr-1"*)
     sql "INSERT INTO completions (task_id, summary, pr_url, created_at) VALUES (?,?,?,?)" \
       "$TASKPILOT_TASK_ID" "fake done" "https://example/pr/1" NOW ;;
   *"Message from the operator"*) : ;;   # ends without a gate -> needs_attention
+  *"QUOTA"*)
+    if [ "$is_cursor" -eq 0 ]; then
+      # Claude Code quota exhaustion: result text carries the real reason.
+      printf '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You'\''ve hit your weekly limit · resets Nov 13, 12pm (UTC)","session_id":"%s"}\n' "${sid:-quota}"
+      exit 1
+    fi
+    request plan-1 plan 1
+    ;;
   *) request plan-1 plan 1 ;;
 esac
+
+# Cursor Agent does not take --session-id; invent one when resuming was not requested.
+if [ -z "$sid" ]; then
+  sid="cursor-$(date +%s)-$$"
+fi
 
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"},{"type":"tool_use","id":"tu1","name":"Edit","input":{"file_path":"a.go"}},{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"git push origin x"}}]},"session_id":"%s"}\n' "$sid"

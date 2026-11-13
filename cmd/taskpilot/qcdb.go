@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,14 +18,24 @@ import (
 // secretReader returns a function reading one secret from the store.
 func secretReader(cfg *config.Config, consumer string) func(ctx context.Context, name string) (string, error) {
 	return func(ctx context.Context, name string) (string, error) {
-		d, err := db.Open(ctx, cfg.Home)
-		if err != nil {
-			return "", err
-		}
-		defer d.Close()
-		v, _, err := d.Resolve(ctx, name, consumer)
+		v, _, err := storedSecret(ctx, cfg, name, consumer, nil)
 		return v, err
 	}
+}
+
+// storedSecret reads a secret from the operator's store; a missing one is
+// the integration's own "not logged in" error (missing), when given.
+func storedSecret(ctx context.Context, cfg *config.Config, name, consumer string, missing error) (string, *db.SecretMeta, error) {
+	d, err := db.Open(ctx, cfg.Home)
+	if err != nil {
+		return "", nil, err
+	}
+	defer d.Close()
+	v, meta, err := d.Resolve(ctx, name, consumer)
+	if missing != nil && errors.Is(err, db.ErrNoSecret) {
+		return "", nil, missing
+	}
+	return v, meta, err
 }
 
 // authSetDB stores the DSN of a project's QC database (for a project whose
@@ -67,11 +78,7 @@ func cmdQCDB(args []string) error {
 	}
 	sub, args := args[0], args[1:]
 	c := newFlags("qcdb " + sub)
-	var pos []string
-	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		pos, args = append(pos, args[0]), args[1:]
-	}
-	c.fs.Parse(args)
+	pos := c.parse(args)
 	cfg, err := config.Load(*c.config)
 	if err != nil {
 		return err

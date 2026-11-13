@@ -7,18 +7,16 @@
 package splgen
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/buonnguwaaa/taskpilot/internal/config"
+	"github.com/buonnguwaaa/taskpilot/internal/oneshot"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 )
 
@@ -84,9 +82,12 @@ func (g *Generator) Generate(ctx context.Context, lc Context, question string) (
 	defer cancel()
 	run := g.Run
 	if run == nil {
-		run = g.exec
+		run = func(ctx context.Context, args []string, stdin string) ([]byte, error) {
+			return oneshot.Exec(ctx, g.Config.Claude.Bin, args, stdin, Timeout)
+		}
 	}
-	out, err := run(ctx, g.args(), prompt(lc, question))
+	c := g.Config.Claude
+	out, err := run(ctx, oneshot.Args(schema, systemPrompt, c.Model, c.SettingSources), prompt(lc, question))
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +95,14 @@ func (g *Generator) Generate(ctx context.Context, lc Context, question string) (
 	if err != nil {
 		return nil, err
 	}
-	return r, Check(r)
+	return r, Check(r, g.Config.Splunk.MaxLookback)
 }
 
-var relTime = regexp.MustCompile(`^(-\d+(s|m|h|d|w))?(@\w+)?$`)
+var relTime = regexp.MustCompile(`^(0|(-\d+(s|m|h|d|w))?(@\w+)?)$`)
 
 // Check validates a generated (or edited) search and window.
-func Check(r *Result) error {
+// maxLookback <= 0 allows any window, all time (earliest 0) included.
+func Check(r *Result, maxLookback time.Duration) error {
 	r.SPL = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r.SPL), "search "))
 	r.Earliest, r.Latest = strings.TrimSpace(r.Earliest), strings.TrimSpace(r.Latest)
 	if r.Latest == "now" {
@@ -120,30 +122,15 @@ func Check(r *Result) error {
 			return fmt.Errorf("thời gian %q không hợp lệ (dạng -4h, @d, -1d@d)", t)
 		}
 	}
-	if d, ok := splunk.Lookback(r.Earliest); ok && d > 7*24*time.Hour {
-		return fmt.Errorf("khoảng thời gian %s quá 7 ngày", r.Earliest)
+	if maxLookback > 0 {
+		if r.Earliest == "0" {
+			return fmt.Errorf("không được tìm toàn bộ thời gian (giới hạn %s)", maxLookback)
+		}
+		if d, ok := splunk.Lookback(r.Earliest); ok && d > maxLookback {
+			return fmt.Errorf("khoảng thời gian %s quá giới hạn %s", r.Earliest, maxLookback)
+		}
 	}
 	return nil
-}
-
-func (g *Generator) args() []string {
-	c := g.Config.Claude
-	args := []string{
-		"-p",
-		"--output-format", "json",
-		"--json-schema", schema,
-		"--system-prompt", systemPrompt,
-		"--tools", "",
-		"--no-session-persistence",
-		"--disable-slash-commands",
-	}
-	if c.Model != "" {
-		args = append(args, "--model", c.Model)
-	}
-	if c.SettingSources != "" {
-		args = append(args, "--setting-sources", c.SettingSources)
-	}
-	return args
 }
 
 func prompt(lc Context, question string) string {
@@ -168,51 +155,12 @@ func prompt(lc Context, question string) string {
 	return b.String()
 }
 
-func (g *Generator) exec(ctx context.Context, args []string, stdin string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, g.Config.Claude.Bin, args...)
-	cmd.Dir = os.TempDir() // no project CLAUDE.md or settings of wherever taskpilot runs
-	cmd.Stdin = strings.NewReader(stdin)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("claude quá thời gian (%s)", Timeout)
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = strings.TrimSpace(string(out))
-		}
-		if r := []rune(msg); len(r) > 300 {
-			msg = string(r[:300]) + "…"
-		}
-		return nil, fmt.Errorf("claude: %w: %s", err, msg)
-	}
-	return out, nil
-}
-
 // parse reads `--output-format json`: the result is in structured_output, or
 // as JSON text in result on older CLIs.
 func parse(out []byte) (*Result, error) {
-	var res struct {
-		IsError          bool            `json:"is_error"`
-		Subtype          string          `json:"subtype"`
-		Result           string          `json:"result"`
-		StructuredOutput json.RawMessage `json:"structured_output"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &res); err != nil {
-		return nil, fmt.Errorf("đọc kết quả claude: %w", err)
-	}
-	if res.IsError {
-		return nil, fmt.Errorf("claude báo lỗi (%s): %s", res.Subtype, res.Result)
-	}
-	raw := []byte(res.StructuredOutput)
-	if len(raw) == 0 || string(raw) == "null" {
-		s := res.Result
-		if i, j := strings.Index(s, "{"), strings.LastIndex(s, "}"); i >= 0 && j > i {
-			s = s[i : j+1]
-		}
-		raw = []byte(s)
+	raw, _, err := oneshot.Answer(out)
+	if err != nil {
+		return nil, err
 	}
 	var r Result
 	if err := json.Unmarshal(raw, &r); err != nil {

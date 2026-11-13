@@ -38,7 +38,8 @@ Có hai dạng response:
 | Comment | `GET v2/task/comment?obj_id={id}` | `data` là mảng (có lúc là `{rows}`) |
 | Thêm comment ✍️ | `POST v2/task/comment`, multipart: `user_id`, `obj_id`, `type=2`, `comment`, `parent_id`?, `file[]`? | chưa gọi thử |
 | Đổi trường task ✍️ | `POST hr/projects/update-field`, multipart: `id`, `field=status`, `value` | chưa gọi thử |
-| Đổi trạng thái assignment ✍️ | `POST hr/projects/update-assign-status`: `task_id`, `assign_id`, `status` | chưa gọi thử |
+| Đổi trạng thái assignment ✍️ | `POST hr/projects/update-assign-status`, JSON: `task_id`, `assign_id` (id của dòng `staff[]` của task, không phải staff_id), `status` (2 xong, 5 chờ duyệt) | theo code JS của web; server từ chối "hoàn thành" khi task chưa có kết quả công việc ("Vui lòng cập nhật kết quả công việc để hoàn thành!"). Chưa gọi thật |
+| Ghi kết quả công việc ✍️ | `POST hr/projects/mass-update-field-task-input`, multipart: `id`, `field=data`, `value[configs][virtual_text]` (HTML) | theo code JS của web (ô "Kết quả công việc"); task sub_type single dùng `update-assign-field` thay vì đây. Chưa gọi thật |
 | Tạo task ✍️ | `POST hr/projects/upsert-task-input/0`, JSON: `id=0`, `name`, `prid`, `parent_id` (EPIC), `milestone_id` (sprint, lấy từ EPIC như web làm khi tạo subtask), `planned_hours` (phút, 480 = 8h), `date_end` (`YYYY-MM-DD 00:00:00`), `note` (mô tả), `no_assign=1`, `sub_type=0` | đã gọi thật 2026-11-10: `data` là task mới (`id`, `code`, `planned_hours` dạng chuỗi), `assign_to_user: []` (chưa giao) |
 | Giao người ✍️ | `POST hr/projects/mass-update-field-task-input`, multipart: `id`, `field=assign_staff`, `value[]=<staff_id>` | theo code JS của web (ô chọn người thực hiện); `staff_id` là `staff_info.staff_id` của profile, không phải user id |
 | Task của một dự án | `GET hr/projects/mytasks-es?option=all&prid={id}&limit=500&offset=0[&status=…][&keyword=…]` | đã gọi thử 2026-11-10; `keyword` lọc theo tên. Index **không trả đủ**: một số EPIC đang mở chỉ thấy qua `parent` của task con |
@@ -55,6 +56,19 @@ Các trường chính của một task: `id`, `code` (ví dụ `HSK-9602DG23`), 
 `status`, `prid` cùng `project{id,name}`, `parent{id,name,code}` (thường là EPIC),
 `milestone{id,name}` (sprint), `date_end`, `planned_hours` (tính bằng phút?),
 `created_by_user`, `assign_to_user[]`, `tags[]`.
+
+## Tệp đính kèm
+
+File đính kèm mô tả nằm trong `note_files[]` (chỉ có ở `task-input/{id}`). Đây là
+đường dẫn tương đối, ví dụ `task/26/11/12/15/Flow_2026-11-12_152833.png`. URL đầy
+đủ là `https://hr-media.hasaki.vn/production/hr/<path>` (web app ghép
+`getMediaUrl() + "/production/hr/"`). URL này công khai, không cần token. Server
+thêm hậu tố `_YYYY-MM-DD_HHMMSS` vào tên file. Khi giao task cho agent
+(phím Enter ở tab Hasaki Work), taskpilot tải các file này về `refs/hw-<code>/`
+cạnh task và liệt kê chúng trong đề bài.
+
+Ảnh kết quả QC của các bước workflow nằm ở
+`subtasks[].data.configs.virtual_media[]`, cùng host media. taskpilot chưa tải các ảnh này.
 
 Lúc khám phá, có 24 task đang mở thuộc 3 project: BOM (Manufactory) `8388`,
 PLM `7264`, Payment (New) `7771`.

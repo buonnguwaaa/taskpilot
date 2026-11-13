@@ -3,13 +3,29 @@
 home: ~/.taskpilot            # task state, worktrees, plugin
 operator_language: Vietnamese # language of summaries shown in the TUI
 
+agent: claude                 # default worker; cursor = always Cursor Agent CLI
+# agent_merge_targets: [release/qc]   # merge_pull_request: only these targets, only when your message says merge/gộp
+
 claude:
   bin: claude
   model: ""                   # empty = Claude Code default
   effort: ""                  # low | medium | high | xhigh | max
+  # classify_model: haiku     # short checks taskpilot makes itself (does a message ask for a merge?)
+  # worklog_model: haiku      # drafts the name and result of a Hasaki Work report (key h)
+  # Until the agent picks its profile (or you pin one), a task runs with the
+  # profile of its estimated level. Default: light → sonnet/medium.
+  # level_profiles:
+  #   light: {model: sonnet, effort: medium}
+  #   standard: {model: sonnet, effort: high}
   # max_budget_usd: 5         # optional cap per run (one turn between two gates); unset = no cap
   permission_mode: dontAsk    # only pre-approved tools run; nothing prompts
   setting_sources: ""         # e.g. "project,local" to ignore ~/.claude settings
+  extra_args: []
+
+cursor:
+  bin: agent                  # Cursor Agent CLI (`curl https://cursor.com/install | bash`)
+  model: ""                   # empty = use claude.model / task profile
+  # fallback_on_quota: true   # when Claude hits weekly/session limit, retry on Cursor (default true)
   extra_args: []
 
 daemon:
@@ -32,6 +48,24 @@ gates: [plan, pr, deploy]
 #     command: '\bkubectl\s+(apply|delete|scale)\b'
 #     requires: deploy
 
+# Jenkins, read-only for agents (MCP tools jenkins_jobs / jenkins_builds /
+# jenkins_log). Credentials: taskpilot auth jenkins (user + API token).
+# jenkins:
+#   url: https://jenkins.example
+#   # depth: 3            # folder levels listed (folder/repo/branch)
+#   # max_log_lines: 400
+# Per project (optional; default: jobs whose name contains a repo name):
+#   projects.<p>.jenkins.jobs: ["BOM/"]
+
+# Graphify graphs (MCP tool graphify): every repo is indexed per line with
+# graphify (code only, local, no LLM), from the branch on the remote, and the
+# repos of a project are linked by their gRPC calls. Install: uv tool install graphifyy
+# graphify:
+#   lines: {prod: "release/prod,$base", qc: release/qc}   # the default
+#   refresh: 30m
+#   # bin: ~/.local/bin/graphify
+#   # ignore: ["*.pb.go", node_modules/, vendor/]          # .graphifyignore
+
 repos:
   example:
     path: ~/repos/github/example
@@ -41,12 +75,10 @@ repos:
       - Bash(go test *)
       - Bash(go build *)
       - Bash(go vet *)
-    prepare:                  # best-effort commands run in a new worktree
-      - [graphify, update, .]
+    # prepare:                # best-effort commands run in a new worktree
+    #   - [make, deps]
+    # lines: {qc: qc}         # graphify graph: this repo's QC branch is named qc
     mcp_servers:
-      graphify:
-        command: python3
-        args: [-m, graphify.serve, graphify-out/graph.json]
       # argocd:
       #   command: npx
       #   args: [argocd-mcp@latest, stdio]

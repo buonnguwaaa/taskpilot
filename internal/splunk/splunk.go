@@ -140,9 +140,9 @@ type Event map[string]any
 // Request is a search.
 type Request struct {
 	SPL       string
-	Earliest  string // e.g. -1h, -15m, 2026-11-09T10:00:00
+	Earliest  string // e.g. -1h, -15m, 2026-11-09T10:00:00, 0 (all time)
 	Latest    string // default now
-	MaxEvents int
+	MaxEvents int    // 0: everything the job returns
 }
 
 // Search creates a search job, waits for it, returns up to MaxEvents events and
@@ -253,6 +253,7 @@ func truthy(v any) bool {
 // search's own data. The agent's searches are read-only investigations.
 var forbidden = []string{
 	"outputlookup", "outputcsv", "outputtext", "collect", "mcollect", "meventcollect", "tscollect",
+	"summaryindex", "dump", "outputtelemetry",
 	"sendemail", "sendalert", "delete", "script", "run", "runshellscript", "map", "rest",
 	"dbxquery", "dbxoutput", "sendresults", "loadjob", "savedsearch",
 	// cross-scope combinators (would escape a project filter)
@@ -265,6 +266,9 @@ var cmdRe = regexp.MustCompile(`\|\s*([A-Za-z_]+)`)
 func Validate(spl string) error {
 	if strings.Contains(spl, "[") {
 		return errors.New("subsearches ([...]) are not allowed")
+	}
+	if strings.Contains(spl, "`") { // a macro can expand to any command, past this check
+		return errors.New("macros (`...`) are not allowed")
 	}
 	trimmed := strings.TrimSpace(spl)
 	if strings.HasPrefix(trimmed, "|") {
@@ -332,7 +336,7 @@ func splitPipe(s string) (base, rest string) {
 func Format(query, earliest string, events []Event, max int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d event(s) for `%s` since %s", len(events), query, earliest)
-	if len(events) == max {
+	if max > 0 && len(events) == max {
 		b.WriteString(" (limit reached: narrow the search or time range to see everything)")
 	}
 	b.WriteString("\n")
@@ -484,11 +488,6 @@ func Expand(spl string, vals map[string]string) (string, error) {
 		return strings.ReplaceAll(strings.ReplaceAll(v, `\`, `\\`), `"`, `\"`)
 	})
 	return strings.TrimSpace(out), bad
-}
-
-// WebURL opens a search in Splunk Web, up to now.
-func WebURL(base, locale, spl, earliest string) string {
-	return WebURLRange(base, locale, spl, earliest, "")
 }
 
 // WebURLRange opens a search in Splunk Web over [earliest, latest).

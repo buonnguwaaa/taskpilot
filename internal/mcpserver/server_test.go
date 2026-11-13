@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,9 +19,13 @@ import (
 
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
 	"github.com/buonnguwaaa/taskpilot/internal/bitbucket"
+	"github.com/buonnguwaaa/taskpilot/internal/claudeai"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
+	"github.com/buonnguwaaa/taskpilot/internal/kafbat"
+	"github.com/buonnguwaaa/taskpilot/internal/refs"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
+	"github.com/buonnguwaaa/taskpilot/internal/vault"
 )
 
 func gitRepo(t *testing.T) string {
@@ -250,23 +255,36 @@ func TestCreatePullRequest(t *testing.T) {
 	if _, err := h.OpenRepo(ctx, OpenRepoIn{Name: "svc"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.CreatePullRequest(ctx, in); err == nil || !strings.Contains(err.Error(), "set_branch") {
+		t.Fatalf("provisional branch: %v", err)
+	}
+	if _, err := h.SetBranch(ctx, SetBranchIn{Name: "tp-cap-discount"}); err == nil {
+		t.Fatal("a name off the convention must be refused")
+	}
+	if msg, err := h.SetBranch(ctx, SetBranchIn{Name: "fix/cap-discount--HSK-1"}); err != nil || !strings.Contains(msg, "svc") {
+		t.Fatalf("set_branch: %q %v", msg, err)
+	}
 	if _, err := h.CreatePullRequest(ctx, in); err == nil || !strings.Contains(err.Error(), "no commits") {
 		t.Fatalf("no commits: %v", err)
 	}
 	work := filepath.Join(ws, "svc")
 	os.WriteFile(filepath.Join(work, "x.go"), []byte("package x\n"), 0o644)
+	gitc(work, "add", ".")
+	gitc(work, "commit", "-q", "-m", "feat: x")
+	os.WriteFile(filepath.Join(work, "x.go"), []byte("package x // edited\n"), 0o644)
 	if _, err := h.CreatePullRequest(ctx, in); err == nil || !strings.Contains(err.Error(), "uncommitted") {
 		t.Fatalf("dirty tree: %v", err)
 	}
-	gitc(work, "add", ".")
-	gitc(work, "commit", "-q", "-m", "feat: x")
+	gitc(work, "checkout", "--", "x.go")
+	// A test kept local (untracked) does not block the PR.
+	os.WriteFile(filepath.Join(work, "x_test.go"), []byte("package x\n"), 0o644)
 
 	// Stage 1: after the pr gate → PR into release/qc.
 	msg, err := h.CreatePullRequest(ctx, in)
 	if err != nil || !strings.Contains(msg, "→ release/qc") || !strings.Contains(msg, `after the "qc" gate`) {
 		t.Fatalf("stage 1: %q %v", msg, err)
 	}
-	if got := gitc(bare, "rev-parse", "refs/heads/tp/mock-9"); got != gitc(work, "rev-parse", "HEAD") {
+	if got := gitc(bare, "rev-parse", "refs/heads/fix/cap-discount--HSK-1"); got != gitc(work, "rev-parse", "HEAD") {
 		t.Fatal("work branch was not pushed")
 	}
 	if !strings.Contains(posted[0]["description"].(string), "HSK-1") {
@@ -278,27 +296,50 @@ func TestCreatePullRequest(t *testing.T) {
 	}
 	// A QC fix: new commit, same call → pushes and reuses the open qc PR.
 	os.WriteFile(filepath.Join(work, "y.go"), []byte("package x\n"), 0o644)
-	gitc(work, "add", ".")
+	gitc(work, "add", "y.go")
 	gitc(work, "commit", "-q", "-m", "fix: qc feedback")
 	if msg, err := h.CreatePullRequest(ctx, in); err != nil || !strings.Contains(msg, "existing pull request #1") {
 		t.Fatalf("qc fix: %q %v", msg, err)
 	}
-	if len(posted) != 1 || gitc(bare, "rev-parse", "refs/heads/tp/mock-9") != gitc(work, "rev-parse", "HEAD") {
+	if len(posted) != 1 || gitc(bare, "rev-parse", "refs/heads/fix/cap-discount--HSK-1") != gitc(work, "rev-parse", "HEAD") {
 		t.Fatalf("qc fix must push without opening a second PR (posted %d)", len(posted))
 	}
 	// Stage 2: after the qc gate → PR from the feature branch into main.
 	r, _ := st.AddRequest("mock-9", "qc", "QC ok?", "")
 	st.Decide("mock-9", r, true, "QC passed")
 	msg, err = h.CreatePullRequest(ctx, in)
-	if err != nil || !strings.Contains(msg, "#2 tp/mock-9 → main") {
+	if err != nil || !strings.Contains(msg, "#2 fix/cap-discount--HSK-1 → main") {
 		t.Fatalf("stage 2: %q %v", msg, err)
 	}
-	if src := posted[1]["source"].(map[string]any)["branch"].(map[string]any)["name"]; src != "tp/mock-9" {
+	if src := posted[1]["source"].(map[string]any)["branch"].(map[string]any)["name"]; src != "fix/cap-discount--HSK-1" {
 		t.Fatalf("main PR must come from the feature branch, got %v", src)
 	}
 	prs, _ := st.PullRequests("mock-9")
 	if len(prs) != 2 || prs[0].Destination != "release/qc" || prs[1].Destination != "main" {
 		t.Fatalf("pr records = %+v", prs)
+	}
+	// The agent renames the branch itself with git: the next call follows it.
+	gitc(work, "branch", "-m", "fix/cap-discount-v2--HSK-1")
+	msg, err = h.CreatePullRequest(ctx, in)
+	if err != nil || !strings.Contains(msg, "fix/cap-discount-v2--HSK-1 → release/qc") || !strings.Contains(msg, "renamed after PR") {
+		t.Fatalf("after git branch -m: %q %v", msg, err)
+	}
+	if gitc(bare, "rev-parse", "refs/heads/fix/cap-discount-v2--HSK-1") != gitc(work, "rev-parse", "HEAD") {
+		t.Fatal("renamed branch was not pushed")
+	}
+	if tk, _ := st.LoadTask("mock-9"); tk.Branch != "fix/cap-discount-v2--HSK-1" {
+		t.Fatalf("task branch = %q, want the renamed one", tk.Branch)
+	}
+	gitc(work, "branch", "-m", "Bad_Name")
+	if _, err := h.CreatePullRequest(ctx, in); err == nil || !strings.Contains(err.Error(), "convention") {
+		t.Fatalf("non-convention name: %v", err)
+	}
+	// Committing a new test is refused: tests stay local.
+	gitc(work, "branch", "-m", "fix/cap-discount-v2--HSK-1")
+	gitc(work, "add", "x_test.go")
+	gitc(work, "commit", "-q", "-m", "test: x")
+	if _, err := h.CreatePullRequest(ctx, in); err == nil || !strings.Contains(err.Error(), "x_test.go") {
+		t.Fatalf("committed test: %v", err)
 	}
 }
 
@@ -336,6 +377,9 @@ func TestCreatePullRequestWithoutTokenPushesAndRecordsCreatePage(t *testing.T) {
 	r, _ := st.AddRequest("mock-4", "pr", "s", "")
 	st.Decide("mock-4", r, true, "")
 	h.OpenRepo(ctx, OpenRepoIn{Name: "bom-api"})
+	if _, err := h.SetBranch(ctx, SetBranchIn{Name: "fix/x--BOM_CTL_PRL_0004"}); err != nil {
+		t.Fatal(err)
+	}
 	work := filepath.Join(ws, "bom-api")
 	os.WriteFile(filepath.Join(work, "x.go"), []byte("package x\n"), 0o644)
 	gitc(work, "add", ".")
@@ -345,11 +389,11 @@ func TestCreatePullRequestWithoutTokenPushesAndRecordsCreatePage(t *testing.T) {
 	if err != nil || !strings.Contains(msg, "TUI (key p)") {
 		t.Fatalf("fallback: %q %v", msg, err)
 	}
-	if gitc(bare, "rev-parse", "refs/heads/tp/mock-4") != gitc(work, "rev-parse", "HEAD") {
+	if gitc(bare, "rev-parse", "refs/heads/fix/x--BOM_CTL_PRL_0004") != gitc(work, "rev-parse", "HEAD") {
 		t.Fatal("branch must still be pushed with the machine's git credentials")
 	}
 	pr, _ := st.PullRequestInto("mock-4", "bom-api", "main")
-	want := "https://bitbucket.org/hasaki-tech/bom-api/pull-requests/new?dest=main&source=tp%2Fmock-4"
+	want := "https://bitbucket.org/hasaki-tech/bom-api/pull-requests/new?dest=main&source=fix%2Fx--BOM_CTL_PRL_0004"
 	if pr == nil || !pr.Pending || pr.URL != want || !strings.Contains(pr.Description, "HSK-2") {
 		t.Fatalf("pending PR = %+v", pr)
 	}
@@ -514,7 +558,212 @@ func TestSetExecutionProfile(t *testing.T) {
 	if err != nil || !strings.Contains(out, "pinned") {
 		t.Fatalf("pinned: %q %v", out, err)
 	}
+	if _, err := h.SetExecutionProfile(SetProfileIn{Model: "opus", Effort: "high", Reason: "r", Level: "insane"}); err == nil {
+		t.Error("an unknown level is refused")
+	}
+	// The assessment is recorded even when the profile is pinned.
+	if _, err := h.SetExecutionProfile(SetProfileIn{Model: "opus", Effort: "high", Reason: "payment, 3 repos", Level: "Hard", Kind: "bugfix"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := st.TaskAssessment("mock-x"); a == nil || a.Level != "hard" || a.Kind != "bugfix" || a.Reason != "payment, 3 repos" {
+		t.Fatalf("assessment = %+v", a)
+	}
 	if p, _ := st.TaskProfile("mock-x"); p.Model != "sonnet" {
 		t.Fatal("the pinned profile must stay")
+	}
+}
+
+func TestAskOperator(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-ask", Project: "payment"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	cfg := &config.Config{Gates: []string{"plan", "pr"}, Projects: map[string]config.Project{"payment": {Name: "Payment"}}}
+	h := &Handlers{Store: st, Config: cfg, TaskID: "mock-ask"}
+	q := []store.Question{{Question: "Port cho service?", Options: []store.Option{{Label: ":3905"}, {Label: ":3910"}}}}
+
+	if _, err := h.AskOperator(AskOperatorIn{}); err == nil {
+		t.Fatal("questions are required")
+	}
+	out, err := h.AskOperator(AskOperatorIn{Context: "Cần chọn port", Questions: q})
+	if err != nil || !strings.Contains(out, "question-1") {
+		t.Fatalf("%q %v", out, err)
+	}
+	p, _ := st.PendingRequest("mock-ask")
+	if p == nil || p.Gate != store.QuestionGate || p.Summary != "Cần chọn port" || len(p.Questions) != 1 {
+		t.Fatalf("pending = %+v", p)
+	}
+	if _, err := h.AskOperator(AskOperatorIn{Questions: q}); err == nil {
+		t.Fatal("one request at a time")
+	}
+	st.Decide("mock-ask", p, true, "Q1 → :3905")
+	// A gate request may carry questions too.
+	if _, err := h.RequestApproval(RequestApprovalIn{Gate: "plan", Summary: "plan", Questions: q}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := st.PendingRequest("mock-ask"); p.Gate != "plan" || len(p.Questions) != 1 {
+		t.Fatalf("plan with questions = %+v", p)
+	}
+}
+
+func TestQCConfigScopedAndAudited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/sys/internal/ui/mounts":
+			io.WriteString(w, `{"data":{"secret":{"kv/":{"type":"kv","options":{"version":"2"}}}}}`)
+		case r.Method == "LIST" && r.URL.Path == "/v1/kv/metadata/payment/":
+			io.WriteString(w, `{"data":{"keys":["payment-vnpay"]}}`)
+		case r.URL.Path == "/v1/kv/data/payment/payment-vnpay":
+			io.WriteString(w, `{"data":{"data":{"VNPAY_URL":"https://sandbox","DB_PASSWORD":"s3cr3t"}}}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-v", Project: "payment"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	cfg := &config.Config{Vault: config.Vault{URL: srv.URL},
+		Projects: map[string]config.Project{"payment": {Name: "Payment", VaultPaths: []string{"kv/payment/"}}}}
+	h := &Handlers{Store: st, Config: cfg, TaskID: "mock-v", Vault: func(context.Context) (*vault.Client, error) {
+		return &vault.Client{BaseURL: srv.URL, Token: "tok"}, nil
+	}}
+	ctx := context.Background()
+
+	if out, err := h.QCConfigList(ctx, QCConfigIn{}); err != nil || !strings.Contains(out, "kv/payment/") {
+		t.Fatalf("roots: %q %v", out, err)
+	}
+	if out, err := h.QCConfigList(ctx, QCConfigIn{Path: "kv/payment/"}); err != nil || !strings.Contains(out, "payment-vnpay") {
+		t.Fatalf("list: %q %v", out, err)
+	}
+	out, err := h.QCConfigGet(ctx, QCConfigIn{Path: "kv/payment/payment-vnpay"})
+	if err != nil || !strings.Contains(out, "VNPAY_URL=https://sandbox") || !strings.Contains(out, "never copy values") {
+		t.Fatalf("get: %q %v", out, err)
+	}
+	if _, err := h.QCConfigGet(ctx, QCConfigIn{Path: "kv/bom/bom-api"}); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("other project: %v", err)
+	}
+	reads, _ := st.VaultReads("mock-v")
+	if len(reads) != 3 || reads[1].Action != "get" || reads[1].Keys != 2 || reads[2].Error == "" {
+		t.Fatalf("audit = %+v", reads)
+	}
+	for _, r := range reads {
+		if strings.Contains(r.Path+r.Error, "s3cr3t") {
+			t.Fatal("values must never reach the audit")
+		}
+	}
+	// A project without vault_paths has no access.
+	cfg.Projects["payment"] = config.Project{Name: "Payment"}
+	if _, err := h.QCConfigGet(ctx, QCConfigIn{Path: "kv/payment/payment-vnpay"}); err == nil || !strings.Contains(err.Error(), "vault_paths") {
+		t.Fatalf("no paths: %v", err)
+	}
+}
+
+func TestQCKafkaScopedToProjectTopics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/clusters/qc/topics":
+			io.WriteString(w, `{"pageCount":1,"topics":[{"name":"payment-vnpay","partitionCount":3},{"name":"bom-api","partitionCount":1}]}`)
+		case r.URL.Path == "/api/clusters/qc/topics/payment-vnpay/messages/v2":
+			io.WriteString(w, "data:{\"type\":\"MESSAGE\",\"message\":{\"partition\":0,\"offset\":1,\"timestamp\":\"2026-11-12T01:00:00Z\",\"key\":\"k\",\"content\":\"v\"}}\n\ndata:{\"type\":\"DONE\"}\n\n")
+		case r.URL.Path == "/api/clusters/qc/consumer-groups/other":
+			io.WriteString(w, `{"groupId":"other","partitions":[{"topic":"bom-api","partition":0}]}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-k", Project: "payment"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	cfg := &config.Config{Kafka: config.Kafka{URL: srv.URL, MaxMessages: 5},
+		Projects: map[string]config.Project{"payment": {Name: "Payment", KafkaTopics: []string{"payment-*"}}}}
+	h := &Handlers{Store: st, Config: cfg, TaskID: "mock-k", Kafka: func(context.Context) (*kafbat.Client, string, error) {
+		return &kafbat.Client{BaseURL: srv.URL, Cookie: "SESSION=x"}, "qc", nil
+	}}
+	ctx := context.Background()
+	out, err := h.QCKafkaTopics(ctx, QCKafkaTopicsIn{})
+	if err != nil || !strings.Contains(out, "payment-vnpay") || strings.Contains(out, "bom-api") {
+		t.Fatalf("topics: %q %v", out, err)
+	}
+	if out, err := h.QCKafkaMessages(ctx, QCKafkaMessagesIn{Topic: "payment-vnpay", Limit: 99}); err != nil || !strings.Contains(out, "#0@1") {
+		t.Fatalf("messages: %q %v", out, err)
+	}
+	for name, call := range map[string]func() error{
+		"messages": func() error { _, err := h.QCKafkaMessages(ctx, QCKafkaMessagesIn{Topic: "bom-api"}); return err },
+		"topic":    func() error { _, err := h.QCKafkaTopics(ctx, QCKafkaTopicsIn{Topic: "bom-api"}); return err },
+		"groups":   func() error { _, err := h.QCKafkaGroups(ctx, QCKafkaGroupsIn{Topic: "bom-api"}); return err },
+		"group":    func() error { _, err := h.QCKafkaGroups(ctx, QCKafkaGroupsIn{Group: "other"}); return err },
+	} {
+		if err := call(); err == nil {
+			t.Errorf("%s: another project's topic must be refused", name)
+		}
+	}
+	cfg.Projects["payment"] = config.Project{Name: "Payment"}
+	if _, err := h.QCKafkaTopics(ctx, QCKafkaTopicsIn{}); err == nil || !strings.Contains(err.Error(), "kafka_topics") {
+		t.Fatalf("no topics configured: %v", err)
+	}
+}
+
+func TestReadClaudeArtifactSavesNextToTask(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	var gotDir string
+	h := &Handlers{Store: st, Config: &config.Config{}, TaskID: "hw-HSK-1",
+		ClaudeArtifact: func(_ context.Context, link, dir string) (*claudeai.Artifact, error) {
+			gotDir = dir
+			return &claudeai.Artifact{URL: link, Title: "Proto", Screenshot: dir + "/s.png"}, nil
+		}}
+	if _, err := h.ReadClaudeArtifact(context.Background(), ReadClaudeArtifactIn{URL: "https://example.com/artifact/x"}); err == nil {
+		t.Fatal("non claude.ai link accepted")
+	}
+	msg, err := h.ReadClaudeArtifact(context.Background(), ReadClaudeArtifactIn{URL: " https://claude.ai/artifact/AbC?sk=1 "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDir != refs.Dir(st.Home, "hw-HSK-1") || !strings.Contains(msg, `claude.ai artifact "Proto"`) || !strings.Contains(msg, "screenshot") {
+		t.Fatalf("dir=%s msg=%s", gotDir, msg)
+	}
+}
+
+func TestPickStageOpensBaseWithQCWhenFlowAllows(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-f", Project: "p"}
+	tk.Transition(store.StateRunning, "")
+	if err := st.SaveTask(tk); err != nil {
+		t.Fatal(err)
+	}
+	repo := config.Repo{Base: "main", PRFlow: []config.PRStage{{Target: "release/qc", Gate: "pr"}, {Target: "main", Gate: "pr"}}}
+	h := &Handlers{Store: st, Config: &config.Config{Gates: []string{"plan", "pr", "qc"}}, TaskID: "mock-f"}
+	r, err := st.AddRequest("mock-f", "pr", "s", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Decide("mock-f", r, true, "")
+	if s, err := h.pickStage("svc", repo, "", ""); err != nil || s.Target != "release/qc" {
+		t.Fatalf("first = %+v %v", s, err)
+	}
+	st.SetPullRequest("mock-f", &store.PullRequest{Repo: "svc", Destination: "release/qc", URL: "u1"})
+	if s, err := h.pickStage("svc", repo, "", ""); err != nil || s.Target != "main" {
+		t.Fatalf("second = %+v %v (the base PR must not wait for qc)", s, err)
+	}
+	if s, err := h.pickStage("svc", repo, "", "feat/renamed--A_B_0001"); err != nil || s.Target != "release/qc" {
+		t.Fatalf("after a rename = %+v %v (the QC PR must be opened again from the new name)", s, err)
+	}
+	if s, err := h.pickStage("svc", repo, "main", ""); err != nil || s.Target != "main" {
+		t.Fatalf("explicit = %+v %v", s, err)
+	}
+	old := config.Repo{Base: "main", PRFlow: []config.PRStage{{Target: "release/qc", Gate: "pr"}, {Target: "main", Gate: "qc"}}}
+	if _, err := h.pickStage("svc", old, "main", ""); err == nil {
+		t.Fatal("a repo keeping the base behind qc must still be refused")
+	}
+}
+
+func TestTestFiles(t *testing.T) {
+	got := testFiles("a/b.go\na/b_test.go\nweb/x.test.ts\nweb/y.spec.tsx\nsrc/__tests__/z.js\npy/test_q.py\npy/q_test.py\npkg/testdata/in.json\ndocs/testing.md\napi/latest.go")
+	want := "a/b_test.go web/x.test.ts web/y.spec.tsx src/__tests__/z.js py/test_q.py py/q_test.py pkg/testdata/in.json"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("test files = %v", got)
 	}
 }

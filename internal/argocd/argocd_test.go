@@ -2,7 +2,6 @@ package argocd
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -120,13 +119,6 @@ func TestMatch(t *testing.T) {
 	}
 	if got := names(Match(apps, []string{"other"}, nil, nil, false, all)); got != "other" {
 		t.Fatalf("explicit: %s", got)
-	}
-}
-
-func TestTokenExpiry(t *testing.T) {
-	tok := "h." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1800000000}`)) + ".s"
-	if e, ok := TokenExpiry(tok); !ok || e.Unix() != 1800000000 {
-		t.Fatalf("%v %v", e, ok)
 	}
 }
 

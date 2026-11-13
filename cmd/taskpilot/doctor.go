@@ -39,10 +39,11 @@ func cmdDoctor(args []string) error {
 	} else {
 		ok("policy: %d rules, gates %s", len(cfg.Rules), strings.Join(cfg.Gates, ", "))
 	}
-	if p, err := exec.LookPath(cfg.Claude.Bin); err != nil {
-		bad("claude binary %q not found", cfg.Claude.Bin)
+	bin := cfg.AgentBin()
+	if p, err := exec.LookPath(bin); err != nil {
+		bad("agent binary %q not found (agent=%s)", bin, cfg.AgentKind())
 	} else {
-		ok("claude: %s", p)
+		ok("agent (%s): %s", cfg.AgentKind(), p)
 	}
 
 	d, err := db.Open(context.Background(), cfg.Home)

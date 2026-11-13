@@ -148,7 +148,7 @@ func wrap(s string, w int) string {
 	// Leave room for punctuation glued to a URL ("(…)."), so the word the URL
 	// is in still fits a line and is not hard-wrapped through the URL.
 	s, links := shortenURLs(strings.TrimSpace(s), w-4)
-	return linkify(lipgloss.NewStyle().Width(w).Render(s), links)
+	return linkify(restoreLabels(lipgloss.NewStyle().Width(w).Render(s), links), links)
 }
 
 // sortedPRs orders PRs with pending ones (needing the operator) first, then by repo.

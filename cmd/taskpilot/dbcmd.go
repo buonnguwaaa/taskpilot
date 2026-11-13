@@ -11,28 +11,6 @@ import (
 	"time"
 )
 
-func cmdMigrateFiles(args []string) error {
-	c := newFlags("migrate-files")
-	c.fs.Parse(args)
-	_, st, err := c.load()
-	if err != nil {
-		return err
-	}
-	if err := refuseOldDaemon(st.Home); err != nil {
-		return err
-	}
-	ids, err := st.ImportLegacy()
-	if err != nil {
-		return err
-	}
-	if len(ids) == 0 {
-		fmt.Println("không có task dạng file nào cần chuyển")
-		return nil
-	}
-	fmt.Printf("đã chuyển %d task vào database: %s\n(file cũ nằm trong tasks/<id>/legacy/)\n", len(ids), strings.Join(ids, ", "))
-	return nil
-}
-
 const dbUsage = `taskpilot db stats            cost, approval rate per gate, top denials, outbox
 taskpilot db tasks            tasks with state, runs and cost
 taskpilot db runs TASK        runs of a task (trigger, cost, turns, outcome, tool calls)

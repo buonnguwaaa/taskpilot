@@ -39,7 +39,7 @@ func TestInvestigateFromErrorGroup(t *testing.T) {
 	srv := investigationServer(t)
 	m, _ := logsModel(t, srv.URL)
 	m.d.Config.Projects["bom"].Repos["bom-api"] = m.d.Config.Projects["bom"].Repos["bom-api"]
-	m, _ = press(t, m, "3", "e", "enter") // Production, first entry: the error grouping
+	m, _ = press(t, m, "3", "enter") // Production, first entry: the error grouping
 	m, cmd := m, tea.Cmd(nil)
 	m, cmd = press(t, m, "r")
 	if cmd == nil {
@@ -76,7 +76,7 @@ func TestInvestigateFromErrorGroup(t *testing.T) {
 func TestInvestigateFromSymptomAndResults(t *testing.T) {
 	srv := investigationServer(t)
 	m, _ := logsModel(t, srv.URL)
-	m, _ = press(t, m, "3", "e", "j", "enter") // 🔎 Điều tra sự cố…
+	m, _ = press(t, m, "3", "j", "enter") // 🔎 Điều tra sự cố…
 	if m.modal == nil || !strings.Contains(m.modal.title, "Điều tra sự cố production") {
 		t.Fatal("the investigate entry opens the symptom form")
 	}

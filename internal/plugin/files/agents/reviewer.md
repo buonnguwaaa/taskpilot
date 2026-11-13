@@ -16,7 +16,15 @@ change; judge it on its merits.
 - Look for: behaviour that does not match the acceptance criteria; bugs and
   unhandled edge cases (nil/empty, errors, retries, time zones, rounding of
   money, idempotency, concurrency, transactions); migrations and backward
-  compatibility; security (injection, secrets, auth); missing or weak tests.
+  compatibility; security (injection, secrets, auth); risky logic the agent
+  did not verify (tests stay local by the operator's rule: do not ask to commit
+  them, ask whether it was checked);
+  then lean: code that should not exist or should be smaller (dead code, logic
+  the repo already has, what the standard library does, an abstraction with
+  one implementation, near-copies). A `shortcut:` comment that names its limit
+  is a decision, not a finding.
+- Every finding needs a concrete case (this input leads to this wrong result).
+  No case, no finding. Propose the smallest fix; prefer fixes that delete code.
 - Report findings ranked by severity, each with `path:line`, what goes wrong
   and a concrete fix. Separate real defects from style nits; skip nits unless
   asked. If the change is sound, say so plainly.

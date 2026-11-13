@@ -102,6 +102,7 @@ func authSplunk(ctx context.Context, cfg *config.Config, d *db.DB, useToken, use
 		if err := ch.Open(sctx, cfg.Splunk.URL+cfg.Splunk.LoginPath); err != nil {
 			return err
 		}
+		defer closeChrome(ch)
 		fmt.Println("Chrome (profile riêng của taskpilot) đã mở Splunk. Đăng nhập trên cửa sổ đó…")
 		wctx, cancel := context.WithTimeout(sctx, timeout)
 		defer cancel()
@@ -123,11 +124,6 @@ func authSplunk(ctx context.Context, cfg *config.Config, d *db.DB, useToken, use
 				exp = &t
 			}
 		}
-		defer func() {
-			if err := ch.Close(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not close Chrome (%v); close it yourself so the debug port goes away\n", err)
-			}
-		}()
 	}
 	if value == "" {
 		return errors.New("nothing entered")

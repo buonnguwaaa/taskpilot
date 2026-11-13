@@ -140,3 +140,19 @@ func (m *Mock) Remove(ticketID string) error {
 	}
 	return nil
 }
+
+// TitleFrom makes a title out of a ticket body, for tickets submitted without
+// one (a quick question): its first non-empty line, at most 80 characters.
+func TitleFrom(body string) string {
+	for _, l := range strings.Split(body, "\n") {
+		l = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(l), "#-*>"))
+		if l == "" {
+			continue
+		}
+		if r := []rune(l); len(r) > 80 {
+			l = strings.TrimSpace(string(r[:79])) + "…"
+		}
+		return l
+	}
+	return ""
+}

@@ -10,17 +10,30 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/plugin"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
+	"github.com/buonnguwaaa/taskpilot/internal/store"
 )
 
-// logsMaxEvents caps one search from the TUI.
+// logsMaxEvents caps one search from the TUI when the config sets no
+// splunk.max_events.
 const logsMaxEvents = 200
+
+// logsLimit is the TUI's cap per search: 0 (no limit) when splunk.max_events
+// is 0, else at least logsMaxEvents.
+func logsLimit(c *config.Config) int {
+	if c != nil && c.Splunk.MaxEvents == 0 && c.Path != "" {
+		return 0
+	}
+	if c != nil && c.Splunk.MaxEvents > logsMaxEvents {
+		return c.Splunk.MaxEvents
+	}
+	return logsMaxEvents
+}
 
 // groupsLimit caps the error groups of one grouping search.
 const groupsLimit = 60
@@ -31,6 +44,7 @@ type (
 		groups                bool // the search is the error grouping (rows are groups)
 		events                []splunk.Event
 		took                  time.Duration
+		limit                 int // events cap of the search (0: none)
 		err                   error
 	}
 	// splGenStartedMsg marks that Claude started writing an SPL.
@@ -46,8 +60,8 @@ type (
 type logsEnv int
 
 const (
-	envQC logsEnv = iota
-	envProd
+	envProd logsEnv = iota // the default: Production comes first
+	envQC
 )
 
 type logsTab struct {
@@ -74,6 +88,13 @@ type logsTab struct {
 	groupCursor int
 	groupsFocus bool
 	generating  bool // claude is writing an SPL from a question
+
+	// Fix suggestions of the scheduled scans (logs_suggest.go).
+	suggestions int // waiting, every project (tab label; refreshed each tick)
+	flows       []*store.ErrorFlow
+	flowOpen    map[int64]bool // expanded flows
+	suggCursor  int            // in suggEntries()
+	suggFocus   bool
 }
 
 // Special entries of the saved-search list.
@@ -95,20 +116,66 @@ func (m Model) logProject() (string, *config.ProdLogs) {
 	return name, m.d.Config.Projects[name].LogsProduction
 }
 
-// logItems are the error grouping, the saved searches, the builder and the
-// question to Claude.
+// logItems are the shared actions (grouping, investigation, search), the
+// question to Claude, then the project's saved searches.
 func (m Model) logItems() []config.LogQuery {
 	_, pl := m.logProject()
 	if pl == nil {
 		return nil
 	}
-	items := []config.LogQuery{{Name: itemGroups, Note: "Gom lỗi giống nhau (số, mã, UUID được che) của mọi service; chọn một nhóm để xem log hoặc tạo task sửa."}}
-	items = append(items, config.LogQuery{Name: itemInvestigate, Note: "Khách / vận hành báo lỗi? Mô tả triệu chứng, mã đơn/giao dịch, khoảng thời gian: tạo task để agent điều tra nguyên nhân gốc trên Splunk, code và DB QC, báo cáo trước khi sửa."})
-	items = append(items, pl.Queries...)
-	items = append(items,
-		config.LogQuery{Name: itemBuilder, Note: "Chọn service, mức, chuỗi cần tìm, request_id: taskpilot tự viết SPL."},
-		config.LogQuery{Name: itemAsk, Note: "Mô tả bằng lời (vd \"refund TCB lỗi sáng nay\"); Claude đọc tài liệu log của dự án và viết SPL để bạn sửa trước khi chạy."})
-	return items
+	var items []config.LogQuery
+	if name, _ := m.logProject(); m.hasScan(name) {
+		items = append(items, config.LogQuery{Name: itemSuggest, Note: "Lỗi production taskpilot tự quét theo lịch (logs_production.scan), đã gom nhóm: tạo task điều tra / sửa, hoặc bỏ qua."})
+	}
+	items = append(items, []config.LogQuery{
+		{Name: itemGroups, Note: "Gom lỗi giống nhau (số, mã, UUID được che) của mọi service; chọn một nhóm để xem log, điều tra hoặc tạo task sửa."},
+		{Name: itemInvestigate, Note: "Khách / vận hành báo lỗi? Mô tả triệu chứng, mã đơn/giao dịch, khoảng thời gian: tạo task để agent điều tra nguyên nhân gốc trên Splunk, code và DB QC, báo cáo trước khi sửa."},
+		{Name: itemBuilder, Note: "Chọn service, mức, chuỗi cần tìm, request_id: taskpilot tự viết SPL."},
+		{Name: itemAsk, Note: "Mô tả bằng lời (vd \"refund TCB lỗi sáng nay\"); Claude đọc tài liệu log của dự án và viết SPL để bạn sửa trước khi chạy."},
+	}...)
+	return append(items, pl.Queries...)
+}
+
+// prodRows lays out the Production list for logsLeft.
+func (m Model) prodRows() []logRow {
+	name, pl := m.logProject()
+	if pl == nil {
+		return nil
+	}
+	var rows []logRow
+	items := m.logItems()
+	actions := len(items) - len(pl.Queries)
+	rows = append(rows, logRow{plain: "── Công cụ", item: -1})
+	for i, q := range items {
+		if i == actions && actions < len(items) {
+			rows = append(rows, logRow{plain: "", item: -1}, logRow{plain: "── Truy vấn có sẵn", item: -1})
+		}
+		if q.Name == itemSuggest {
+			n := m.suggestionCount(name)
+			plain := fmt.Sprintf("%s (%d)", q.Name, n)
+			label := q.Name
+			if n > 0 {
+				label += " " + warnStyle.Render(fmt.Sprintf("%d", n))
+			}
+			rows = append(rows, logRow{plain: plain, label: label, note: q.Note, item: i})
+			continue
+		}
+		note := q.Note
+		if q.SPL != "" {
+			note = strings.TrimSpace(note + "\nSPL: " + q.SPL)
+		}
+		rows = append(rows, logRow{plain: q.Name, note: note, item: i})
+	}
+	return rows
+}
+
+func itemIndex(items []config.LogQuery, name string) int {
+	for i, q := range items {
+		if q.Name == name {
+			return i
+		}
+	}
+	return 0
 }
 
 // window is the time range for a search: the chosen preset, or the saved
@@ -122,13 +189,6 @@ func (m Model) window(q config.LogQuery) (earliest, latest string) {
 		return q.Earliest, ""
 	}
 	return m.d.Config.Splunk.DefaultEarliest, ""
-}
-
-func (m Model) presetLabel() string {
-	if m.logs.preset == 0 {
-		return "theo truy vấn"
-	}
-	return splunk.Presets[m.logs.preset-1].Label
 }
 
 // presetOptions are the windows of the forms, with the current one first chosen.
@@ -147,12 +207,12 @@ func splitWindow(v string) (string, string) {
 
 // envLine is the first line of the Logs list box: which environment is shown.
 func (m Model) envLine() string {
-	qc := " QC · Argo CD "
 	prod := " Production · Splunk "
+	qc := " QC · Argo CD "
 	if m.logs.env == envQC {
-		return activeTabStyle.Render(qc) + " " + tabStyle.Render(prod) + dimStyle.Render("  e đổi")
+		return tabStyle.Render(prod) + " " + activeTabStyle.Render(qc) + dimStyle.Render("  e")
 	}
-	return tabStyle.Render(qc) + " " + activeTabStyle.Render(prod) + dimStyle.Render("  e đổi")
+	return activeTabStyle.Render(prod) + " " + tabStyle.Render(qc) + dimStyle.Render("  e")
 }
 
 func (m Model) logsView() string {
@@ -163,8 +223,20 @@ func (m Model) logsView() string {
 }
 
 func (m Model) logsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if k.String() == "e" && !m.logs.groupsFocus {
-		return m.switchEnv()
+	switch k.String() {
+	case "e":
+		if !m.logs.groupsFocus && !m.logs.qc.groupsFocus {
+			return m.switchEnv()
+		}
+	case "t", "T": // one time window for both environments
+		n := len(splunk.Presets) + 1
+		if k.String() == "t" {
+			m.logs.preset = (m.logs.preset + 1) % n
+		} else {
+			m.logs.preset = (m.logs.preset + n - 1) % n
+		}
+		m.msg = "thời gian: " + m.presetLabel() + " (áp dụng cho lần đọc tiếp theo; r để chạy lại)"
+		return m, nil
 	}
 	if m.logs.env == envQC {
 		return m.qcKey(k)
@@ -189,61 +261,26 @@ func (m Model) switchEnv() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) prodView() string {
-	h := m.innerHeight()
-	lw := m.listWidth()
 	name, pl := m.logProject()
-	var b strings.Builder
-	b.WriteString(m.envLine() + "\n")
 	if pl == nil {
-		b.WriteString(dimStyle.Render("Chưa có project nào có logs_production trong config."))
-		return boxStyle.Width(m.width - 2).Height(h).Render(b.String())
+		var b strings.Builder
+		b.WriteString(m.envLine() + "\n" + dimStyle.Render("Chưa có project nào có logs_production trong config."))
+		return boxStyle.Width(m.width - 2).Height(m.innerHeight()).Render(b.String())
 	}
-	var tabs []string
-	for i, p := range m.logProjects() {
-		if i == m.logs.proj%len(m.logProjects()) {
-			tabs = append(tabs, activeTabStyle.Render(" "+p+" "))
-		} else {
-			tabs = append(tabs, tabStyle.Render(" "+p+" "))
-		}
-	}
-	b.WriteString(strings.Join(tabs, " ") + dimStyle.Render("  ←/→") + "\n")
-	b.WriteString(dimStyle.Render("thời gian: ") + accentStyle.Render(m.presetLabel()) + dimStyle.Render("  (t đổi)") + "\n")
-	items := m.logItems()
-	rows := m.listRows() - 6
-	start := 0
-	if m.logs.cursor >= rows {
-		start = m.logs.cursor - rows + 1
-	}
-	for i := start; i < len(items) && i-start < rows; i++ {
-		label := truncate(items[i].Name, lw-4)
-		switch {
-		case i == m.logs.cursor && !m.logs.groupsFocus:
-			b.WriteString(selStyle.Render(" "+label+" ") + "\n")
-		case i == m.logs.cursor:
-			b.WriteString(accentStyle.Render("›"+label) + "\n")
-		default:
-			b.WriteString(" " + label + "\n")
-		}
-	}
-	if m.logs.cursor < len(items) && !m.logs.groupsFocus {
-		q := items[m.logs.cursor]
-		b.WriteString("\n")
-		if q.Note != "" {
-			b.WriteString(dimStyle.Render(wrap(q.Note, lw-2)) + "\n")
-		}
-		if q.SPL != "" {
-			b.WriteString(dimStyle.Render(wrap("SPL: "+q.SPL, lw-2)) + "\n")
-		}
-	}
+	extra := ""
 	if pl.Filter == "" {
-		b.WriteString("\n" + warnStyle.Render(wrap(fmt.Sprintf("Chưa có filter prod cho %s: chạy truy vấn tìm namespace rồi đặt logs_production.filter trong config.", name), lw-2)))
+		extra = quote(warnStyle.Render(wrap(fmt.Sprintf("Chưa có filter prod cho %s: đặt logs_production.filter trong config.", name), m.listWidth()-4)), "208")
 	}
-	left := boxStyle.Width(lw).Height(h).Render(b.String())
-	right := boxStyle.Width(m.logs.vp.Width + 2).Height(h).Render(m.logs.vp.View())
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	ps := m.logProjects()
+	return m.logsLeft(ps, m.logs.proj%len(ps), m.prodRows(), m.logs.cursor, m.logs.groupsFocus, extra)
 }
 
 func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.logs.suggFocus {
+		if mm, cmd, ok := m.suggestKey(k); ok {
+			return mm, cmd
+		}
+	}
 	if m.logs.groupsFocus {
 		if mm, cmd, ok := m.groupsKey(k); ok {
 			return mm, cmd
@@ -265,12 +302,6 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.logs.cursor = min(m.logs.cursor+1, max(0, len(items)-1))
 	case "k", "up":
 		m.logs.cursor = max(0, m.logs.cursor-1)
-	case "t":
-		m.logs.preset = (m.logs.preset + 1) % (len(splunk.Presets) + 1)
-		m.msg = "thời gian: " + m.presetLabel() + " (áp dụng cho lần tìm tiếp theo; r để chạy lại)"
-	case "T":
-		m.logs.preset = (m.logs.preset + len(splunk.Presets)) % (len(splunk.Presets) + 1)
-		m.msg = "thời gian: " + m.presetLabel()
 	case "pgdown", "ctrl+d", " ":
 		m.logs.vp.HalfPageDown()
 	case "pgup", "ctrl+u":
@@ -278,10 +309,10 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		return m.runLogItem()
 	case "/":
-		m.logs.cursor = len(items) - 2 // the builder
+		m.logs.cursor = itemIndex(items, itemBuilder)
 		return m.runLogItem()
 	case "a":
-		m.logs.cursor = len(items) - 1 // the question to Claude
+		m.logs.cursor = itemIndex(items, itemAsk)
 		return m.runLogItem()
 	case "g":
 		if len(m.logs.groups) > 0 { // back to the last groups; r or Enter on the entry searches again
@@ -289,7 +320,7 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.renderGroups()
 			return m, nil
 		}
-		m.logs.cursor = 0
+		m.logs.cursor = itemIndex(items, itemGroups)
 		return m.runLogItem()
 	case "r":
 		if m.logs.lastSPL != "" {
@@ -351,6 +382,8 @@ func (m Model) runLogItem() (tea.Model, tea.Cmd) {
 	q := items[m.logs.cursor]
 	name, pl := m.logProject()
 	switch q.Name {
+	case itemSuggest:
+		return m.openSuggestions()
 	case itemGroups:
 		return m.runGroups("")
 	case itemInvestigate:
@@ -520,7 +553,7 @@ func (m Model) onSPLGen(msg splGenMsg) (tea.Model, tea.Cmd) {
 	res := msg.res
 	f := newForm("SPL cho: "+truncate(msg.question, 60), func(v map[string]string) (tea.Cmd, error) {
 		r := &splgen.Result{SPL: v["spl"], Earliest: v["earliest"], Latest: v["latest"]}
-		if err := splgen.Check(r); err != nil {
+		if err := splgen.Check(r, m.d.Config.Splunk.MaxLookback); err != nil {
 			return nil, err
 		}
 		spl, err := m.scoped(r.SPL)
@@ -557,12 +590,13 @@ func (m Model) runLogSearch(spl, earliest, latest string, groups bool) (tea.Mode
 
 func (m Model) searchCmd(spl, earliest, latest string, groups bool) tea.Cmd {
 	get := m.d.Splunk
+	limit := logsLimit(m.d.Config)
 	timeout := m.d.Config.Splunk.Timeout
 	if timeout == 0 {
 		timeout = 2 * time.Minute
 	}
 	return func() tea.Msg {
-		msg := logsResultMsg{spl: spl, earliest: earliest, latest: latest, groups: groups}
+		msg := logsResultMsg{spl: spl, earliest: earliest, latest: latest, groups: groups, limit: limit}
 		if get == nil {
 			msg.err = errors.New("splunk chưa được cấu hình")
 			return msg
@@ -575,7 +609,7 @@ func (m Model) searchCmd(spl, earliest, latest string, groups bool) tea.Cmd {
 			msg.err = err
 			return msg
 		}
-		msg.events, msg.err = c.Search(ctx, splunk.Request{SPL: spl, Earliest: earliest, Latest: latest, MaxEvents: logsMaxEvents})
+		msg.events, msg.err = c.Search(ctx, splunk.Request{SPL: spl, Earliest: earliest, Latest: latest, MaxEvents: limit})
 		msg.took = time.Since(start)
 		return msg
 	}
@@ -588,10 +622,11 @@ func (m Model) onLogsResult(msg logsResultMsg) (tea.Model, tea.Cmd) {
 	window := splunk.Describe(msg.earliest, msg.latest)
 	if msg.err != nil {
 		var b strings.Builder
-		b.WriteString(titleStyle.Render(wrap(msg.spl, w)) + "\n")
-		b.WriteString(dimStyle.Render(window) + "\n\n" + errStyle.Render(wrap(msg.err.Error(), w)) + "\n")
+		b.WriteString(section("✗ Lỗi", "", w) + "\n")
+		b.WriteString(quote(accentStyle.Render(wrap(msg.spl, w-2)), "12") + "\n")
+		b.WriteString(warnStyle.Render("◷ "+window) + "\n\n" + quote(errStyle.Render(wrap(msg.err.Error(), w-2)), "9") + "\n")
 		if errors.Is(msg.err, splunk.ErrUnauthorized) || errors.Is(msg.err, splunk.ErrNoCredentials) {
-			b.WriteString("\n" + warnStyle.Render("→ tab 4 Status, phím s để đăng nhập Splunk") + "\n")
+			b.WriteString("\n" + warnStyle.Render("→ tab 4 Status, phím ") + keyCap("s") + warnStyle.Render(" để đăng nhập Splunk") + "\n")
 		}
 		m.logs.groupsFocus = false
 		m.setLogsContent(b.String())
@@ -609,33 +644,18 @@ func (m Model) onLogsResult(msg logsResultMsg) (tea.Model, tea.Cmd) {
 	m.logs.groupsFocus = false
 	m.logs.lastEvents = msg.events
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(wrap(msg.spl, w)) + "\n")
-	note := ""
-	if len(msg.events) == logsMaxEvents {
-		note = fmt.Sprintf(" (đã đạt giới hạn %d — thu hẹp truy vấn hoặc bấm o để xem trên Splunk)", logsMaxEvents)
-	}
-	back := ""
+	keys := "n điều tra · o Splunk Web · c copy · r chạy lại"
 	if len(m.logs.groups) > 0 {
-		back = " · g về nhóm lỗi"
+		keys += " · g về nhóm lỗi"
 	}
-	b.WriteString(dimStyle.Render(fmt.Sprintf("%s · %d dòng · %.1fs%s · n tạo task điều tra · o mở Splunk · c copy SPL · r chạy lại%s", window, len(msg.events), msg.took.Seconds(), note, back)) + "\n\n")
-	if len(msg.events) == 0 {
-		b.WriteString(dimStyle.Render("Không có kết quả."))
-	}
+	renderResultHeader(&b, msg.spl, window, len(msg.events), msg.took, msg.limit > 0 && len(msg.events) == msg.limit, keys, w)
 	if splunk.IsTransforming(msg.spl) {
 		for _, l := range splunk.Table(msg.events, w) {
 			b.WriteString(l + "\n")
 		}
 	} else {
 		for _, l := range splunk.Pretty(msg.events, w) {
-			switch {
-			case strings.Contains(l, " ERROR ") || strings.Contains(l, " FATAL ") || strings.Contains(l, " PANIC "):
-				b.WriteString(errStyle.Render(l) + "\n")
-			case strings.Contains(l, " WARN "):
-				b.WriteString(warnStyle.Render(l) + "\n")
-			default:
-				b.WriteString(l + "\n")
-			}
+			b.WriteString(colorLogLine(l) + "\n")
 		}
 	}
 	m.setLogsContent(b.String())
@@ -643,51 +663,14 @@ func (m Model) onLogsResult(msg logsResultMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// renderGroups draws the error groups with the selected one detailed, and
-// keeps the selected row in view.
+// renderGroups draws the error groups (shared layout) and keeps the
+// selected row in view.
 func (m *Model) renderGroups() {
 	w := max(30, m.logs.vp.Width)
 	name, _ := m.logProject()
-	gs := m.logs.groups
 	var b strings.Builder
-	total := 0
-	for _, g := range gs {
-		total += g.Count
-	}
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Nhóm lỗi — %s · %s", name, splunk.Describe(m.logs.lastEarliest, m.logs.lastLatest))) + "\n")
-	b.WriteString(dimStyle.Render(fmt.Sprintf("%d nhóm · %d lỗi · ↑↓ chọn · Enter xem log · n tạo task điều tra · f tạo task sửa ngay · s chỉ service này · esc về danh sách", len(gs), total)) + "\n\n")
-	if len(gs) == 0 {
-		b.WriteString(dimStyle.Render("Không có lỗi nào trong khoảng thời gian này."))
-	}
-	selLine := 0
-	for i, g := range gs {
-		last := "     "
-		if !g.Last.IsZero() {
-			last = g.Last.Local().Format("15:04")
-		}
-		row := fmt.Sprintf("%6d  %-16s %s  %s", g.Count, truncate(g.Service, 16), last, g.Signature)
-		row = truncate(row, w)
-		if i == m.logs.groupCursor && m.logs.groupsFocus {
-			selLine = strings.Count(b.String(), "\n")
-			b.WriteString(selStyle.Render(row) + "\n")
-		} else {
-			b.WriteString(row + "\n")
-		}
-	}
-	if g := m.currentGroup(); g != nil {
-		b.WriteString("\n" + accentStyle.Render(strings.Repeat("─", min(w, 40))) + "\n")
-		fmt.Fprintf(&b, "%s %s\n", titleStyle.Render(g.Service), dimStyle.Render(fmt.Sprintf("%d lần · %s → %s", g.Count, g.First.Local().Format("02/01 15:04"), g.Last.Local().Format("02/01 15:04"))))
-		b.WriteString(wrap(g.Sample, w) + "\n")
-		for _, kv := range [][2]string{{"caller", g.Caller}, {"prefix", g.Prefix}, {"request_id", g.RequestID}} {
-			if kv[1] != "" {
-				b.WriteString(dimStyle.Render(kv[0]+": ") + kv[1] + "\n")
-			}
-		}
-		if st := strings.TrimSpace(g.Stacktrace); st != "" {
-			lines := strings.Split(st, "\n")
-			b.WriteString(dimStyle.Render("stacktrace:") + "\n" + dimStyle.Render(strings.Join(lines[:min(6, len(lines))], "\n")) + "\n")
-		}
-	}
+	title := fmt.Sprintf("Nhóm lỗi Production — %s · %s", name, splunk.Describe(m.logs.lastEarliest, m.logs.lastLatest))
+	selLine := renderGroupList(&b, title, m.logs.groups, m.logs.groupCursor, m.logs.groupsFocus, w, groupKeys)
 	m.logs.intro = false
 	m.logs.vpContent = b.String()
 	m.logs.vp.SetContent(m.logs.vpContent)
@@ -776,15 +759,27 @@ func (m Model) taskFromGroup() (tea.Model, tea.Cmd) {
 	if g == nil {
 		return m, nil
 	}
+	return m.fixFlowTask(*g, "", nil)
+}
+
+// fixFlowTask opens the fix task form of an error group and, when it belongs
+// to a failing flow, the other groups of that flow: one task for the path.
+func (m Model) fixFlowTask(gv splunk.ErrorGroup, flow string, related []splunk.ErrorGroup, after ...func(string)) (tea.Model, tea.Cmd) {
+	g := &gv
 	name, pl := m.logProject()
 	window := splunk.Describe(m.logs.lastEarliest, m.logs.lastLatest)
 	title := "Sửa lỗi prod " + g.Service + ": " + truncate(strings.TrimSpace(g.Signature), 70)
-	t := source.Ticket{Project: name, Repo: m.repoForService(name, g.Service), Title: title, Body: splunk.TicketBody(name, *g, pl.Filter, window)}
+	extra := ""
+	if flow != "" || len(related) > 0 {
+		title = "Sửa luồng lỗi prod: " + truncate(flow, 80)
+		extra = splunk.FlowSection(flow, related)
+	}
+	t := source.Ticket{Project: name, Repo: m.repoForService(name, g.Service), Title: title, Body: splunk.FlowTicketBody(name, *g, pl.Filter, window, extra)}
 	hint := fmt.Sprintf("Từ nhóm lỗi %s (%d lần, %s). Sửa tiêu đề/mô tả nếu cần rồi Ctrl+S.", g.Service, g.Count, window)
 	if t.Repo == "" {
 		hint += " Không tìm thấy repo trùng tên service: chọn repo bắt đầu hoặc để agent tự chọn."
 	}
-	return m.newTaskForm(t, hint)
+	return m.newTaskForm(t, hint, after...)
 }
 
 func (m *Model) setLogsContent(s string) {

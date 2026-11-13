@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +21,14 @@ import (
 
 // DefaultAPIURL is the Hasaki Work backend.
 const DefaultAPIURL = "https://wshr.hasaki.vn/api"
+
+// DefaultMediaURL serves the files of tasks (note_files are paths under it).
+// The web app builds it as getMediaUrl() + "/production/hr/"; the files are
+// public, no token is sent.
+const DefaultMediaURL = "https://hr-media.hasaki.vn/production/hr/"
+
+// MaxFileSize caps one downloaded task file.
+const MaxFileSize = 100 << 20
 
 // Task statuses (STATUS_TASK_* in the web app).
 const (
@@ -59,13 +71,15 @@ type TokenSource interface {
 type Client struct {
 	Tokens  TokenSource
 	BaseURL string
-	Locale  string
-	HTTP    *http.Client
+	// MediaURL is the base of task file paths (DefaultMediaURL).
+	MediaURL string
+	Locale   string
+	HTTP     *http.Client
 }
 
 // NewClient returns a client with defaults.
 func NewClient(tokens TokenSource) *Client {
-	return &Client{Tokens: tokens, BaseURL: DefaultAPIURL, Locale: "vi", HTTP: &http.Client{Timeout: 60 * time.Second}}
+	return &Client{Tokens: tokens, BaseURL: DefaultAPIURL, MediaURL: DefaultMediaURL, Locale: "vi", HTTP: &http.Client{Timeout: 60 * time.Second}}
 }
 
 // ErrUnauthorized means the API rejected the token (expired or blacklisted).
@@ -172,26 +186,39 @@ type User struct {
 
 // Task is a task as returned by the list and detail endpoints.
 type Task struct {
-	ID           int64   `json:"id"`
-	Code         string  `json:"code"`
-	Name         string  `json:"name"`
-	Note         string  `json:"note"` // description (markdown); detail endpoint only
-	Status       int     `json:"status"`
-	Type         int     `json:"type"`
-	ProjectID    int64   `json:"prid"`
-	ParentID     int64   `json:"parent_id"`
-	MilestoneID  FlexInt `json:"milestone_id"`
-	DateStart    string  `json:"date_start"`
-	DateEnd      string  `json:"date_end"`
-	PlannedHours float64 `json:"planned_hours"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
-	Tags         []any   `json:"tags"`
-	Project      *Ref    `json:"project"`
-	Parent       *Ref    `json:"parent"`
-	Milestone    *Ref    `json:"milestone"`
-	CreatedBy    *User   `json:"created_by_user"`
-	AssignTo     []User  `json:"assign_to_user"`
+	ID   int64  `json:"id"`
+	Code string `json:"code"`
+	Name string `json:"name"`
+	Note string `json:"note"` // description (markdown); detail endpoint only
+	// NoteFiles are the files attached to the description, as paths under
+	// the media URL (detail endpoint only).
+	NoteFiles    []string `json:"note_files"`
+	Status       int      `json:"status"`
+	Type         int      `json:"type"`
+	ProjectID    int64    `json:"prid"`
+	ParentID     int64    `json:"parent_id"`
+	MilestoneID  FlexInt  `json:"milestone_id"`
+	DateStart    string   `json:"date_start"`
+	DateEnd      string   `json:"date_end"`
+	PlannedHours float64  `json:"planned_hours"`
+	CreatedAt    string   `json:"created_at"`
+	UpdatedAt    string   `json:"updated_at"`
+	Tags         []any    `json:"tags"`
+	Project      *Ref     `json:"project"`
+	Parent       *Ref     `json:"parent"`
+	Milestone    *Ref     `json:"milestone"`
+	CreatedBy    *User    `json:"created_by_user"`
+	AssignTo     []User   `json:"assign_to_user"`
+	// Staff are the assignment rows (one per assignee): their id is the
+	// assign_id of update-assign-status.
+	Staff []Assignment `json:"staff"`
+}
+
+// Assignment is one assignee of a task.
+type Assignment struct {
+	ID      int64 `json:"id"`
+	StaffID int64 `json:"staff_id"`
+	Status  int   `json:"status"`
 }
 
 // Profile is the logged-in user.
@@ -252,6 +279,89 @@ func (c *Client) Task(ctx context.Context, id int64) (*Task, error) {
 	return &t, nil
 }
 
+// FileURL is where a task file path (NoteFiles) is served.
+func (c *Client) FileURL(path string) string {
+	base := c.MediaURL
+	if base == "" {
+		base = DefaultMediaURL
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
+}
+
+// FileName is the local name of a task file: its base name without the
+// upload stamp the server adds ("spec_2026-11-10_103428.pdf" → "spec.pdf").
+func FileName(path string) string {
+	base := filepath.Base(filepath.FromSlash(strings.ReplaceAll(path, `\`, "/")))
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return "file"
+	}
+	ext := filepath.Ext(base)
+	stem := uploadStamp.ReplaceAllString(strings.TrimSuffix(base, ext), "")
+	if stem == "" {
+		stem = "file"
+	}
+	return stem + ext
+}
+
+var uploadStamp = regexp.MustCompile(`_\d{4}-\d{2}-\d{2}_\d{6}$`)
+
+// DownloadFile saves a task file (a NoteFiles path) into dir and returns the
+// local path. A name already taken by another file gets a -2, -3… suffix.
+func (c *Client) DownloadFile(ctx context.Context, path, dir string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.FileURL(path), nil)
+	if err != nil {
+		return "", err
+	}
+	hc := c.HTTP
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s: HTTP %d", path, resp.StatusCode)
+	}
+	if resp.ContentLength > MaxFileSize {
+		return "", fmt.Errorf("%s: too large (%d MB)", path, resp.ContentLength>>20)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name := FileName(path)
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	var f *os.File
+	for i := 1; ; i++ {
+		dst := filepath.Join(dir, name)
+		if i > 1 {
+			dst = filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, i, ext))
+		}
+		f, err = os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		break
+	}
+	n, err := io.Copy(f, io.LimitReader(resp.Body, MaxFileSize+1))
+	if err == nil && n > MaxFileSize {
+		err = fmt.Errorf("%s: too large (over %d MB)", path, MaxFileSize>>20)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
 // Comment is a task comment.
 type Comment struct {
 	ID        int64  `json:"id"`
@@ -282,27 +392,6 @@ func (c *Client) Comments(ctx context.Context, taskID int64) ([]Comment, error) 
 		return nil, fmt.Errorf("comments: unexpected shape: %w", err)
 	}
 	return wrapped.Rows, nil
-}
-
-// AddComment posts a comment on a task (multipart, as the web app does).
-// This WRITES to Hasaki Work; callers gate it behind configuration.
-func (c *Client) AddComment(ctx context.Context, userID, taskID int64, text string) error {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	for k, v := range map[string]string{
-		"user_id": strconv.FormatInt(userID, 10),
-		"obj_id":  strconv.FormatInt(taskID, 10),
-		"type":    "2",
-		"comment": text,
-	} {
-		if err := w.WriteField(k, v); err != nil {
-			return err
-		}
-	}
-	if err := w.Close(); err != nil {
-		return err
-	}
-	return c.do(ctx, http.MethodPost, "v2/task/comment", nil, &buf, w.FormDataContentType(), nil)
 }
 
 // NewTask is the payload of upsert-task-input for a new task, as the web app
@@ -363,4 +452,97 @@ func (c *Client) CreateTask(ctx context.Context, t NewTask) (*Created, error) {
 		return nil, fmt.Errorf("create task: response has no id/code (id=%d code=%q)", out.ID, out.Code)
 	}
 	return &out, nil
+}
+
+// resultHTML turns plain text (paragraphs separated by blank lines) into the
+// HTML the web app's result editor stores.
+func resultHTML(text string) string {
+	var paras []string
+	for _, p := range strings.Split(strings.ReplaceAll(strings.TrimSpace(text), "\r\n", "\n"), "\n\n") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		lines := strings.Split(p, "\n")
+		for i, l := range lines {
+			lines[i] = html.EscapeString(l)
+		}
+		paras = append(paras, "<p>"+strings.Join(lines, "<br>")+"</p>")
+	}
+	return strings.Join(paras, "")
+}
+
+// UpdateResult writes the task's work result ("Kết quả công việc"), as the
+// web app's result editor does. This WRITES to Hasaki Work.
+func (c *Client) UpdateResult(ctx context.Context, taskID int64, text string) error {
+	if taskID == 0 || strings.TrimSpace(text) == "" {
+		return errors.New("update result: task and text are required")
+	}
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	w.WriteField("id", strconv.FormatInt(taskID, 10))
+	w.WriteField("field", "data")
+	w.WriteField("value[configs][virtual_text]", resultHTML(text))
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "hr/projects/mass-update-field-task-input", nil, &buf, w.FormDataContentType(), nil)
+}
+
+// SetAssignStatus sets the status of one assignee of a task (2 done, 5
+// waiting for approval…), as the web app's status menu does. Hasaki Work
+// refuses "done" while the task has no work result. This WRITES.
+func (c *Client) SetAssignStatus(ctx context.Context, taskID, assignID int64, status int) error {
+	body, err := json.Marshal(map[string]any{"task_id": taskID, "assign_id": assignID, "status": status})
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "hr/projects/update-assign-status", nil, bytes.NewReader(body), "application/json", nil)
+}
+
+// SetRealityMinutes writes the actual time spent on the task ("Giờ thực
+// tế"), in minutes like planned_hours, as the web app's task table does.
+// This WRITES to Hasaki Work.
+func (c *Client) SetRealityMinutes(ctx context.Context, taskID int64, minutes int) error {
+	if taskID == 0 || minutes <= 0 {
+		return errors.New("reality hours: task and a positive time are required")
+	}
+	body, err := json.Marshal(map[string]any{"id": taskID, "field": "reality_hours", "value": minutes})
+	if err != nil {
+		return err
+	}
+	return c.do(ctx, http.MethodPost, "hr/projects/mass-update-field-task-input", nil, bytes.NewReader(body), "application/json", nil)
+}
+
+// Report writes the work result and the actual time (realityMinutes, 0 =
+// unchanged), then sets the status of the operator's assignment (staffID;
+// status 0 = unchanged).
+func (c *Client) Report(ctx context.Context, taskID, staffID int64, result string, realityMinutes, status int) error {
+	if err := c.UpdateResult(ctx, taskID, result); err != nil {
+		return fmt.Errorf("ghi kết quả công việc: %w", err)
+	}
+	if realityMinutes > 0 {
+		if err := c.SetRealityMinutes(ctx, taskID, realityMinutes); err != nil {
+			return fmt.Errorf("ghi giờ thực tế: %w", err)
+		}
+	}
+	if status == 0 {
+		return nil
+	}
+	t, err := c.Task(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("đọc task để đổi trạng thái: %w", err)
+	}
+	var assign int64
+	for _, a := range t.Staff {
+		if a.StaffID == staffID {
+			assign = a.ID
+		}
+	}
+	if assign == 0 {
+		return fmt.Errorf("bạn không nằm trong danh sách người thực hiện %s nên không đổi được trạng thái", t.Code)
+	}
+	if err := c.SetAssignStatus(ctx, taskID, assign, status); err != nil {
+		return fmt.Errorf("đổi trạng thái: %w", err)
+	}
+	return nil
 }

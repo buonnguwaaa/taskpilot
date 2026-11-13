@@ -114,6 +114,7 @@ func cmdExport(args []string) error {
 	}
 	fmt.Printf("dữ liệu (KHÔNG có token): %s\n", dataPath)
 	fmt.Printf("  database schema v%d, thư mục tasks/, %d transcript Claude, config\n", version, len(transcripts))
+	fmt.Println("  lưu ý: transcript và tasks/ chứa những gì agent đã đọc (giá trị Vault QC, dữ liệu DB/Kafka QC, log): giữ kín như dữ liệu QC")
 	if secretsSnap != "" {
 		m.SecretsIncluded = true
 		secPath := filepath.Join(dir, "taskpilot-secrets-"+stamp+".tar.gz")

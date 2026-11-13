@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -20,8 +21,19 @@ type Config struct {
 	Home string `yaml:"home"`
 	// OperatorLanguage is the language the agent uses for summaries shown in the TUI.
 	OperatorLanguage string `yaml:"operator_language"`
+	// Editor opens a task's workspace for review (TUI key w), e.g. "cursor"
+	// or "code". Empty: the first of cursor, code found in PATH.
+	Editor string `yaml:"editor"`
+	// Agent picks the headless worker: "claude" (default, Claude Code) or
+	// "cursor" (Cursor Agent CLI: `agent -p`).
+	Agent string `yaml:"agent"`
+	// AgentMergeTargets are the branches the agent may merge its PRs into with
+	// merge_pull_request, and only in a run started by an operator message or
+	// decision that asks for a merge (default: release/qc).
+	AgentMergeTargets []string `yaml:"agent_merge_targets"`
 
 	Claude Claude   `yaml:"claude"`
+	Cursor Cursor   `yaml:"cursor"`
 	Daemon Daemon   `yaml:"daemon"`
 	Source Source   `yaml:"source"`
 	Gates  []string `yaml:"gates"`
@@ -37,6 +49,18 @@ type Config struct {
 	HasakiWork HasakiWork `yaml:"hasaki_work"`
 	Splunk     Splunk     `yaml:"splunk"`
 	ArgoCD     ArgoCD     `yaml:"argocd"`
+	// Vault is the QC Vault agents read service configuration from (MCP
+	// tools qc_config_list / qc_config_get), within each project's vault_paths.
+	Vault Vault `yaml:"vault"`
+	// Kafka is the QC Kafka UI (Kafbat) agents read topics and messages from
+	// (MCP tools qc_kafka_*, limited to each project's kafka_topics).
+	Kafka Kafka `yaml:"kafka"`
+	// Jenkins is read by agents (MCP tools jenkins_jobs / jenkins_builds /
+	// jenkins_log): build status and console logs, never a trigger.
+	Jenkins Jenkins `yaml:"jenkins"`
+	// Graphify indexes the long-lived branches of every repo with graphify
+	// and links the repos of a project (MCP tool graphify). Nil: off.
+	Graphify *Graphify `yaml:"graphify"`
 
 	// Path is the file the config was loaded from (not serialized).
 	Path string `yaml:"-"`
@@ -53,6 +77,18 @@ type Claude struct {
 	// Models are the models the agent may pick for itself (aliases such as
 	// fable, opus, sonnet, haiku, or full names). Default: fable, opus, sonnet.
 	Models []string `yaml:"models"`
+	// LevelProfiles is the model/effort a task runs with, by its assessed
+	// level (light, standard, hard, hardest), until the agent picks its own
+	// profile or the operator pins one. It covers the planning run (the
+	// level estimated when the task was created) and tasks that never reach
+	// a plan gate (investigations, questions). Default: light → sonnet/medium.
+	LevelProfiles map[string]LevelProfile `yaml:"level_profiles"`
+	// ClassifyModel answers short yes/no checks taskpilot makes itself (does
+	// the operator's message ask for a merge?). Default: haiku.
+	ClassifyModel string `yaml:"classify_model"`
+	// WorklogModel drafts the name and result of a Hasaki Work report (key h:
+	// a short summary of what the task recorded). Default: haiku.
+	WorklogModel string `yaml:"worklog_model"`
 	// MaxBudgetUSD caps the cost of one run; 0 (the default) means no cap.
 	MaxBudgetUSD   float64  `yaml:"max_budget_usd"`
 	PermissionMode string   `yaml:"permission_mode"`
@@ -60,11 +96,73 @@ type Claude struct {
 	ExtraArgs      []string `yaml:"extra_args"`
 }
 
+// Cursor controls how headless Cursor Agent CLI sessions are launched when
+// Config.Agent is "cursor", or when Claude hits a usage/quota limit and
+// fallback is enabled. Model/effort still come from Claude (shared execution
+// profile) unless Cursor.Model is set.
+type Cursor struct {
+	Bin string `yaml:"bin"`
+	// Model overrides Claude.Model for Cursor runs when set.
+	Model     string   `yaml:"model"`
+	ExtraArgs []string `yaml:"extra_args"`
+	// FallbackOnQuota retries (and then prefers) Cursor when Claude is out of
+	// quota. Nil means true. Set false to disable.
+	FallbackOnQuota *bool `yaml:"fallback_on_quota"`
+}
+
+// FallbackEnabled reports whether Claude→Cursor quota fallback is on.
+func (c Cursor) FallbackEnabled() bool {
+	if c.FallbackOnQuota == nil {
+		return true
+	}
+	return *c.FallbackOnQuota
+}
+
+// AgentClaude and AgentCursor are the supported Config.Agent values.
+const (
+	AgentClaude = "claude"
+	AgentCursor = "cursor"
+)
+
+// AgentKind returns the headless worker kind (claude or cursor).
+func (c *Config) AgentKind() string {
+	if c != nil && strings.EqualFold(strings.TrimSpace(c.Agent), AgentCursor) {
+		return AgentCursor
+	}
+	return AgentClaude
+}
+
+// AgentBin is the binary used to run (and take over) a task session.
+func (c *Config) AgentBin() string {
+	if c.AgentKind() == AgentCursor {
+		if c.Cursor.Bin != "" {
+			return c.Cursor.Bin
+		}
+		return "agent"
+	}
+	if c.Claude.Bin != "" {
+		return c.Claude.Bin
+	}
+	return "claude"
+}
+
 // Efforts are the effort levels Claude Code accepts, lowest first.
 var Efforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 // ValidEffort reports whether e is an effort level Claude Code accepts.
 func ValidEffort(e string) bool { return slices.Contains(Efforts, e) }
+
+// LevelProfile is a model/effort pair; empty fields keep the default.
+type LevelProfile struct {
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
+}
+
+// ForLevel is the profile of an assessed level, if one is configured.
+func (c Claude) ForLevel(level string) (LevelProfile, bool) {
+	p, ok := c.LevelProfiles[level]
+	return p, ok && (p.Model != "" || p.Effort != "")
+}
 
 // AllowsModel reports whether the agent may pick model m.
 func (c Claude) AllowsModel(m string) bool { return slices.Contains(c.Models, m) }
@@ -127,6 +225,45 @@ type ArgoCD struct {
 	MaxLogLines int `yaml:"max_log_lines"`
 }
 
+// Jenkins configures read-only access to a Jenkins instance.
+type Jenkins struct {
+	URL string `yaml:"url"`
+	// Depth is how many levels of folders / multibranch projects are listed
+	// (default 3: folder/repo/branch).
+	Depth int `yaml:"depth"`
+	// MaxLogLines caps the console lines one jenkins_log call returns.
+	MaxLogLines int `yaml:"max_log_lines"`
+}
+
+// ProjectJenkins maps a project to its Jenkins jobs.
+type ProjectJenkins struct {
+	// Jobs are texts a job's full name contains (e.g. "BOM/", "bom-api").
+	Jobs []string `yaml:"jobs"`
+	// MatchRepos also takes jobs whose full name contains one of the
+	// project's repo names (default true).
+	MatchRepos *bool `yaml:"match_repos"`
+}
+
+// MatchesJob reports whether a Jenkins job (full name) belongs to a project
+// with these repos.
+func (p ProjectJenkins) MatchesJob(fullName string, repos []string) bool {
+	low := strings.ToLower(fullName)
+	for _, j := range p.Jobs {
+		if j != "" && strings.Contains(low, strings.ToLower(j)) {
+			return true
+		}
+	}
+	if p.MatchRepos != nil && !*p.MatchRepos {
+		return false
+	}
+	for _, r := range repos {
+		if r != "" && strings.Contains(low, strings.ToLower(r)) {
+			return true
+		}
+	}
+	return false
+}
+
 // ProjectArgo maps a project to its Argo CD applications.
 type ProjectArgo struct {
 	// Apps lists application names explicitly.
@@ -145,9 +282,11 @@ type Splunk struct {
 	// deployments only expose Splunk Web on 443 and the REST API on :8089.
 	APIURL string `yaml:"api_url"`
 	Locale string `yaml:"locale"`
-	// MaxLookback caps how far back a search may go (relative earliest times).
+	// MaxLookback caps how far back a search may go. Absent: 7 days; 0s: no
+	// limit (all time, earliest=0 allowed).
 	MaxLookback time.Duration `yaml:"max_lookback"`
-	// MaxEvents caps events returned to the agent per search.
+	// MaxEvents caps events per search (agent and TUI). Absent: 100; 0: no
+	// limit (whatever Splunk returns).
 	MaxEvents int `yaml:"max_events"`
 	// DefaultEarliest is used when the agent gives no time range.
 	DefaultEarliest string `yaml:"default_earliest"`
@@ -163,10 +302,13 @@ type PRStage struct {
 	Gate   string `yaml:"gate" json:"gate"`
 }
 
-// DefaultPRFlow: feature → release/qc for testing (after the pr gate), then
-// feature → base (after the qc gate). Promotion base → release/prod is a human release step.
+// DefaultPRFlow: once the pr gate is approved, the work branch goes into
+// release/qc for testing and into the base (both PRs open together; the qc
+// gate then records the QC result before the task completes). Promotion
+// base → release/prod is a human release step. A repo that wants the base PR
+// only after QC sets its pr_flow to [{release/qc, pr}, {$base, qc}].
 func DefaultPRFlow() []PRStage {
-	return []PRStage{{Target: "release/qc", Gate: "pr"}, {Target: "$base", Gate: "qc"}}
+	return []PRStage{{Target: "release/qc", Gate: "pr"}, {Target: "$base", Gate: "pr"}}
 }
 
 // Project is a group of repos that tasks are scoped to (BOM, PLM, payment, ...).
@@ -190,9 +332,101 @@ type Project struct {
 	LogsProduction *ProdLogs `yaml:"logs_production"`
 	// ArgoCD links the project to its QC applications.
 	ArgoCD ProjectArgo `yaml:"argocd"`
+	// Jenkins links the project to its Jenkins jobs.
+	Jenkins ProjectJenkins `yaml:"jenkins"`
 	// QCDB gives agents read-only access to the project's QC database (MCP
 	// tool db_query). Nil: no database access.
 	QCDB *QCDB `yaml:"qc_db"`
+	// VaultPaths are the QC Vault paths agents of this project may read
+	// (logical KV paths such as kv/payment/; KV v2 data/ is added for them).
+	VaultPaths []string `yaml:"vault_paths"`
+	// BranchPattern is the regexp a work branch must match before a PR is
+	// opened (set_branch). Empty: DefaultBranchPattern.
+	BranchPattern string `yaml:"branch_pattern"`
+	// KafkaTopics are the QC Kafka topics agents of this project may read:
+	// exact names or globs (payment-*, *.order.*).
+	KafkaTopics []string `yaml:"kafka_topics"`
+	// GraphifyLines override graphify.lines for this project's repos.
+	GraphifyLines map[string]string `yaml:"graphify_lines"`
+}
+
+// Graphify configures the graphify graphs: one per repo and line (a long-lived
+// branch such as release/prod or release/qc), built by graphify from the
+// branch on the remote, merged per project with the gRPC links between repos.
+type Graphify struct {
+	// Bin is the graphify executable (default: graphify in PATH, then ~/.local/bin/graphify).
+	Bin string `yaml:"bin"`
+	// Dir holds the snapshots and graphs (default <home>/graphs).
+	Dir string `yaml:"dir"`
+	// Lines name the branches to index, e.g. {prod: release/prod, qc: release/qc}
+	// (the default). Projects and repos override them (graphify_lines, lines).
+	Lines map[string]string `yaml:"lines"`
+	// Refresh is how often the remote branches are checked (default 30m).
+	Refresh time.Duration `yaml:"refresh"`
+	// Ignore are .graphifyignore patterns (default: generated protobuf code).
+	Ignore []string `yaml:"ignore"`
+}
+
+// DefaultGraphLines are the lines indexed when the config names none.
+// A value may list branches to try in order; $base is the repo's base branch
+// (repos deployed straight from main have no release/prod).
+var DefaultGraphLines = map[string]string{"prod": "release/prod,$base", "qc": "release/qc"}
+
+// GraphLines returns line → branch for a repo of a project: the config's
+// lines, then the project's, then the repo's ("" or "-" drops a line).
+func (c *Config) GraphLines(project, repo string) map[string]string {
+	out := map[string]string{}
+	if c.Graphify == nil {
+		return out
+	}
+	p := c.Projects[project]
+	for _, m := range []map[string]string{c.Graphify.Lines, p.GraphifyLines, p.Repos[repo].Lines} {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	for k, v := range out {
+		if v = strings.TrimSpace(v); v == "" || v == "-" {
+			delete(out, k)
+		}
+	}
+	return out
+}
+
+// ProjectGraphLines lists the lines of a project's repos, sorted.
+func (c *Config) ProjectGraphLines(project string) []string {
+	seen := map[string]bool{}
+	for _, r := range c.Projects[project].RepoNames() {
+		for l := range c.GraphLines(project, r) {
+			seen[l] = true
+		}
+	}
+	var out []string
+	for l := range seen {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Kafka configures the QC Kafbat UI (kafka-ui), read-only.
+type Kafka struct {
+	URL string `yaml:"url"` // https://kafka-ui-qc-v2.hasaki.dev
+	Env string `yaml:"env"` // shown in messages; default qc
+	// Cluster is the cluster name in the UI; empty: the only cluster there is.
+	Cluster string `yaml:"cluster"`
+	// LoginPath is opened in the dedicated Chrome profile to log in (SSO).
+	LoginPath string `yaml:"login_path"`
+	// MaxMessages caps messages per read (default 50).
+	MaxMessages int `yaml:"max_messages"`
+}
+
+// Vault configures the QC Vault (read-only for agents).
+type Vault struct {
+	URL string `yaml:"url"` // https://vault-qc-v2.hasaki.dev (a /ui suffix is dropped)
+	Env string `yaml:"env"` // shown in messages; default qc
+	// LoginPath is opened in the dedicated Chrome profile to log in (SSO).
+	LoginPath string `yaml:"login_path"`
 }
 
 // QCDB locates the credentials of a project's QC database (MySQL). They are
@@ -236,6 +470,24 @@ type ProdLogs struct {
 	// Knowledge is the prod-logs skill file shown with "i" (e.g. payment.md).
 	Knowledge string     `yaml:"knowledge"`
 	Queries   []LogQuery `yaml:"queries"`
+	// Scan, when set, makes the daemon group the production errors at fixed
+	// times and keep them as fix suggestions for the operator.
+	Scan *ErrorScan `yaml:"scan"`
+}
+
+// ErrorScan schedules the automatic production error scan of a project.
+type ErrorScan struct {
+	// Times are the local times of day to scan, "HH:MM" (e.g. 09:00, 13:30).
+	Times []string `yaml:"times"`
+	// MinCount ignores error groups seen fewer times in the window (default 3).
+	MinCount int `yaml:"min_count"`
+	// Ignore drops groups whose message contains one of these texts (known noise).
+	Ignore []string `yaml:"ignore"`
+	// Services restricts the scan to these containers (default: all of the project).
+	Services []string `yaml:"services"`
+	// MaxWindow caps how far back a scan reads (default 24h): a scan covers the
+	// time since the previous one, at most this.
+	MaxWindow time.Duration `yaml:"max_window"`
 }
 
 // LogQuery is a saved search. SPL may use {filter}, {service} and any other
@@ -262,6 +514,9 @@ type Repo struct {
 	Description  string     `yaml:"description"`
 	AllowedTools []string   `yaml:"allowed_tools"`
 	Prepare      [][]string `yaml:"prepare"`
+	// Lines override the graphify graph lines of this repo, e.g. {qc: qc} when its
+	// QC branch is named differently, {qc: "-"} when it has none.
+	Lines map[string]string `yaml:"lines"`
 }
 
 // harnessPath matches the harness's private files: the database, the config,
@@ -272,21 +527,39 @@ const harnessPath = `taskpilot\.db|\.config/taskpilot|taskpilot-chrome|chrome-pr
 
 const harnessDeny = "taskpilot policy: the harness's own files (database, config, task state, browser profile) are off-limits"
 
+const mergeDeny = "taskpilot policy: merge only with the merge_pull_request tool, which works when the operator's message for this turn asks for the merge"
+
+// gitOpts matches git's global options before the subcommand (git -C dir push).
+const gitOpts = `(\s+-[Cc]\s+\S+)*`
+
 // DefaultRules are used when the config defines no rules.
+// Tool names cover both Claude Code (Edit/Bash/mcp__…) and Cursor Agent
+// (Write/Shell/MCP:…).
 func DefaultRules() []Rule {
 	return []Rule{
-		{Tool: `Edit|Write|MultiEdit|NotebookEdit`, Requires: "plan"},
-		{Tool: `Bash`, Command: `(^|[;&|(]\s*)git\s+push\b`, Requires: "pr"},
-		{Tool: `Bash`, Command: `\bgh\s+pr\s+(create|merge)\b`, Requires: "pr"},
-		{Tool: `mcp__taskpilot__create_pull_request`, Requires: "pr"},
-		{Tool: `Bash`, Command: `\bargocd\s+app\s+(sync|rollback|delete|set)\b`, Requires: "deploy"},
+		{Tool: `Edit|Write|MultiEdit|NotebookEdit|Delete`, Requires: "plan"},
+		{Tool: `Bash|Shell`, Command: `(^|[;&|(]\s*)git` + gitOpts + `\s+push\b`, Requires: "pr"},
+		{Tool: `Bash|Shell`, Command: `\bgh\s+pr\s+create\b`, Requires: "pr"},
+		// Merges go through merge_pull_request only, which checks the operator
+		// asked for it in the message that started the run.
+		{Tool: `Bash|Shell`, Command: `\bgh\s+pr\s+merge\b`, Deny: mergeDeny},
+		{Tool: `Bash|Shell`, Command: `pullrequests/[^/\s]+/merge\b`, Deny: mergeDeny},
+		{Tool: `Bash|Shell`, Command: `\bgit` + gitOpts + `\s+push\b[^;&|]*[\s:+](refs/heads/)?(main|master|develop|release/[^\s;&|]+)(\s|$|[;&|])`,
+			Deny: "taskpilot policy: pushing straight to main/master/develop/release/* is a merge; open a PR (create_pull_request) and merge it with merge_pull_request when the operator asks"},
+		{Tool: `mcp__taskpilot__create_pull_request|MCP:create_pull_request`, Requires: "pr"},
+		{Tool: `Bash|Shell`, Command: `\bargocd\s+app\s+(sync|rollback|delete|set)\b`, Requires: "deploy"},
 		{Tool: `mcp__.*argo.*__.*(sync|rollback|delete|create|update).*`, Requires: "deploy"},
-		{Tool: `Bash`, Command: `\bvault\s+(read|kv\s+get|kv\s+put|write|token\s+create)\b`, Deny: "taskpilot policy: the agent must never read or write Vault secret values"},
-		{Tool: `Bash`, Command: `\bgit\s+push\b.*(--force|-f\b)`, Deny: "taskpilot policy: force-push is not allowed"},
+		// Cursor MCP tools are named MCP:<tool> (no server prefix); keep this
+		// narrow so MCP:create_pull_request is not treated as a deploy action.
+		{Tool: `MCP:.*(sync|rollback).*`, Requires: "deploy"},
+		{Tool: `Bash|Shell`, Command: `\bvault\s+(read|kv\s+get|kv\s+put|write|token\s+create)\b`, Deny: "taskpilot policy: the agent must never read or write Vault secret values"},
+		{Tool: `Bash|Shell`, Command: `\bgit` + gitOpts + `\s+push\b.*(--force|\s-f\b|\s\+\S)`, Deny: "taskpilot policy: force-push is not allowed"},
+		// git -c alias.x='!cmd' / core.* run arbitrary programs through the allowed `git -C *`.
+		{Tool: `Bash|Shell`, Command: `\bgit\b.*\s-c\s*["']?(alias|core)\.`, Deny: "taskpilot policy: git -c alias./core. settings are not allowed"},
 		// The harness keeps credentials in plain text in its database: keep the agent out of
 		// the harness's own files (task worktrees under ~/.taskpilot/worktrees stay allowed).
 		{Tool: `.*`, Path: harnessPath, Deny: harnessDeny},
-		{Tool: `Bash`, Command: harnessPath, Deny: harnessDeny},
+		{Tool: `Bash|Shell`, Command: harnessPath, Deny: harnessDeny},
 	}
 }
 
@@ -298,6 +571,8 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	var c Config
+	// -1 marks "not in the file" so an explicit 0 can mean "no limit".
+	c.Splunk.MaxLookback, c.Splunk.MaxEvents = -1, -1
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -321,14 +596,63 @@ func (c *Config) applyDefaults() {
 	if c.OperatorLanguage == "" {
 		c.OperatorLanguage = "Vietnamese"
 	}
+	if len(c.AgentMergeTargets) == 0 {
+		c.AgentMergeTargets = []string{"release/qc"}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Agent)) {
+	case "", AgentClaude:
+		c.Agent = AgentClaude
+	case AgentCursor:
+		c.Agent = AgentCursor
+	default:
+		// leave as-is; Load validates below
+	}
 	if c.Claude.Bin == "" {
 		c.Claude.Bin = "claude"
+	}
+	if g := c.Graphify; g != nil {
+		if g.Dir == "" {
+			g.Dir = filepath.Join(c.Home, "graphs")
+		}
+		g.Dir = ExpandHome(g.Dir)
+		if len(g.Lines) == 0 {
+			g.Lines = map[string]string{}
+			for k, v := range DefaultGraphLines {
+				g.Lines[k] = v
+			}
+		}
+		if g.Refresh <= 0 {
+			g.Refresh = 30 * time.Minute
+		}
+		if g.Ignore == nil {
+			g.Ignore = []string{"*.pb.go", "*.pb.gw.go", "*_pb2.py", "*_pb2_grpc.py", "node_modules/", "vendor/", "dist/", "*.min.js"}
+		}
+		if g.Bin == "" {
+			g.Bin = "graphify"
+			if _, err := exec.LookPath("graphify"); err != nil {
+				if p := ExpandHome("~/.local/bin/graphify"); fileExists(p) {
+					g.Bin = p
+				}
+			}
+		}
+	}
+	if c.Cursor.Bin == "" {
+		c.Cursor.Bin = "agent"
 	}
 	if c.Claude.PermissionMode == "" {
 		c.Claude.PermissionMode = "dontAsk"
 	}
 	if len(c.Claude.Models) == 0 {
 		c.Claude.Models = []string{"fable", "opus", "sonnet"}
+	}
+	if c.Claude.ClassifyModel == "" {
+		c.Claude.ClassifyModel = "haiku"
+	}
+	if c.Claude.WorklogModel == "" {
+		c.Claude.WorklogModel = "haiku"
+	}
+	if c.Claude.LevelProfiles == nil {
+		c.Claude.LevelProfiles = map[string]LevelProfile{"light": {Model: "sonnet", Effort: "medium"}}
 	}
 	if c.Daemon.Concurrency <= 0 {
 		c.Daemon.Concurrency = 2
@@ -378,6 +702,46 @@ func (c *Config) applyDefaults() {
 			c.ArgoCD.MaxLogLines = 300
 		}
 	}
+	for _, p := range c.Projects {
+		if sc := p.LogsProduction; sc != nil && sc.Scan != nil {
+			if sc.Scan.MinCount <= 0 {
+				sc.Scan.MinCount = 3
+			}
+			if sc.Scan.MaxWindow <= 0 {
+				sc.Scan.MaxWindow = 24 * time.Hour
+			}
+		}
+	}
+	if c.Vault.URL != "" {
+		c.Vault.URL = strings.TrimRight(strings.TrimSuffix(strings.TrimRight(c.Vault.URL, "/"), "/ui"), "/")
+		if c.Vault.Env == "" {
+			c.Vault.Env = "qc"
+		}
+		if c.Vault.LoginPath == "" {
+			c.Vault.LoginPath = "/ui/vault/auth?with=oidc"
+		}
+	}
+	if c.Jenkins.URL != "" {
+		c.Jenkins.URL = strings.TrimRight(c.Jenkins.URL, "/")
+		if c.Jenkins.Depth <= 0 {
+			c.Jenkins.Depth = 3
+		}
+		if c.Jenkins.MaxLogLines <= 0 {
+			c.Jenkins.MaxLogLines = 400
+		}
+	}
+	if c.Kafka.URL != "" {
+		c.Kafka.URL = strings.TrimRight(c.Kafka.URL, "/")
+		if c.Kafka.Env == "" {
+			c.Kafka.Env = "qc"
+		}
+		if c.Kafka.LoginPath == "" {
+			c.Kafka.LoginPath = "/"
+		}
+		if c.Kafka.MaxMessages <= 0 {
+			c.Kafka.MaxMessages = 50
+		}
+	}
 	sp := &c.Splunk
 	sp.URL = strings.TrimRight(sp.URL, "/")
 	sp.APIURL = strings.TrimRight(sp.APIURL, "/")
@@ -387,10 +751,10 @@ func (c *Config) applyDefaults() {
 	if sp.Locale == "" {
 		sp.Locale = "en-US"
 	}
-	if sp.MaxLookback <= 0 {
+	if sp.MaxLookback < 0 {
 		sp.MaxLookback = 7 * 24 * time.Hour
 	}
-	if sp.MaxEvents <= 0 {
+	if sp.MaxEvents < 0 {
 		sp.MaxEvents = 100
 	}
 	if sp.DefaultEarliest == "" {
@@ -453,7 +817,42 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// ScanTimes parses the "HH:MM" times of a scan schedule into minutes of the day.
+func (sc *ErrorScan) ScanTimes() ([]int, error) {
+	var out []int
+	for _, t := range sc.Times {
+		var h, m int
+		if n, err := fmt.Sscanf(strings.TrimSpace(t), "%d:%d", &h, &m); err != nil || n != 2 || h < 0 || h > 23 || m < 0 || m > 59 {
+			return nil, fmt.Errorf("giờ quét %q không hợp lệ (dạng HH:MM)", t)
+		}
+		out = append(out, h*60+m)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
 func (c *Config) validate() error {
+	if c.Agent != AgentClaude && c.Agent != AgentCursor {
+		return fmt.Errorf("agent: must be %q or %q (got %q)", AgentClaude, AgentCursor, c.Agent)
+	}
+	for pname, p := range c.Projects {
+		if p.BranchPattern != "" {
+			if _, err := regexp.Compile(p.BranchPattern); err != nil {
+				return fmt.Errorf("projects.%s.branch_pattern: %w", pname, err)
+			}
+		}
+	}
+	for pname, p := range c.Projects {
+		if p.LogsProduction == nil || p.LogsProduction.Scan == nil {
+			continue
+		}
+		if _, err := p.LogsProduction.Scan.ScanTimes(); err != nil {
+			return fmt.Errorf("projects.%s.logs_production.scan: %w", pname, err)
+		}
+		if p.LogsProduction.Filter == "" {
+			return fmt.Errorf("projects.%s.logs_production.scan needs logs_production.filter (the production logs to scan)", pname)
+		}
+	}
 	gates := map[string]bool{}
 	for _, g := range c.Gates {
 		gates[g] = true
@@ -516,6 +915,22 @@ func (c *Config) validate() error {
 var validName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // ValidName reports whether s is usable as a project or repo name (and a directory name).
+// DefaultBranchPattern is the team convention <type>/<kebab-description>--<CODES>:
+// function codes (PLM_DSN_STY_0013, several comma-separated) or ticket codes
+// (HSK-SLJ68DMP), as the repos' lefthook reads them.
+const DefaultBranchPattern = `^(feat|fix|hotfix|refactor|perf|chore|docs|test|ci|build|style|revert)/[a-z0-9]+(-[a-z0-9]+)*--` +
+	`([A-Z]{2,}_[A-Z0-9_]+(,[A-Z]{2,}_[A-Z0-9_]+)*|[A-Z]+-[0-9A-Z]+(,[A-Z]+-[0-9A-Z]+)*)$`
+
+// BranchRule is the compiled branch convention of the project.
+func (p Project) BranchRule() *regexp.Regexp {
+	if p.BranchPattern != "" {
+		if re, err := regexp.Compile(p.BranchPattern); err == nil {
+			return re
+		}
+	}
+	return regexp.MustCompile(DefaultBranchPattern)
+}
+
 func ValidName(s string) bool { return validName.MatchString(s) && s != "." && s != ".." }
 
 // ProjectByHasakiID returns the project linked to a Hasaki Work project id.
@@ -527,16 +942,6 @@ func (c *Config) ProjectByHasakiID(id int64) (string, *Project) {
 		}
 	}
 	return "", nil
-}
-
-// HasGate reports whether g is a configured gate.
-func (c *Config) HasGate(g string) bool {
-	for _, x := range c.Gates {
-		if x == g {
-			return true
-		}
-	}
-	return false
 }
 
 // AllRepoNames lists every repo of every project (for Argo CD app matching).
@@ -618,6 +1023,9 @@ func (p Project) AllowedToolList() []string {
 		// workflow skill says when to use them. Their tool calls go through the
 		// same allowlist and gate hook.
 		"Agent",
+		// Headless: the hook forwards AskUserQuestion to the operator (as
+		// ask_operator does) and denies the call itself.
+		"AskUserQuestion",
 		"Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
 		"Bash(git add*)", "Bash(git commit*)", "Bash(git push*)", "Bash(git rev-parse*)",
 		"Bash(git -C *)", "Bash(cd *)", "Bash(ls*)", "Bash(rg *)",
@@ -644,3 +1052,5 @@ func (p Project) AllowedToolList() []string {
 	}
 	return tools
 }
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }

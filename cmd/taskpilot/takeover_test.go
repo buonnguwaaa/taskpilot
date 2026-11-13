@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
 )
 
@@ -22,7 +23,8 @@ func TestTakeoverMarksWhileClaudeRuns(t *testing.T) {
 		filepath.Join(st.Home, "taskpilot.db") + "; } > " + out + "\n"
 	os.WriteFile(claude, []byte(script), 0o755)
 
-	if err := takeover(st, claude, "mock-t"); err != nil {
+	cfg := &config.Config{Agent: config.AgentClaude, Claude: config.Claude{Bin: claude}}
+	if err := takeover(st, cfg, "mock-t"); err != nil {
 		t.Fatal(err)
 	}
 	seen, _ := os.ReadFile(out)
@@ -36,13 +38,13 @@ func TestTakeoverMarksWhileClaudeRuns(t *testing.T) {
 	// Refused while the task runs, or while someone else drives it.
 	tk.Transition(store.StateRunning, "")
 	st.SaveTask(tk)
-	if err := takeover(st, claude, "mock-t"); err == nil || !strings.Contains(err.Error(), "running") {
+	if err := takeover(st, cfg, "mock-t"); err == nil || !strings.Contains(err.Error(), "running") {
 		t.Fatalf("running task: %v", err)
 	}
 	tk.Transition(store.StateNeedsAttention, "")
 	st.SaveTask(tk)
 	st.SetTakeover("mock-t", true) // this (live) process holds it
-	if err := takeover(st, claude, "mock-t"); err == nil || !strings.Contains(err.Error(), "another pane") {
+	if err := takeover(st, cfg, "mock-t"); err == nil || !strings.Contains(err.Error(), "another pane") {
 		t.Fatalf("double takeover: %v", err)
 	}
 }

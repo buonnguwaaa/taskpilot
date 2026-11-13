@@ -97,9 +97,18 @@ func (d *DB) migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		tx, err := d.BeginTx(ctx, nil)
+		tx, err := d.BeginTx(ctx, nil) // _txlock=immediate: holds the write lock from here
 		if err != nil {
 			return err
+		}
+		// Another process may have applied it while this one waited for the lock.
+		var now int
+		if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&now); err != nil || now >= m.n {
+			tx.Rollback()
+			if err != nil {
+				return err
+			}
+			continue
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 			tx.Rollback()

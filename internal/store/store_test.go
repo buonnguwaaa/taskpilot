@@ -1,10 +1,8 @@
 package store
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -174,76 +172,6 @@ func TestOutboxRetries(t *testing.T) {
 }
 
 // writeLegacyTask lays out a task exactly as the file-based store did.
-func writeLegacyTask(t *testing.T, home string) {
-	t.Helper()
-	dir := filepath.Join(home, "tasks", "hw-HSK-9")
-	w := func(rel string, v any) {
-		p := filepath.Join(dir, rel)
-		os.MkdirAll(filepath.Dir(p), 0o755)
-		b, _ := json.Marshal(v)
-		os.WriteFile(p, b, 0o644)
-	}
-	at := time.Date(2026, 11, 9, 10, 43, 32, 0, time.UTC)
-	w("task.json", map[string]any{"id": "hw-HSK-9", "source": "hw", "ticket_id": "HSK-9", "title": "Sửa MO", "project": "bom",
-		"branch": "tp/hw-HSK-9", "workspace": "/ws", "session_id": "sid", "state": "awaiting_approval", "runs": 1, "cost_usd": 0.58,
-		"created_at": at, "updated_at": at.Add(2 * time.Minute),
-		"history": []map[string]any{{"at": at, "state": "queued", "note": "picked up"}, {"at": at.Add(2 * time.Minute), "state": "awaiting_approval", "note": "gate plan"}}})
-	w("requests/plan-1.json", map[string]any{"id": "plan-1", "gate": "plan", "summary": "s1", "created_at": at})
-	w("decisions/plan-1.json", map[string]any{"request_id": "plan-1", "gate": "plan", "approved": false, "comment": "lại", "decided_at": at.Add(time.Minute)})
-	w("requests/plan-2.json", map[string]any{"id": "plan-2", "gate": "plan", "summary": "s2", "details": "chi tiết", "created_at": at.Add(time.Minute)})
-	w("baselines/bom-api.json", map[string]any{"repo": "bom-api", "command": "go test ./...", "passed": false, "output": "FAIL", "at": at})
-	w("prs/bom-api__release_qc.json", map[string]any{"repo": "bom-api", "destination": "release/qc", "url": "u", "pending": true, "created_at": at})
-	w("nudge.json", map[string]any{"message": "nhớ chạy test", "created_at": at})
-	os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte("{}\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "splunk-queries.jsonl"), []byte(`{"at":"2026-11-09T10:50:00Z","query":"q","earliest":"-1h","events":3}`+"\n"), 0o644)
-}
-
-func TestImportLegacy(t *testing.T) {
-	home := t.TempDir()
-	writeLegacyTask(t, home)
-	s, err := New(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	ids, err := s.ImportLegacy()
-	if err != nil || len(ids) != 1 {
-		t.Fatalf("import = %v %v", ids, err)
-	}
-	tk, err := s.LoadTask("hw-HSK-9")
-	if err != nil || tk.State != StateAwaitApproval || tk.CostUSD != 0.58 || len(tk.History) != 2 || tk.SessionID != "sid" {
-		t.Fatalf("task = %+v %v", tk, err)
-	}
-	if p, _ := s.PendingRequest("hw-HSK-9"); p == nil || p.ID != "plan-2" || p.Details != "chi tiết" {
-		t.Fatalf("the pending plan must survive the import: %+v", p)
-	}
-	if d, _ := s.Decisions("hw-HSK-9"); d["plan-1"] == nil || d["plan-1"].Comment != "lại" {
-		t.Fatalf("decisions = %+v", d)
-	}
-	if b, _ := s.Baselines("hw-HSK-9"); b["bom-api"] == nil {
-		t.Fatal("baseline")
-	}
-	if p, _ := s.PullRequestInto("hw-HSK-9", "bom-api", "release/qc"); p == nil || !p.Pending {
-		t.Fatal("pr")
-	}
-	if n, _ := s.TakeNudge("hw-HSK-9"); n == nil || n.Message != "nhớ chạy test" {
-		t.Fatal("unconsumed nudge")
-	}
-	if q, _ := s.SplunkQueries("hw-HSK-9"); len(q) != 1 || q[0].Events != 3 {
-		t.Fatal("splunk audit")
-	}
-	dir := filepath.Join(home, "tasks", "hw-HSK-9")
-	if _, err := os.Stat(filepath.Join(dir, "legacy", "task.json")); err != nil {
-		t.Fatal("legacy files must be kept under legacy/")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "events.jsonl")); err != nil {
-		t.Fatal("events.jsonl stays in place")
-	}
-	if again, err := s.ImportLegacy(); err != nil || len(again) != 0 {
-		t.Fatalf("import must be idempotent: %v %v", again, err)
-	}
-}
-
 func TestDeleteTask(t *testing.T) {
 	s := newStore(t)
 	saved(t, s, "mock-1", StateDone)

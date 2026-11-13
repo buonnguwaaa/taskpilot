@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -15,6 +17,8 @@ type RunStart struct {
 	Prompt    string
 	Model     string
 	Effort    string
+	// ResumeAt is the session entry the run continues from ("" = unknown).
+	ResumeAt string
 }
 
 // RunEnd is what a finished run produced.
@@ -49,9 +53,9 @@ func (s *Store) StartRun(taskID string, r RunStart) (int64, error) {
 		trigger = "initial"
 	}
 	res, err := s.DB.ExecContext(bg(), `INSERT INTO runs (task_id, n, session_id, resume, trigger, prompt, model, effort,
-		started_at, events_path, stderr_path) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		started_at, events_path, stderr_path, resume_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		taskID, r.N, r.SessionID, r.Resume, trigger, r.Prompt, r.Model, r.Effort, ts(time.Now()),
-		s.EventsPath(taskID), s.StderrPath(taskID, r.N))
+		s.EventsPath(taskID), s.StderrPath(taskID, r.N), r.ResumeAt)
 	if err != nil {
 		return 0, err
 	}
@@ -223,10 +227,11 @@ type Stats struct {
 // Stats computes the status-page summary.
 func (s *Store) Stats() (*Stats, error) {
 	st := &Stats{}
-	today := time.Now().Format("2006-01-02")
+	y, mo, d := time.Now().Date()
+	today := ts(time.Date(y, mo, d, 0, 0, 0, 0, time.Local)) // local midnight; started_at is UTC
 	week := ts(time.Now().AddDate(0, 0, -7))
 	q := s.DB.QueryRowContext
-	if err := q(bg(), `SELECT coalesce(sum(cost_usd),0) FROM runs WHERE substr(started_at,1,10) = ?`, today).Scan(&st.CostToday); err != nil {
+	if err := q(bg(), `SELECT coalesce(sum(cost_usd),0) FROM runs WHERE started_at >= ?`, today).Scan(&st.CostToday); err != nil {
 		return nil, err
 	}
 	if err := q(bg(), `SELECT coalesce(sum(cost_usd),0), count(*) FROM runs WHERE started_at >= ?`, week).Scan(&st.Cost7d, &st.Runs7d); err != nil {
@@ -273,4 +278,210 @@ func (s *Store) Stats() (*Stats, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// ---- graphify graph usage -----------------------------------------------------------------
+
+// ExploreStats is the average planning run (run 1) of a group of tasks.
+type ExploreStats struct {
+	Tasks       int
+	Lookups     float64 // Grep, Glob, Read and search commands (rg, grep, find, ls, cat…) per planning run
+	Explorers   float64 // subagents spawned per planning run
+	PlanCost    float64 // USD
+	PlanMinutes float64
+}
+
+// GraphUse is how agents used the graphify graph since a time, and how their
+// planning runs compare with those of tasks that did not use it.
+type GraphUse struct {
+	Since      time.Time
+	Calls      int
+	Errors     int
+	ByAction   map[string]int
+	Tasks      int // tasks whose first run started since
+	GraphTasks int // of which used graphify
+	// SearchRuns are the runs since that searched code (Grep, rg…);
+	// GraphRuns of them also queried the graph.
+	SearchRuns, GraphRuns int
+	With                  ExploreStats
+	Without               ExploreStats
+	// Recent are the latest graphify calls ("task: action text").
+	Recent []string
+}
+
+// searchCmd matches a shell command that only looks for or at code.
+var searchCmd = regexp.MustCompile(`^\s*(cd\s+\S+\s*&&\s*)?(rg|grep|egrep|find|fd|ls|tree|cat|head|tail|wc|sed\s+-n|git\s+(-C\s+\S+\s+)?(ls-files|grep|show|log|blame))\b`)
+
+func isGraphTool(name string) bool { return strings.HasSuffix(name, "graphify") }
+
+// GraphUsage computes the graphify graph usage since a time.
+func (s *Store) GraphUsage(since time.Time) (*GraphUse, error) {
+	u := &GraphUse{Since: since, ByAction: map[string]int{}}
+	rows, err := s.DB.QueryContext(bg(), `SELECT r.task_id, r.n, c.tool_name, c.input_summary, c.is_error, r.started_at
+		FROM tool_calls c JOIN runs r ON r.id = c.run_id
+		WHERE r.task_id IN (SELECT task_id FROM runs WHERE n = 1 AND started_at >= ?)
+		ORDER BY r.started_at, c.seq`, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	type acc struct {
+		graph            bool
+		lookups, explore int
+	}
+	tasks := map[string]*acc{}
+	get := func(id string) *acc {
+		if tasks[id] == nil {
+			tasks[id] = &acc{}
+		}
+		return tasks[id]
+	}
+	for rows.Next() {
+		var task, tool, input, started string
+		var n int
+		var isErr bool
+		if err := rows.Scan(&task, &n, &tool, &input, &isErr, &started); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		a := get(task)
+		switch {
+		case isGraphTool(tool):
+			a.graph = true
+			u.Calls++
+			if isErr {
+				u.Errors++
+			}
+			action, _, _ := strings.Cut(strings.TrimSpace(input), " ")
+			if action == "" {
+				action = "?"
+			}
+			u.ByAction[action]++
+			u.Recent = append(u.Recent, task+": "+input)
+		case n != 1:
+		case tool == "Grep" || tool == "Glob" || tool == "Read" || tool == "Search":
+			a.lookups++
+		case (tool == "Bash" || tool == "Shell") && searchCmd.MatchString(input):
+			a.lookups++
+		case tool == "Agent" || tool == "Task":
+			a.explore++
+		}
+	}
+	rows.Close()
+	if len(u.Recent) > 5 {
+		u.Recent = u.Recent[len(u.Recent)-5:]
+	}
+	// Runs since that searched code, and how many of them asked the graph.
+	if err := s.DB.QueryRowContext(bg(), `SELECT count(*), coalesce(sum(g), 0) FROM (
+		SELECT r.id, max(c.tool_name LIKE '%graphify') AS g,
+		       max(c.tool_name IN ('Grep','Search') OR ((c.tool_name IN ('Bash','Shell')) AND (c.input_summary LIKE '%rg %' OR c.input_summary LIKE '%grep %'))) AS searched
+		FROM runs r JOIN tool_calls c ON c.run_id = r.id WHERE r.started_at >= ? GROUP BY r.id) WHERE searched`, ts(since)).
+		Scan(&u.SearchRuns, &u.GraphRuns); err != nil {
+		return nil, err
+	}
+	// The planning run of every task started since (tasks without tool calls too).
+	rows, err = s.DB.QueryContext(bg(), `SELECT task_id, cost_usd, coalesce(duration_ms, 0) FROM runs WHERE n = 1 AND started_at >= ?`, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	add := func(e *ExploreStats, a *acc, cost float64, ms int64) {
+		e.Tasks++
+		e.Lookups += float64(a.lookups)
+		e.Explorers += float64(a.explore)
+		e.PlanCost += cost
+		e.PlanMinutes += float64(ms) / 60000
+	}
+	for rows.Next() {
+		var task string
+		var cost float64
+		var ms int64
+		if err := rows.Scan(&task, &cost, &ms); err != nil {
+			return nil, err
+		}
+		a := get(task)
+		u.Tasks++
+		if a.graph {
+			u.GraphTasks++
+			add(&u.With, a, cost, ms)
+		} else {
+			add(&u.Without, a, cost, ms)
+		}
+	}
+	for _, e := range []*ExploreStats{&u.With, &u.Without} {
+		if e.Tasks > 0 {
+			n := float64(e.Tasks)
+			e.Lookups, e.Explorers, e.PlanCost, e.PlanMinutes = e.Lookups/n, e.Explorers/n, e.PlanCost/n, e.PlanMinutes/n
+		}
+	}
+	return u, rows.Err()
+}
+
+// OperatorTextOfRun returns what the operator wrote that started the task's
+// latest run: messages consumed and request decisions (approve/reject
+// comments, answers) made after the previous run started, up to this run's
+// start. Only the TUI and the CLI write these rows, so an agent cannot
+// forge them; merge_pull_request uses them as the operator's instruction.
+func (s *Store) OperatorTextOfRun(taskID string) ([]string, error) {
+	rows, err := s.DB.QueryContext(bg(), `SELECT started_at FROM runs WHERE task_id = ? ORDER BY n DESC, id DESC LIMIT 2`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	var starts []time.Time
+	for rows.Next() {
+		var at string
+		if err := rows.Scan(&at); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		starts = append(starts, parseTS(at))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(starts) == 0 {
+		return nil, nil
+	}
+	cur, prev := starts[0], time.Time{}
+	if len(starts) > 1 {
+		prev = starts[1]
+	}
+	in := func(at string) bool {
+		t := parseTS(at)
+		return !t.IsZero() && t.After(prev) && !t.After(cur)
+	}
+	var out []string
+	collect := func(q string) error {
+		rows, err := s.DB.QueryContext(bg(), q, taskID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var text, at string
+			if err := rows.Scan(&text, &at); err != nil {
+				return err
+			}
+			if in(at) && strings.TrimSpace(text) != "" {
+				out = append(out, text)
+			}
+		}
+		return rows.Err()
+	}
+	if err := collect(`SELECT message, consumed_at FROM operator_messages WHERE task_id = ? AND consumed_at IS NOT NULL`); err != nil {
+		return nil, err
+	}
+	if err := collect(`SELECT coalesce(comment, ''), decided_at FROM approvals WHERE task_id = ? AND decided_at IS NOT NULL AND decided_by = 'operator'`); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UsedGraphify reports whether an earlier run of the task called graphify
+// (the tool calls of a run are recorded when it ends).
+func (s *Store) UsedGraphify(taskID string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(bg(), `SELECT count(*) FROM tool_calls c JOIN runs r ON r.id = c.run_id
+		WHERE r.task_id = ? AND c.tool_name LIKE '%graphify'`, taskID).Scan(&n)
+	return n > 0, err
 }

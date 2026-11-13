@@ -18,6 +18,7 @@ const (
 	fieldSelect fieldKind = iota
 	fieldText
 	fieldArea
+	fieldMulti // several options, Space toggles the highlighted one
 )
 
 type option struct{ Label, Value string }
@@ -31,6 +32,7 @@ type field struct {
 	// options returns the choices of a select; it can depend on other fields.
 	options func(f *form) []option
 	sel     int
+	checked map[int]bool // fieldMulti
 	input   textinput.Model
 	area    textarea.Model
 }
@@ -62,6 +64,12 @@ func (f *form) addSelect(key, label string, opts func(*form) []option, initial s
 		}
 	}
 	f.fields = append(f.fields, fl)
+	return f
+}
+
+// addMulti adds a field where several options can be ticked (Space).
+func (f *form) addMulti(key, label string, opts func(*form) []option, required bool) *form {
+	f.fields = append(f.fields, &field{key: key, label: label, kind: fieldMulti, options: opts, required: required, checked: map[int]bool{}})
 	return f
 }
 
@@ -120,6 +128,14 @@ func (f *form) value(key string) string {
 				fl.sel = 0
 			}
 			return opts[fl.sel].Value
+		case fieldMulti:
+			var vals []string
+			for i, o := range fl.options(f) {
+				if fl.checked[i] {
+					vals = append(vals, o.Value)
+				}
+			}
+			return strings.Join(vals, "\x1f") // unit separator: values may contain commas
 		case fieldText:
 			return strings.TrimSpace(fl.input.Value())
 		case fieldArea:
@@ -199,12 +215,32 @@ func (f *form) update(msg tea.KeyMsg) (cmd tea.Cmd, done bool) {
 				fl.sel = (fl.sel + 1) % n
 			}
 		}
+	case fieldMulti:
+		n := len(fl.options(f))
+		if n > 0 {
+			switch msg.String() {
+			case "left", "up", "h", "k":
+				fl.sel = (fl.sel - 1 + n) % n
+			case "right", "down", "l", "j":
+				fl.sel = (fl.sel + 1) % n
+			case " ", "x":
+				fl.checked[fl.sel] = !fl.checked[fl.sel]
+			}
+		}
 	case fieldText:
 		fl.input, cmd = fl.input.Update(msg)
 	case fieldArea:
 		fl.area, cmd = fl.area.Update(msg)
 	}
 	return cmd, false
+}
+
+// multiValues splits a fieldMulti value.
+func multiValues(v string) []string {
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, "\x1f")
 }
 
 // insert adds a file reference at the cursor of a text field.
@@ -251,6 +287,17 @@ func (f *form) view(width int) string {
 		switch fl.kind {
 		case fieldSelect:
 			b.WriteString(wrapOptions(fl.options(f), fl.sel, w-8, "    ") + "\n")
+		case fieldMulti:
+			opts := fl.options(f)
+			marked := make([]option, len(opts))
+			for j, o := range opts {
+				box := "☐ "
+				if fl.checked[j] {
+					box = "☑ "
+				}
+				marked[j] = option{Label: box + o.Label, Value: o.Value}
+			}
+			b.WriteString(wrapOptions(marked, fl.sel, w-8, "    ") + "\n")
 		case fieldText:
 			fl.input.Width = w - 6
 			b.WriteString("  " + fl.input.View() + "\n")
@@ -264,6 +311,9 @@ func (f *form) view(width int) string {
 		b.WriteString(errStyle.Render("✗ "+f.err) + "\n")
 	}
 	help := "Tab/Shift+Tab: chuyển ô · ←/→: chọn · Ctrl+S: gửi · Esc: huỷ"
+	if f.fields[f.focus].kind == fieldMulti {
+		help += " · Space: đánh dấu"
+	}
 	if fl := f.fields[f.focus]; fl.kind == fieldText || fl.kind == fieldArea {
 		help += " · Ctrl+O: đính kèm tệp (hoặc gõ @đường/dẫn)"
 	}

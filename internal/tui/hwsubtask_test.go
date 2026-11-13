@@ -82,8 +82,8 @@ func TestSubtaskFromDispatchedTask(t *testing.T) {
 	st.SaveTask(tk)
 	m, _ = press(t, m, "1")
 	m.reloadTasks()
-	m, _ = press(t, m, "h")
+	m, _ = press(t, m, "H")
 	if m.modal == nil || !strings.Contains(m.modal.title, "Subtask của HSK-PARENT") {
-		t.Fatalf("h on a Hasaki Work task opens the subtask form: modal=%v msg=%q", m.modal != nil, m.msg)
+		t.Fatalf("H on a Hasaki Work task opens the subtask form: modal=%v msg=%q", m.modal != nil, m.msg)
 	}
 }

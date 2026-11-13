@@ -47,24 +47,12 @@ func (t *tasksTab) rows() []listRow {
 	return out
 }
 
-// rowOffset is the first row shown so the cursor's row (and, at the top, the
-// group header above it) stays visible in h rows.
+// rowOffset is the first row shown so the cursor's row stays visible in h
+// rows (at the bottom once scrolled, so the group header above it shows too).
 func (t *tasksTab) rowOffset(rows []listRow, h int) int {
-	cur := 0
 	for i, r := range rows {
-		if r.task == t.cursor {
-			cur = i
-			break
-		}
-	}
-	if cur > 0 && rows[cur-1].task < 0 {
-		cur-- // keep the header of the cursor's group with it when scrolling up
-	}
-	if t.cursor >= 0 && cur >= h {
-		for i, r := range rows {
-			if r.task == t.cursor {
-				return i - h + 1
-			}
+		if t.cursor >= 0 && r.task == t.cursor {
+			return max(0, i-h+1)
 		}
 	}
 	return 0

@@ -39,6 +39,9 @@ func TestSubagents(t *testing.T) {
 // Investigation tickets are recognised by the marker their body starts with.
 func TestSkillKnowsInvestigationTickets(t *testing.T) {
 	skill, _ := Read("skills/workflow/SKILL.md")
+	if !strings.Contains(string(skill), "`"+splunk.QCInvestigationMarker+"`") {
+		t.Fatalf("the workflow skill must name the marker %q", splunk.QCInvestigationMarker)
+	}
 	if !strings.Contains(string(skill), "`"+splunk.InvestigationMarker+"`") {
 		t.Fatalf("the workflow skill must name the marker %q", splunk.InvestigationMarker)
 	}

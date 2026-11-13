@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
 	"github.com/buonnguwaaa/taskpilot/internal/herdr"
@@ -36,6 +37,13 @@ type tasksTab struct {
 	completion *store.Completion
 	prs        []*store.PullRequest
 	hwLink     *store.HasakiLink
+	// answer holds the choices made in the detail pane for the pending
+	// request's questions (questions.go).
+	answer *inlineAnswer
+	// workDrafting / workDrafts: the name and result of a Hasaki Work report
+	// being drafted by Claude, and the finished drafts (worklog.go).
+	workDrafting map[string]bool
+	workDrafts   map[string]*workDraftMsg
 	// hwPushing marks tasks being created on Hasaki Work (no double submit).
 	hwPushing map[string]bool
 	// hwEpics caches the current EPICs per project for key h, with the
@@ -50,12 +58,27 @@ type tasksTab struct {
 
 	// showActivity expands the "Hoạt động" section; collapsed by default.
 	showActivity bool
+	// focus: the keys scroll the detail pane (Enter/→ in, Esc/← out).
+	focus bool
+	// view of the detail pane: viewOverview or viewChat (key t).
+	view int
+	// assess caches the agents' assessments for the list (reloadTasks).
+	assess map[string]*store.Assessment
+	// assessing: a Claude estimate is running; assessTried: tasks already
+	// estimated (or failed) in this session.
+	assessing   bool
+	assessTried map[string]bool
 
 	// drafting: a prompt is being turned into a ticket draft by Claude.
 	drafting bool
 	// draft is a finished draft not shown yet (a modal was open when it arrived).
 	draft *draftMsg
 }
+
+const (
+	viewOverview = iota
+	viewChat
+)
 
 func needsOperator(s store.State) bool {
 	return s == store.StateAwaitApproval || s == store.StateNeedsAttention || s == store.StateFailed
@@ -95,6 +118,12 @@ func (m *Model) reloadTasks() {
 		}
 	}
 	m.tasks.list = append(m.tasks.list, done...)
+	m.tasks.assess = map[string]*store.Assessment{}
+	for _, t := range m.tasks.list {
+		if a, _ := m.d.Store.TaskAssessment(t.ID); a != nil {
+			m.tasks.assess[t.ID] = a
+		}
+	}
 	m.tasks.cursor = min(m.tasks.cursor, max(0, len(m.tasks.list)-1))
 	for i, t := range m.tasks.list {
 		if t.ID == selected {
@@ -135,11 +164,16 @@ func (m *Model) refreshTaskDetail(force bool) {
 		return
 	}
 	tt.lastBody = body
-	y := tt.vp.YOffset
+	y, bottom := tt.vp.YOffset, tt.vp.AtBottom()
 	tt.vp.SetContent(body)
-	if changed {
+	switch {
+	case changed && tt.view == viewChat:
+		tt.vp.GotoBottom() // the latest of the conversation
+	case changed:
 		tt.vp.GotoTop()
-	} else {
+	case tt.view == viewChat && bottom:
+		tt.vp.GotoBottom() // follow the conversation as it grows
+	default:
 		tt.vp.SetYOffset(y)
 	}
 }
@@ -148,62 +182,135 @@ func (m *Model) taskDetail(t *store.Task) string {
 	w := max(20, m.tasks.vp.Width)
 	tt := &m.tasks
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", titleStyle.Render(wrap(t.Title, w)))
-	fmt.Fprintf(&b, "%s  project %s  ·  nhánh %s\n", stateBadge(t.State), t.Project, t.Branch)
-	fmt.Fprintf(&b, "%s\n", dimStyle.Render(fmt.Sprintf("ticket %s · %d lượt chạy · $%.2f", t.TicketID, t.Runs, t.CostUSD)))
-	fmt.Fprintf(&b, "%s\n", dimStyle.Render(wrap(m.profileLine(t), w)))
+	reqs, _ := m.d.Store.Requests(t.ID)
+	decs, _ := m.d.Store.Decisions(t.ID)
+	fmt.Fprintf(&b, "%s\n\n", workflowBar(workflowSteps(t, reqs, decs, tt.pending, tt.prs), w))
+	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(wrap(t.Title, w)))
+	chips := []string{stateChip(t.State)}
+	for _, c := range []string{t.Project, "⎇ " + t.Branch, t.TicketID, t.ID} {
+		if strings.TrimSpace(strings.TrimPrefix(c, "⎇ ")) != "" && (c != t.ID || t.ID != t.TicketID) {
+			chips = append(chips, c)
+		}
+	}
+	fmt.Fprintf(&b, "%s\n\n", truncateANSI(strings.Join(chips, dimStyle.Render("  ·  ")), w))
+	assess := strings.TrimPrefix(m.assessmentLine(t, w-len(kvIndent)), "Level ")
+	fmt.Fprintf(&b, "%s\n", kv("Đánh giá", strings.ReplaceAll(assess, "\n", "\n"+kvIndent)))
+	fmt.Fprintf(&b, "%s\n", kv("Model", strings.ReplaceAll(dimStyle.Render(wrap(m.profileLine(t), w-len(kvIndent))), "\n", "\n"+kvIndent)))
+	fmt.Fprintf(&b, "%s\n", kv("Chi phí", fmt.Sprintf("$%.2f", t.CostUSD)+dimStyle.Render(fmt.Sprintf(" · %d lượt chạy", t.Runs))))
+	tabs := []string{" Tổng quan ", " Trò chuyện "}
+	for i := range tabs {
+		if i == tt.view {
+			tabs[i] = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12")).Render(tabs[i])
+		} else {
+			tabs[i] = tabStyle.Render(tabs[i])
+		}
+	}
+	scroll := "Enter/→ cuộn khung này"
+	if tt.focus {
+		scroll = "j/k cuộn · g/G đầu/cuối · Esc/← về danh sách"
+	}
+	fmt.Fprintf(&b, "\n%s %s\n", strings.Join(tabs, " "), dimStyle.Render(" t đổi · "+scroll))
+	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", w)))
+	if n := m.undoNotice(t); n != "" {
+		fmt.Fprintf(&b, "%s\n", quote(accentStyle.Render(wrap(n, w-2)), "12"))
+	}
+	if tt.view == viewChat {
+		if tt.pending != nil {
+			fmt.Fprintf(&b, "%s\n", quote(warnStyle.Render(wrap("Đang chờ bạn: "+tt.pending.ID+" (t về Tổng quan để trả lời, hoặc a/x/m)", w-2)), "11"))
+		}
+		b.WriteString(m.conversation(t, w))
+		return b.String()
+	}
 	if l := tt.hwLink; l != nil {
-		fmt.Fprintf(&b, "%s\n", accentStyle.Render(fmt.Sprintf("✓ Đã đẩy lên Hasaki Work: %s (id %d) lúc %s", l.Code, l.HWID, l.CreatedAt.Local().Format("02/01 15:04"))))
+		fmt.Fprintf(&b, "%s\n", okMark+" "+accentStyle.Render(fmt.Sprintf("Đã đẩy lên Hasaki Work: %s (id %d) lúc %s", l.Code, l.HWID, l.CreatedAt.Local().Format("02/01 15:04"))))
 	}
 	if tt.pending != nil {
-		fmt.Fprintf(&b, "\n%s\n%s\n", warnStyle.Render("▶ Chờ bạn duyệt: "+tt.pending.ID+"   (a duyệt · A duyệt+ghi chú · x từ chối)"), wrap(tt.pending.Summary, w))
-		if tt.pending.Details != "" {
-			fmt.Fprintf(&b, "\n%s\n", wrap(tt.pending.Details, w))
+		p := tt.pending
+		var ans *inlineAnswer
+		if tt.answer != nil && tt.answer.reqID == p.ID {
+			ans = tt.answer
 		}
+		var c strings.Builder
+		switch {
+		case isQuestion(p):
+			fmt.Fprintf(&b, "\n%s\n", section("❓ Agent hỏi bạn ("+p.ID+")", "", w))
+			fmt.Fprintf(&c, "%s\n", accentStyle.Render(wrap(inlineKeys(p), w-2)))
+			if len(p.Questions) > 1 || p.Summary != p.Questions[0].Question {
+				fmt.Fprintf(&c, "%s\n", mdWrap(p.Summary, w-2))
+			}
+			c.WriteString("\n" + inlineQuestions(p, ans, w-2))
+		default:
+			keys := "a duyệt · A duyệt+ghi chú · x từ chối · m góp ý"
+			if len(p.Questions) > 0 {
+				keys = inlineKeys(p)
+			}
+			fmt.Fprintf(&b, "\n%s\n", section("⏸ Chờ bạn duyệt: "+p.ID, "", w))
+			fmt.Fprintf(&c, "%s\n%s\n", accentStyle.Render(wrap(keys, w-2)), mdWrap(p.Summary, w-2))
+			// The questions come before the long details, so they are in view.
+			if len(p.Questions) > 0 {
+				c.WriteString("\n" + warnStyle.Render("Câu hỏi kèm theo:") + "\n" + inlineQuestions(p, ans, w-2))
+			}
+			if p.Details != "" {
+				fmt.Fprintf(&c, "\n%s\n", mdWrap(p.Details, w-2))
+			}
+		}
+		fmt.Fprintf(&b, "%s\n", quote(strings.TrimRight(c.String(), "\n"), "11"))
 	}
 	switch t.State {
 	case store.StateNeedsAttention, store.StateFailed:
-		fmt.Fprintf(&b, "\n%s\n", warnStyle.Render("▶ Task đang dừng: bấm m để nhắn agent chạy tiếp, hoặc o để tự làm"))
+		fmt.Fprintf(&b, "\n%s\n", quote(warnStyle.Render("Task đang dừng: ")+"bấm "+keyCap("m")+" để nhắn agent chạy tiếp, hoặc "+keyCap("o")+" để tự làm", "208"))
 	}
 	if len(tt.prs) > 0 {
-		fmt.Fprintf(&b, "\n%s\n", titleStyle.Render("Pull requests  (p mở)"))
+		fmt.Fprintf(&b, "\n%s\n", section("Pull requests", "p mở", w))
 		for _, pr := range sortedPRs(tt.prs) {
 			if pr.Pending {
-				fmt.Fprintf(&b, "%s → %s  chưa tạo: bấm p để mở trang tạo PR (tiêu đề + mô tả đã copy sẵn)\n", pr.Repo, pr.Destination)
-			} else {
-				fmt.Fprintf(&b, "%s\n", wrap(fmt.Sprintf("%s #%d → %s  %s", pr.Repo, pr.ID, pr.Destination, pr.URL), w))
+				fmt.Fprintf(&b, "%s\n", wrap(warnMark+" "+pr.Repo+" → "+pr.Destination+dimStyle.Render("  chưa tạo: bấm p để mở trang tạo PR (tiêu đề + mô tả đã copy sẵn)"), w))
+				continue
 			}
+			num := fmt.Sprintf("#%d", pr.ID)
+			if pr.URL != "" {
+				num = hyperlink(lipgloss.NewStyle().Underline(true).Foreground(lipgloss.Color("12")).Render(num), pr.URL)
+			}
+			line := fmt.Sprintf("%s %s %s %s %s", okMark, titleStyle.Render(pr.Repo), num, dimStyle.Render("→"), pr.Destination)
+			if pr.Title != "" {
+				line += dimStyle.Render("  " + ansi.Truncate(pr.Title, max(0, w-lipgloss.Width(line)-2), "…"))
+			}
+			fmt.Fprintf(&b, "%s\n", line)
 		}
 	}
 	if tt.completion != nil {
-		fmt.Fprintf(&b, "\n%s\n%s\n", titleStyle.Render("✓ Hoàn thành"), wrap(tt.completion.Summary, w))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("✓ Hoàn thành", "", w), quote(mdWrap(tt.completion.Summary, w-2), "10"))
 	}
 	if t.LastError != "" {
-		fmt.Fprintf(&b, "\n%s\n%s\n", errStyle.Render("Lỗi"), wrap(t.LastError, w))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("✗ Lỗi", "", w), quote(errStyle.Render(wrap(t.LastError, w-2)), "9"))
 	}
 	if t.LastResult != "" && tt.pending == nil {
-		fmt.Fprintf(&b, "\n%s\n%s\n", titleStyle.Render("Tin nhắn cuối của agent"), wrap(t.LastResult, w))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("Tin nhắn cuối của agent", "", w), quote(mdWrap(t.LastResult, w-2), "8"))
 	}
 	if acts := activity(m.d.Store.EventsPath(t.ID), 60); len(acts) > 0 {
 		if tt.showActivity {
-			fmt.Fprintf(&b, "\n%s\n", titleStyle.Render("▾ Hoạt động  (v thu gọn)"))
+			fmt.Fprintf(&b, "\n%s\n", section("▾ Hoạt động", "v thu gọn", w))
 			for _, a := range acts {
 				fmt.Fprintf(&b, "%s\n", truncate(a, w))
 			}
 		} else {
-			fmt.Fprintf(&b, "\n%s %s\n", titleStyle.Render("▸ Hoạt động"), dimStyle.Render(fmt.Sprintf("(%d sự kiện · v mở rộng)", len(acts))))
+			fmt.Fprintf(&b, "\n%s\n", section("▸ Hoạt động", fmt.Sprintf("%d sự kiện · v mở rộng", len(acts)), w))
 		}
 	}
 	if t.Workspace != "" {
-		fmt.Fprintf(&b, "\n%s\n", dimStyle.Render("workspace "+t.Workspace))
+		fmt.Fprintf(&b, "\n%s\n", dimStyle.Render("workspace "+t.Workspace+"  (w mở trong IDE · W xem trong repo của bạn)"))
 	}
 	return b.String()
 }
+
+// truncateANSI cuts styled text to w columns.
+func truncateANSI(s string, w int) string { return ansi.Truncate(s, w, "…") }
 
 func (m Model) tasksView() string {
 	h := m.innerHeight()
 	rows := m.listRows()
 	lw := m.listWidth()
+	cw := lw - 2 // inside the box's padding
 	var lines []string
 	if len(m.tasks.list) == 0 {
 		empty := "(trống)"
@@ -213,21 +320,17 @@ func (m Model) tasksView() string {
 		lines = append(lines, dimStyle.Render(empty))
 	}
 	all := m.tasks.rows()
-	for _, r := range all[m.tasks.rowOffset(all, rows):] {
-		if len(lines) >= rows {
-			break
-		}
+	for _, ln := range m.tasks.listLayout(all, rows) {
+		r := all[ln.row]
 		if r.task < 0 {
-			lines = append(lines, accentStyle.Render("── "+r.header))
+			head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(r.header)
+			if rest := cw - lipgloss.Width(head) - 1; rest > 0 {
+				head += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", rest))
+			}
+			lines = append(lines, head)
 			continue
 		}
-		t := m.tasks.list[r.task]
-		text := truncate(t.ID+"  "+t.Title, lw-20)
-		if r.task == m.tasks.cursor {
-			lines = append(lines, selStyle.Render(fmt.Sprintf("%-17s %s", t.State, text)))
-		} else {
-			lines = append(lines, fmt.Sprintf("%-17s %s", stateBadge(t.State), text))
-		}
+		lines = append(lines, m.taskEntry(m.tasks.list[r.task], r.task == m.tasks.cursor, cw)[ln.sub])
 	}
 	title := "Tasks  (/ tìm)"
 	if m.tasks.inboxOnly {
@@ -239,14 +342,54 @@ func (m Model) tasksView() string {
 	case m.tasks.query != "":
 		title = fmt.Sprintf("Tìm %q: %d task  (/ sửa · Esc xoá)", m.tasks.search.Value(), len(m.tasks.list))
 	}
-	left := boxStyle.Width(lw).Height(h).Render(dimStyle.Render(title) + "\n" + strings.Join(lines, "\n"))
-	right := boxStyle.Width(m.tasks.vp.Width + 2).Height(h).Render(m.tasks.vp.View())
+	if vp := m.tasks.vp; vp.TotalLineCount() > vp.Height {
+		title += fmt.Sprintf(" · chi tiết %d%%", int(vp.ScrollPercent()*100))
+	}
+	lbox, rbox := boxStyle, boxStyle
+	if m.tasks.focus {
+		rbox = rbox.BorderForeground(lipgloss.Color("12"))
+		lbox = lbox.BorderForeground(lipgloss.Color("8"))
+	}
+	left := lbox.Width(lw).Height(h).Render(dimStyle.Render(title) + "\n" + strings.Join(lines, "\n"))
+	right := rbox.Width(m.tasks.vp.Width + 2).Height(h).Render(m.tasks.vp.View())
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
 func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	t := m.tasks.current()
+	if m.tasks.focus {
+		vp := &m.tasks.vp
+		switch k.String() {
+		case "j", "down":
+			vp.ScrollDown(1)
+			return m, nil
+		case "k", "up":
+			vp.ScrollUp(1)
+			return m, nil
+		case "g", "home":
+			vp.GotoTop()
+			return m, nil
+		case "G", "end":
+			vp.GotoBottom()
+			return m, nil
+		case "esc", "left", "enter":
+			m.tasks.focus = false
+			m.refreshTaskDetail(true)
+			return m, nil
+		}
+	}
 	switch k.String() {
+	case "enter", "right", "l":
+		if t != nil {
+			m.tasks.focus = true
+			m.refreshTaskDetail(true)
+		}
+		return m, nil
+	case "t":
+		m.tasks.view = 1 - m.tasks.view
+		m.tasks.detailID = "" // scroll as for a new task: top, or the end of the conversation
+		m.refreshTaskDetail(true)
+		return m, nil
 	case "j", "down":
 		m.moveTask(1)
 	case "k", "up":
@@ -261,12 +404,22 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.tasks.vp.HalfViewUp()
 	case "h":
 		return m.pushToHW(t)
+	case "H":
+		if t == nil || t.Source != hwSource {
+			m.msg = "H tạo subtask cho task lấy từ Hasaki Work; task này tạo trong taskpilot: dùng h"
+			break
+		}
+		return m.subtaskFromLocal(t.TicketID)
 	case "d", "delete":
 		return m.deleteTask(t)
 	case "c":
 		return m.markDone(t)
 	case "e":
 		return m.editProfile(t)
+	case "w":
+		return m.openWorkspace(t)
+	case "W":
+		return m.reviewInClone(t)
 	case "v":
 		m.tasks.showActivity = !m.tasks.showActivity
 		m.refreshTaskDetail(true)
@@ -294,6 +447,9 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		req := m.tasks.pending
+		if len(req.Questions) > 0 {
+			return m.answerForm(t, req, true)
+		}
 		if err := m.d.Store.Decide(t.ID, req, true, ""); err != nil {
 			m.msg = "duyệt: " + err.Error()
 		} else {
@@ -307,6 +463,12 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		approve := k.String() == "A"
 		req, id := m.tasks.pending, t.ID
+		if len(req.Questions) > 0 && (approve || !isQuestion(req)) {
+			return m.answerForm(t, req, approve)
+		}
+		if isQuestion(req) { // x on a question: reply without picking
+			return m.replyForm(t, req)
+		}
 		verb := map[bool]string{true: "Duyệt", false: "Từ chối"}[approve]
 		f := newForm(fmt.Sprintf("%s %s — %s", verb, req.ID, truncate(t.Title, 60)), func(v map[string]string) (tea.Cmd, error) {
 			comment, err := m.attach(id, v["comment"])
@@ -324,22 +486,16 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.msg = strings.ToLower(verb) + " " + req.ID
 		return m, f.start()
 	case "m":
+		if t != nil && m.tasks.pending != nil { // waiting for you: reply to the request
+			return m.replyForm(t, m.tasks.pending)
+		}
 		if t == nil || !(t.State == store.StateNeedsAttention || t.State == store.StateFailed || t.State == store.StateDone) {
-			m.msg = "chỉ nhắn được khi task đang dừng (needs_attention, failed hoặc done)"
+			m.msg = "chỉ nhắn được khi task đang dừng hoặc đang chờ bạn (needs_attention, failed, done, awaiting_approval)"
 			break
 		}
-		id := t.ID
-		f := newForm("Nhắn agent — "+truncate(t.Title, 60), func(v map[string]string) (tea.Cmd, error) {
-			text, err := m.attach(id, v["text"])
-			if err != nil {
-				return nil, err
-			}
-			return nil, m.d.Store.SetNudge(id, text)
-		})
-		f.hint = "Agent chạy tiếp trong cùng session với tin nhắn này."
-		f.addArea("text", "Tin nhắn", "", true)
-		m.modal = f
-		return m, f.start()
+		return m.messageForm(t, "", "Agent chạy tiếp trong cùng session với tin nhắn này. Gõ nhầm: u để thu hồi (kể cả khi agent đã nhận).")
+	case "u":
+		return m.undoSend(t)
 	case "o":
 		if t == nil {
 			break
@@ -425,7 +581,8 @@ func (m Model) repoOptions(f *form) []option {
 }
 
 // newTaskForm opens the task form, prefilled from init (a prompt draft or empty).
-func (m Model) newTaskForm(init source.Ticket, hint string) (tea.Model, tea.Cmd) {
+// after, if given, runs once the task was submitted (with its task id).
+func (m Model) newTaskForm(init source.Ticket, hint string, after ...func(taskID string)) (tea.Model, tea.Cmd) {
 	if m.d.Inbox == nil {
 		m.msg = "không có inbox để tạo task"
 		return m, nil
@@ -440,7 +597,20 @@ func (m Model) newTaskForm(init source.Ticket, hint string) (tea.Model, tea.Cmd)
 		if err != nil {
 			return nil, err
 		}
-		return nil, inbox.Submit(source.Ticket{ID: id, Title: v["title"], Body: body, Project: v["project"], Repo: v["repo"]})
+		title := strings.TrimSpace(v["title"])
+		if title == "" {
+			title = source.TitleFrom(v["body"])
+		}
+		if title == "" {
+			return nil, errors.New("nhập tiêu đề hoặc mô tả (câu hỏi)")
+		}
+		if err := inbox.Submit(source.Ticket{ID: id, Title: title, Body: body, Project: v["project"], Repo: v["repo"]}); err != nil {
+			return nil, err
+		}
+		for _, a := range after {
+			a(store.TaskID(inbox.Name(), id))
+		}
+		return nil, nil
 	})
 	f.hint = "Agent chỉ làm trong các repo của project đã chọn. Daemon nhận task trong vài giây."
 	if hint != "" {
@@ -448,8 +618,8 @@ func (m Model) newTaskForm(init source.Ticket, hint string) (tea.Model, tea.Cmd)
 	}
 	f.addSelect("project", "Project", m.projectOptions, init.Project)
 	f.addSelect("repo", "Repo bắt đầu", m.repoOptions, init.Repo)
-	f.addText("title", "Tiêu đề", init.Title, true)
-	f.addArea("body", "Mô tả / acceptance criteria", init.Body, true)
+	f.addText("title", "Tiêu đề (bỏ trống: lấy dòng đầu của mô tả)", init.Title, false)
+	f.addArea("body", "Mô tả / acceptance criteria — hoặc chỉ một câu hỏi", init.Body, false)
 	m.modal = f
 	return m, f.start()
 }

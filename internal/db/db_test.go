@@ -25,7 +25,7 @@ func TestOpenMigratesAndIsPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := d.SchemaVersion(context.Background()); err != nil || v != 5 {
+	if v, err := d.SchemaVersion(context.Background()); err != nil || v != 12 {
 		t.Fatalf("schema version = %d, %v", v, err)
 	}
 	d.Close()
@@ -64,10 +64,6 @@ func TestPlainSecretLifecycle(t *testing.T) {
 	}
 	if meta.Description != "desc" || meta.ExpiresAt != nil {
 		t.Fatalf("meta = %+v (update without expiry clears it; empty description keeps the old one)", meta)
-	}
-	list, err := d.ListSecrets(ctx)
-	if err != nil || len(list) != 1 || list[0].Kind != "plain" {
-		t.Fatalf("list = %+v, %v", list, err)
 	}
 
 	var actions []string

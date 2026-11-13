@@ -23,20 +23,20 @@ const investigationSamples = 8
 
 // openInvestigation opens the new-task form prefilled with the ticket, so the
 // operator can read and adjust it before the agent starts.
-func (m Model) openInvestigation(in splunk.Investigation, from string) (tea.Model, tea.Cmd) {
+func (m Model) openInvestigation(in splunk.Investigation, from string, after ...func(string)) (tea.Model, tea.Cmd) {
 	t := source.Ticket{Project: in.Project, Repo: m.repoForService(in.Project, in.Service), Title: in.Title(), Body: in.Body()}
 	hint := "Task điều tra sự cố production (" + from + "): agent tìm nguyên nhân gốc trên Splunk, code và DB QC, " +
 		"báo cáo ở cổng plan; chỉ sửa code khi bạn duyệt. Sửa tiêu đề/mô tả nếu cần rồi Ctrl+S."
-	return m.newTaskForm(t, hint)
+	return m.newTaskForm(t, hint, after...)
 }
 
 // investigateFromGroup starts an investigation from an error group.
-func (m Model) investigateFromGroup(g splunk.ErrorGroup) (tea.Model, tea.Cmd) {
+func (m Model) investigateFromGroup(g splunk.ErrorGroup, after ...func(string)) (tea.Model, tea.Cmd) {
 	name, pl := m.logProject()
 	e, l := splunk.AbsoluteWindow(m.logs.lastEarliest, m.logs.lastLatest, time.Now())
 	in := splunk.Investigation{Project: name, Service: g.Service, Filter: pl.Filter, Earliest: e, Latest: l,
 		Group: &g, SPL: splunk.Scope(pl.Filter, splunk.DrillSPL(g))}
-	return m.openInvestigation(in, fmt.Sprintf("từ nhóm lỗi %s, %d lần", g.Service, g.Count))
+	return m.openInvestigation(in, fmt.Sprintf("từ nhóm lỗi %s, %d lần", g.Service, g.Count), after...)
 }
 
 // investigateFromResults starts an investigation from the last search: its
@@ -98,4 +98,18 @@ func (m Model) investigateForm() (tea.Model, tea.Cmd) {
 	f.addSelect("window", "Xảy ra trong", presetOptions, m.formWindow())
 	m.modal = f
 	return m, f.start()
+}
+
+// investigateFlow starts an investigation of a failing flow: its main error
+// group plus the other groups of the same path.
+func (m Model) investigateFlow(g splunk.ErrorGroup, flow string, related []splunk.ErrorGroup, after ...func(string)) (tea.Model, tea.Cmd) {
+	if flow == "" && len(related) == 0 {
+		return m.investigateFromGroup(g, after...)
+	}
+	name, pl := m.logProject()
+	e, l := splunk.AbsoluteWindow(m.logs.lastEarliest, m.logs.lastLatest, time.Now())
+	in := splunk.Investigation{Project: name, Service: g.Service, Filter: pl.Filter, Earliest: e, Latest: l,
+		Group: &g, Flow: flow, Related: related, SPL: splunk.Scope(pl.Filter, splunk.DrillSPL(g)),
+		Symptom: "Luồng lỗi: " + flow}
+	return m.openInvestigation(in, fmt.Sprintf("từ luồng lỗi %d nhóm", len(related)+1), after...)
 }

@@ -185,17 +185,14 @@ PRAGMA synchronous = NORMAL;    -- an toàn với WAL, nhanh hơn FULL
   từ đầu, nên daemon, TUI, MCP và hook ghi song song mà không gặp lỗi "database is locked" giữa chừng.
 - `taskpilot db stats | tasks | runs TASK | sql "SELECT …"` để xem dữ liệu (lệnh `sql` chạy ở chế
   độ `query_only`). Tab Status có mục **Thống kê**.
-- Chuyển dữ liệu cũ: lần đầu daemon hoặc TUI khởi động (hoặc `taskpilot migrate-files`), các task
-  dạng file được nhập vào DB, mỗi task một transaction, giữ nguyên thời gian gốc. File cũ được cất
-  vào `tasks/<id>/legacy/`.
-- File `daemon.lock` ghi `store=sqlite`. Bản mới từ chối chạy cạnh daemon bản cũ (còn ghi file)
-  và không chuyển dữ liệu trong tình huống đó.
+- Dữ liệu dạng file cũ đã được nhập vào DB (file gốc cất ở `tasks/<id>/legacy/`). Code nhập đã bỏ
+  khỏi taskpilot (11/2026); muốn nhập lại thì dùng một bản taskpilot cũ hơn.
 
 ## Kế hoạch chuyển đổi từ file (đã làm bước 1–3)
 
 1. Tạo package `internal/db` (mở kết nối, migration) và viết lại `store` trên
    SQLite, giữ nguyên các hàm public để daemon, TUI, MCP và hook không phải sửa.
-2. Lệnh `taskpilot migrate-files` để nhập dữ liệu cũ từ `~/.taskpilot/tasks/*`.
+2. Nhập dữ liệu cũ từ `~/.taskpilot/tasks/*` (đã chạy xong; lệnh `migrate-files` đã bỏ).
 3. Thêm các phần mới: ghi `runs` và `tool_calls` từ stream-json, outbox có retry,
    `v_inbox` cho TUI.
 4. Thêm phần secret: lệnh `taskpilot secret set|ref|bind|rotate|list` (không bao

@@ -22,18 +22,24 @@ import (
 
 	"github.com/buonnguwaaa/taskpilot/internal/argocd"
 	"github.com/buonnguwaaa/taskpilot/internal/bitbucket"
+	"github.com/buonnguwaaa/taskpilot/internal/claudeai"
 	"github.com/buonnguwaaa/taskpilot/internal/config"
 	"github.com/buonnguwaaa/taskpilot/internal/daemon"
 	"github.com/buonnguwaaa/taskpilot/internal/gate"
+	"github.com/buonnguwaaa/taskpilot/internal/graphify"
 	"github.com/buonnguwaaa/taskpilot/internal/hook"
 	"github.com/buonnguwaaa/taskpilot/internal/intake"
+	"github.com/buonnguwaaa/taskpilot/internal/jenkins"
+	"github.com/buonnguwaaa/taskpilot/internal/kafbat"
 	"github.com/buonnguwaaa/taskpilot/internal/mcpserver"
 	"github.com/buonnguwaaa/taskpilot/internal/plugin"
 	"github.com/buonnguwaaa/taskpilot/internal/refs"
 	"github.com/buonnguwaaa/taskpilot/internal/runner"
+	"github.com/buonnguwaaa/taskpilot/internal/scan"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
 	"github.com/buonnguwaaa/taskpilot/internal/store"
+	"github.com/buonnguwaaa/taskpilot/internal/vault"
 )
 
 //go:embed example-config.yaml
@@ -55,7 +61,6 @@ Usage:
   taskpilot message TASK -text M                resume a stopped task with a message
   taskpilot takeover TASK                       drive the task's Claude session by hand (daemon leaves it alone)
   taskpilot db [stats|tasks|runs TASK|sql "SELECT …"]   inspect the database (read-only)
-  taskpilot migrate-files                       import tasks of the old file-based store (also automatic on start)
   taskpilot export [-o DIR] [-secrets]          pack data (no tokens) for another machine; -secrets: tokens in a separate archive
   taskpilot import -i DATA.tar.gz [-secrets SECRETS.tar.gz] [-force]   restore an export on this machine
 
@@ -76,8 +81,32 @@ QC databases (read-only, agents use the MCP tool db_query):
   taskpilot qcdb list                           where each project's QC database is (no credentials shown)
   taskpilot qcdb query PROJECT "SELECT …"       run one read-only statement
 
+Graphify graphs (graphify: graphify per repo and line, gRPC links between repos; agents use graphify):
+  taskpilot graphify build [PROJECT] [-line L] [-force] build / update now (the daemon does it every graphify.refresh)
+  taskpilot graphify status [PROJECT]              what each line was built from
+  taskpilot graphify links PROJECT [-line L] [FILTER]   gRPC calls between the repos
+  taskpilot graphify ask PROJECT LINE ACTION ARG…  query / explain / path / affected, as the agent does
+  taskpilot graphify task TASK [ACTION ARG…]    build / update a task's own graph (its branch), then ask it
+
+Production error scans (logs_production.scan: times, min_count, ignore):
+  taskpilot scan run PROJECT                    scan now (since the previous scan, at most max_window)
+  taskpilot scan list [PROJECT]                 fix suggestions waiting for you
+
+Vault (QC, read-only; agents use qc_config_list / qc_config_get within vault_paths):
+  taskpilot auth vault [-token]                 log in with SSO (Chrome profile) or paste a token
+  taskpilot vault whoami|ls [PATH]|get PATH     look at the QC configuration yourself
+
+Kafka (QC through Kafka UI, read-only; agents use qc_kafka_* within kafka_topics):
+  taskpilot auth kafka [-token]                 log in with SSO (Chrome profile) or paste the Cookie
+  taskpilot kafka whoami|topics|topic|messages|groups|group   look at QC topics yourself
+
+claude.ai artifacts (prototypes linked from tasks; agents use read_claude_artifact):
+  taskpilot auth claude                         paste the claude.ai sessionKey cookie
+  taskpilot claude whoami|artifact URL [-o DIR] check the session, download an artifact yourself
+
 Argo CD (QC):
   taskpilot auth argocd [-token]                log in (Chrome profile) or paste a token
+  taskpilot auth jenkins                        store the Jenkins user + API token (read-only)
   taskpilot argo apps [-project P]              applications and the project each maps to
   taskpilot argo logs APP [-filter S]           latest pod logs
 
@@ -124,8 +153,6 @@ func main() {
 		err = cmdSplunk(args)
 	case "takeover":
 		err = cmdTakeover(args)
-	case "migrate-files":
-		err = cmdMigrateFiles(args)
 	case "export":
 		err = cmdExport(args)
 	case "import":
@@ -138,6 +165,16 @@ func main() {
 		err = cmdHW(args)
 	case "qcdb":
 		err = cmdQCDB(args)
+	case "vault":
+		err = cmdVault(args)
+	case "kafka":
+		err = cmdKafka(args)
+	case "claude":
+		err = cmdClaude(args)
+	case "graphify", "graph":
+		err = cmdGraph(args)
+	case "scan":
+		err = cmdScan(args)
 	case "mcp":
 		err = cmdMCP(args)
 	case "hook":
@@ -162,6 +199,17 @@ type common struct {
 func newFlags(name string) common {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	return common{fs: fs, config: fs.String("config", config.DefaultPath(), "config file")}
+}
+
+// parse parses the flags of a subcommand whose positional arguments may come
+// before the flags (taskpilot kafka messages TOPIC -limit 5) and returns them.
+func (c common) parse(args []string) []string {
+	var pos []string
+	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		pos, args = append(pos, args[0]), args[1:]
+	}
+	c.fs.Parse(args)
+	return append(pos, c.fs.Args()...)
 }
 
 func (c common) load() (*config.Config, *store.Store, error) {
@@ -204,48 +252,24 @@ func cmdDaemon(args []string) error {
 	if err != nil {
 		return err
 	}
-	src, err := source.New(cfg.Source)
-	if err != nil {
-		return err
-	}
-	pluginDir, err := plugin.Materialize(cfg.Home)
-	if err != nil {
-		return fmt.Errorf("write plugin: %w", err)
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	if _, err := gate.Compile(cfg.Rules); err != nil {
+	d, err := newDaemon(cfg, st, exe, os.Stderr)
+	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	d := &daemon.Daemon{
-		Config: cfg,
-		Store:  st,
-		Source: src,
-		Runner: &runner.Runner{Config: cfg, Store: st, PluginDir: pluginDir, Exe: exe},
-		Log:    log.New(os.Stderr, "", log.LstdFlags),
-	}
 	if len(cfg.Projects) == 0 {
 		return fmt.Errorf("no projects configured in %s", cfg.Path)
 	}
 	unlock, err := daemon.Lock(cfg.Home)
-	if errors.Is(err, daemon.ErrLocked) {
-		if oerr := daemon.CheckOwner(cfg.Home); oerr != nil {
-			return oerr
-		}
-	}
 	if err != nil {
 		return fmt.Errorf("%w (close the TUI, or the other `taskpilot daemon`)", err)
 	}
 	defer unlock()
-	if ids, err := st.ImportLegacy(); err != nil {
-		return fmt.Errorf("import file-based tasks: %w", err)
-	} else if len(ids) > 0 {
-		log.Printf("imported %d file-based task(s) into the database: %s", len(ids), strings.Join(ids, ", "))
-	}
 	if *once {
 		return d.Once(ctx)
 	}
@@ -307,8 +331,11 @@ func cmdSubmit(args []string) error {
 			return fmt.Errorf("Claude could not tell the project; pass -project (configured: %v)", cfg.ProjectNames())
 		}
 	}
+	if *title == "" {
+		*title = source.TitleFrom(*body)
+	}
 	if *project == "" || *title == "" {
-		return fmt.Errorf("-project and -title are required")
+		return fmt.Errorf("-project and -title (or -body) are required")
 	}
 	proj, ok := cfg.Projects[*project]
 	if !ok {
@@ -450,13 +477,31 @@ func cmdMCP(args []string) error {
 		Bitbucket: func(ctx context.Context) (*bitbucket.Client, error) { return bitbucketClient(ctx, cfg, "mcp:"+*task) },
 		Splunk:    func(ctx context.Context) (*splunk.Client, error) { return splunkClient(ctx, cfg, "mcp:"+*task) },
 		ArgoCD:    func(ctx context.Context) (*argocd.Client, error) { return argocdClient(ctx, cfg, "mcp:"+*task) },
-		Secret:    secretReader(cfg, "mcp:"+*task)})
+		Vault:     func(ctx context.Context) (*vault.Client, error) { return vaultClient(ctx, cfg, "mcp:"+*task) },
+		Kafka: func(ctx context.Context) (*kafbat.Client, string, error) {
+			cl, err := kafkaClient(ctx, cfg, "mcp:"+*task)
+			if err != nil {
+				return nil, "", err
+			}
+			cluster, err := kafkaCluster(ctx, cfg, cl)
+			return cl, cluster, err
+		},
+		ClaudeArtifact: func(ctx context.Context, link, dir string) (*claudeai.Artifact, error) {
+			f, err := claudeFetcher(ctx, cfg, "mcp:"+*task)
+			if err != nil {
+				return nil, err
+			}
+			return f.Fetch(ctx, link, dir)
+		},
+		Jenkins: func(ctx context.Context) (*jenkins.Client, error) { return jenkinsClient(ctx, cfg, "mcp:"+*task) },
+		Secret:  secretReader(cfg, "mcp:"+*task)})
 	return srv.Run(context.Background(), &mcp.StdioTransport{})
 }
 
 func cmdHook(args []string) error {
 	c := newFlags("hook")
 	task := c.fs.String("task", os.Getenv("TASKPILOT_TASK_ID"), "task id")
+	format := c.fs.String("format", "", "hook response format: claude, cursor, or empty (auto)")
 	c.fs.Parse(args)
 	// Fail closed: a broken config must not silently allow gated calls.
 	cfg, st, err := c.load()
@@ -467,5 +512,36 @@ func cmdHook(args []string) error {
 	if err != nil {
 		return hook.Deny(os.Stdout, "taskpilot hook has an invalid policy ("+err.Error()+"); blocked to be safe")
 	}
-	return hook.Run(os.Stdin, os.Stdout, st, *task, pol)
+	var opts hook.Options
+	if t, err := st.LoadTask(*task); err == nil && cfg.Graphify != nil && len(cfg.ProjectGraphLines(t.Project)) > 0 {
+		opts.Graphify = true
+	}
+	return hook.RunWith(os.Stdin, os.Stdout, st, *task, pol, *format, opts)
+}
+
+// newDaemon builds the scheduler (and its error scanner) the same way for
+// `taskpilot daemon` and the daemon embedded in the TUI.
+func newDaemon(cfg *config.Config, st *store.Store, exe string, logw io.Writer) (*daemon.Daemon, error) {
+	src, err := source.New(cfg.Source)
+	if err != nil {
+		return nil, err
+	}
+	pluginDir, err := plugin.Materialize(cfg.Home)
+	if err != nil {
+		return nil, fmt.Errorf("write plugin: %w", err)
+	}
+	if _, err := gate.Compile(cfg.Rules); err != nil {
+		return nil, err
+	}
+	d := &daemon.Daemon{
+		Config: cfg, Store: st, Source: src,
+		Runner: &runner.Runner{Config: cfg, Store: st, PluginDir: pluginDir, Exe: exe},
+		Log:    log.New(logw, "", log.LstdFlags),
+	}
+	d.Scanner = &scan.Scanner{Config: d.CurrentConfig, Store: st, Logf: d.Log.Printf,
+		Splunk: func(ctx context.Context) (*splunk.Client, error) {
+			return splunkClient(ctx, d.CurrentConfig(), "daemon:scan")
+		}, Group: flowGrouper(d.CurrentConfig)}
+	d.Indexer = &graphify.Indexer{Config: d.CurrentConfig, Logf: d.Log.Printf}
+	return d, nil
 }

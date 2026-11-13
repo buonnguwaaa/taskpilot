@@ -84,9 +84,6 @@ func TestPullRequests(t *testing.T) {
 	if got, err := c.FindOpenPR(ctx, ref, "tp/none", "main"); got != nil || err != nil {
 		t.Fatalf("find none: %+v %v", got, err)
 	}
-	if d, err := c.RecentDestinations(ctx, ref, 30); err != nil || d["release/qc"] != 2 || d["main"] != 1 {
-		t.Fatalf("destinations = %v %v", d, err)
-	}
 	if _, err := c.CreatePR(ctx, RepoRef{"ws", "nope"}, CreateInput{}); err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("error path: %v", err)
 	}
