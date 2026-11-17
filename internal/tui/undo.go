@@ -57,7 +57,7 @@ func (m Model) undoNotice(t *store.Task) string {
 		return "↶ Đang thu hồi lượt cuối: daemon dừng agent (nếu đang chạy) rồi tua session về trước lượt đó…"
 	}
 	if pm, _ := m.d.Store.PendingMessage(t.ID); pm != nil {
-		return "✉ Tin nhắn chưa tới agent · u thu hồi để sửa"
+		return "Tin nhắn chưa tới agent · u thu hồi để sửa"
 	}
 	return ""
 }
@@ -72,7 +72,7 @@ func (m Model) undoSend(t *store.Task) (tea.Model, tea.Cmd) {
 		return m, nil
 	} else if text != "" {
 		m.reloadTasks()
-		return m.messageForm(t, text, "Đã thu hồi tin nhắn (agent chưa nhận) — sửa rồi Ctrl+S để gửi lại, Esc để bỏ hẳn.")
+		return m.messageForm(t, text, "Đã thu hồi tin nhắn (agent chưa nhận): sửa rồi Ctrl+S để gửi lại, Esc để bỏ hẳn.")
 	}
 	if m.d.Store.UndoRequested(t.ID) {
 		m.msg = "đang thu hồi rồi, đợi daemon xử lý"
@@ -127,7 +127,7 @@ func (m Model) onUndoRequested(msg undoRequestedMsg) (tea.Model, tea.Cmd) {
 		return m.decisionForm(msg.task, tr.Request, tr.Approved, tr.Comment)
 	}
 	return m.messageForm(msg.task, strings.Join(tr.Messages, "\n\n"),
-		"Đang thu hồi tin nhắn cũ — sửa rồi Ctrl+S: tin mới tới agent sau khi thu hồi xong. Esc: không gửi gì.")
+		"Đang thu hồi tin nhắn cũ. Sửa rồi Ctrl+S: tin mới tới agent sau khi thu hồi xong. Esc: không gửi gì.")
 }
 
 // messageForm is the form that messages a stopped task's agent.
@@ -168,7 +168,7 @@ func (m Model) decisionForm(t *store.Task, reqID string, approve bool, initial s
 		}
 		return nil, m.d.Store.Decide(id, req, approve, text)
 	})
-	f.hint = "Quyết định cũ đang được thu hồi — sửa rồi Ctrl+S để gửi lại. Esc: yêu cầu chờ bạn (a/x/m như thường)."
+	f.hint = "Quyết định cũ đang được thu hồi. Sửa rồi Ctrl+S để gửi lại. Esc: yêu cầu chờ bạn (a/x/m như thường)."
 	f.addArea("text", "Nội dung gửi agent", initial, !approve)
 	m.modal = f
 	return m, f.start()

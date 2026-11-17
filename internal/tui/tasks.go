@@ -185,14 +185,14 @@ func (m *Model) taskDetail(t *store.Task) string {
 	reqs, _ := m.d.Store.Requests(t.ID)
 	decs, _ := m.d.Store.Decisions(t.ID)
 	fmt.Fprintf(&b, "%s\n\n", workflowBar(workflowSteps(t, reqs, decs, tt.pending, tt.prs), w))
-	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(wrap(t.Title, w)))
+	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(clr(cBright)).Render(wrap(t.Title, w)))
 	chips := []string{stateChip(t.State)}
 	for _, c := range []string{t.Project, "⎇ " + t.Branch, t.TicketID, t.ID} {
 		if strings.TrimSpace(strings.TrimPrefix(c, "⎇ ")) != "" && (c != t.ID || t.ID != t.TicketID) {
 			chips = append(chips, c)
 		}
 	}
-	fmt.Fprintf(&b, "%s\n\n", truncateANSI(strings.Join(chips, dimStyle.Render("  ·  ")), w))
+	fmt.Fprintf(&b, "%s\n\n", truncateANSI(strings.Join(chips, dimStyle.Render(" · ")), w))
 	assess := strings.TrimPrefix(m.assessmentLine(t, w-len(kvIndent)), "Level ")
 	fmt.Fprintf(&b, "%s\n", kv("Đánh giá", strings.ReplaceAll(assess, "\n", "\n"+kvIndent)))
 	fmt.Fprintf(&b, "%s\n", kv("Model", strings.ReplaceAll(dimStyle.Render(wrap(m.profileLine(t), w-len(kvIndent))), "\n", "\n"+kvIndent)))
@@ -200,7 +200,7 @@ func (m *Model) taskDetail(t *store.Task) string {
 	tabs := []string{" Tổng quan ", " Trò chuyện "}
 	for i := range tabs {
 		if i == tt.view {
-			tabs[i] = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12")).Render(tabs[i])
+			tabs[i] = fg(cBright).Underline(true).Render(tabs[i])
 		} else {
 			tabs[i] = tabStyle.Render(tabs[i])
 		}
@@ -210,19 +210,31 @@ func (m *Model) taskDetail(t *store.Task) string {
 		scroll = "j/k cuộn · g/G đầu/cuối · Esc/← về danh sách"
 	}
 	fmt.Fprintf(&b, "\n%s %s\n", strings.Join(tabs, " "), dimStyle.Render(" t đổi · "+scroll))
-	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", w)))
+	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Foreground(clr(cRule)).Render(strings.Repeat("─", w)))
 	if n := m.undoNotice(t); n != "" {
-		fmt.Fprintf(&b, "%s\n", quote(accentStyle.Render(wrap(n, w-2)), "12"))
+		fmt.Fprintf(&b, "%s\n", quote(accentStyle.Render(wrap(n, w-2)), cRule))
 	}
 	if tt.view == viewChat {
 		if tt.pending != nil {
-			fmt.Fprintf(&b, "%s\n", quote(warnStyle.Render(wrap("Đang chờ bạn: "+tt.pending.ID+" (t về Tổng quan để trả lời, hoặc a/x/m)", w-2)), "11"))
+			fmt.Fprintf(&b, "%s\n", quote(warnStyle.Render(wrap("Đang chờ bạn: "+tt.pending.ID+" (t về Tổng quan để trả lời, hoặc a/x/m)", w-2)), cAccent))
 		}
 		b.WriteString(m.conversation(t, w))
 		return b.String()
 	}
 	if l := tt.hwLink; l != nil {
 		fmt.Fprintf(&b, "%s\n", okMark+" "+accentStyle.Render(fmt.Sprintf("Đã đẩy lên Hasaki Work: %s (id %d) lúc %s", l.Code, l.HWID, l.CreatedAt.Local().Format("02/01 15:04"))))
+	}
+	if gs, _ := m.d.Store.Grants(t.ID, t.Project); len(gs) > 0 {
+		var rs []string
+		for _, g := range gs {
+			rs = append(rs, g.Rule+map[string]string{store.GrantTask: " (task)", store.GrantProject: " (project)"}[g.Scope])
+		}
+		fmt.Fprintf(&b, "%s\n", dimStyle.Render(wrap("Quyền đã cấp thêm: "+strings.Join(rs, ", ")+"  · thu hồi: taskpilot grants rm", w)))
+	}
+	if tks, _ := m.d.Store.TaskTickets(t.ID); len(tks) > 0 {
+		for _, x := range tks {
+			fmt.Fprintf(&b, "%s\n", truncateANSI(accentStyle.Render("Gộp thêm ticket "+x.TicketID)+dimStyle.Render(" · "+x.Title+" · "+x.At.Local().Format("02/01 15:04")), w))
+		}
 	}
 	if tt.pending != nil {
 		p := tt.pending
@@ -233,7 +245,7 @@ func (m *Model) taskDetail(t *store.Task) string {
 		var c strings.Builder
 		switch {
 		case isQuestion(p):
-			fmt.Fprintf(&b, "\n%s\n", section("❓ Agent hỏi bạn ("+p.ID+")", "", w))
+			fmt.Fprintf(&b, "\n%s%s\n", warnStyle.Render("● "), section("Agent hỏi bạn ("+p.ID+")", "", w-2))
 			fmt.Fprintf(&c, "%s\n", accentStyle.Render(wrap(inlineKeys(p), w-2)))
 			if len(p.Questions) > 1 || p.Summary != p.Questions[0].Question {
 				fmt.Fprintf(&c, "%s\n", mdWrap(p.Summary, w-2))
@@ -244,7 +256,7 @@ func (m *Model) taskDetail(t *store.Task) string {
 			if len(p.Questions) > 0 {
 				keys = inlineKeys(p)
 			}
-			fmt.Fprintf(&b, "\n%s\n", section("⏸ Chờ bạn duyệt: "+p.ID, "", w))
+			fmt.Fprintf(&b, "\n%s%s\n", warnStyle.Render("● "), section("Chờ bạn duyệt: "+p.ID, "", w-2))
 			fmt.Fprintf(&c, "%s\n%s\n", accentStyle.Render(wrap(keys, w-2)), mdWrap(p.Summary, w-2))
 			// The questions come before the long details, so they are in view.
 			if len(p.Questions) > 0 {
@@ -254,11 +266,11 @@ func (m *Model) taskDetail(t *store.Task) string {
 				fmt.Fprintf(&c, "\n%s\n", mdWrap(p.Details, w-2))
 			}
 		}
-		fmt.Fprintf(&b, "%s\n", quote(strings.TrimRight(c.String(), "\n"), "11"))
+		fmt.Fprintf(&b, "%s\n", quote(strings.TrimRight(c.String(), "\n"), cAccent))
 	}
 	switch t.State {
 	case store.StateNeedsAttention, store.StateFailed:
-		fmt.Fprintf(&b, "\n%s\n", quote(warnStyle.Render("Task đang dừng: ")+"bấm "+keyCap("m")+" để nhắn agent chạy tiếp, hoặc "+keyCap("o")+" để tự làm", "208"))
+		fmt.Fprintf(&b, "\n%s\n", quote(warnStyle.Render("Task đang dừng: ")+"bấm "+keyCap("m")+" để nhắn agent chạy tiếp, hoặc "+keyCap("o")+" để tự làm", cAccent))
 	}
 	if len(tt.prs) > 0 {
 		fmt.Fprintf(&b, "\n%s\n", section("Pull requests", "p mở", w))
@@ -269,7 +281,7 @@ func (m *Model) taskDetail(t *store.Task) string {
 			}
 			num := fmt.Sprintf("#%d", pr.ID)
 			if pr.URL != "" {
-				num = hyperlink(lipgloss.NewStyle().Underline(true).Foreground(lipgloss.Color("12")).Render(num), pr.URL)
+				num = hyperlink(lipgloss.NewStyle().Underline(true).Foreground(clr(cBright)).Render(num), pr.URL)
 			}
 			line := fmt.Sprintf("%s %s %s %s %s", okMark, titleStyle.Render(pr.Repo), num, dimStyle.Render("→"), pr.Destination)
 			if pr.Title != "" {
@@ -279,13 +291,13 @@ func (m *Model) taskDetail(t *store.Task) string {
 		}
 	}
 	if tt.completion != nil {
-		fmt.Fprintf(&b, "\n%s\n%s\n", section("✓ Hoàn thành", "", w), quote(mdWrap(tt.completion.Summary, w-2), "10"))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("Hoàn thành", "", w), quote(mdWrap(tt.completion.Summary, w-2), cOk))
 	}
 	if t.LastError != "" {
-		fmt.Fprintf(&b, "\n%s\n%s\n", section("✗ Lỗi", "", w), quote(errStyle.Render(wrap(t.LastError, w-2)), "9"))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("Lỗi", "", w), quote(errStyle.Render(wrap(t.LastError, w-2)), cErr))
 	}
 	if t.LastResult != "" && tt.pending == nil {
-		fmt.Fprintf(&b, "\n%s\n%s\n", section("Tin nhắn cuối của agent", "", w), quote(mdWrap(t.LastResult, w-2), "8"))
+		fmt.Fprintf(&b, "\n%s\n%s\n", section("Tin nhắn cuối của agent", "", w), quote(mdWrap(t.LastResult, w-2), cRule))
 	}
 	if acts := activity(m.d.Store.EventsPath(t.ID), 60); len(acts) > 0 {
 		if tt.showActivity {
@@ -323,9 +335,9 @@ func (m Model) tasksView() string {
 	for _, ln := range m.tasks.listLayout(all, rows) {
 		r := all[ln.row]
 		if r.task < 0 {
-			head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(r.header)
+			head := fg(cSub).Render(r.header)
 			if rest := cw - lipgloss.Width(head) - 1; rest > 0 {
-				head += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", rest))
+				head += " " + lipgloss.NewStyle().Foreground(clr(cRule)).Render(strings.Repeat("─", rest))
 			}
 			lines = append(lines, head)
 			continue
@@ -345,13 +357,13 @@ func (m Model) tasksView() string {
 	if vp := m.tasks.vp; vp.TotalLineCount() > vp.Height {
 		title += fmt.Sprintf(" · chi tiết %d%%", int(vp.ScrollPercent()*100))
 	}
-	lbox, rbox := boxStyle, boxStyle
+	// Hairline borders; the pane that takes the keys is one step brighter.
+	lbox, rbox := boxStyle.BorderForeground(clr(cSub)), boxStyle.BorderForeground(clr(cRule))
 	if m.tasks.focus {
-		rbox = rbox.BorderForeground(lipgloss.Color("12"))
-		lbox = lbox.BorderForeground(lipgloss.Color("8"))
+		lbox, rbox = rbox, lbox
 	}
-	left := lbox.Width(lw).Height(h).Render(dimStyle.Render(title) + "\n" + strings.Join(lines, "\n"))
-	right := rbox.Width(m.tasks.vp.Width + 2).Height(h).Render(m.tasks.vp.View())
+	left := lbox.Width(lw).Height(h).Render(fit(dimStyle.Render(title)+"\n"+strings.Join(lines, "\n"), lw-2, h))
+	right := rbox.Width(m.tasks.vp.Width + 2).Height(h).Render(fit(m.tasks.vp.View(), m.tasks.vp.Width, h))
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
@@ -527,7 +539,7 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if err != nil {
 					return infoMsg("mở pane herdr: " + err.Error())
 				}
-				return infoMsg("đã mở session của " + id + " ở pane " + pane + " — thoát claude để trả task cho daemon")
+				return infoMsg("đã mở session của " + id + " ở pane " + pane + "; thoát claude để trả task cho daemon")
 			}
 		}
 		cmd := exec.Command(argv[0], argv[1:]...)

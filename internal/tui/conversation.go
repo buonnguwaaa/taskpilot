@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,7 +28,7 @@ import (
 
 var levelLabels = map[string]string{"light": "Nhẹ", "standard": "Trung bình", "hard": "Khó", "hardest": "Rất khó"}
 
-var levelColors = map[string]string{"light": "10", "standard": "12", "hard": "208", "hardest": "9"}
+var levelColors = map[string]string{"light": cMuted, "standard": cSub, "hard": cText, "hardest": cErr}
 
 var kindLabels = map[string]string{
 	"feature": "Tính năng", "bugfix": "Sửa lỗi", "investigation": "Điều tra", "improvement": "Cải tiến",
@@ -56,7 +57,7 @@ func levelBadge(level string) string {
 	if !ok {
 		return dimStyle.Render("○ chưa đánh giá")
 	}
-	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(levelColors[level])).Render("● " + l)
+	return fg(levelColors[level]).Render("● " + l)
 }
 
 // levelDot is the one-cell level mark of the task list.
@@ -64,7 +65,7 @@ func levelDot(a *store.Assessment) string {
 	if a == nil || levelColors[a.Level] == "" {
 		return " "
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(levelColors[a.Level])).Render("●")
+	return lipgloss.NewStyle().Foreground(clr(levelColors[a.Level])).Render("●")
 }
 
 // assessmentLine is "Level ● Khó · Loại Sửa lỗi (agent: reason)".
@@ -109,9 +110,43 @@ type convItem struct {
 	text string
 }
 
+// convCache keeps the last event logs read, by path, size and time: the
+// detail is rebuilt every second, and a long log takes long to parse.
+var convCache = struct {
+	sync.Mutex
+	m map[string]convCached
+}{m: map[string]convCached{}}
+
+type convCached struct {
+	size int64
+	mod  time.Time
+	segs [][]convItem
+}
+
 // convSegments reads the event log split per run (each run starts with a
 // "system init" event).
 func convSegments(path string) [][]convItem {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	convCache.Lock()
+	c, ok := convCache.m[path]
+	convCache.Unlock()
+	if ok && c.size == fi.Size() && c.mod.Equal(fi.ModTime()) {
+		return c.segs
+	}
+	segs := readConvSegments(path)
+	convCache.Lock()
+	if len(convCache.m) >= 8 {
+		convCache.m = map[string]convCached{}
+	}
+	convCache.m[path] = convCached{fi.Size(), fi.ModTime(), segs}
+	convCache.Unlock()
+	return segs
+}
+
+func readConvSegments(path string) [][]convItem {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -198,9 +233,9 @@ func (m Model) conversation(t *store.Task, w int) string {
 	reqs, _ := st.Requests(t.ID)
 	decs, _ := st.Decisions(t.ID)
 	for _, r := range reqs {
-		head := "▶ Agent xin duyệt " + r.ID
+		head := "● Agent xin duyệt " + r.ID
 		if r.Gate == store.QuestionGate {
-			head = "❓ Agent hỏi bạn"
+			head = "● Agent hỏi bạn"
 		}
 		text := warnStyle.Render(head) + dimStyle.Render("  "+r.CreatedAt.Local().Format("02/01 15:04")) + "\n" + mdWrap(r.Summary, w)
 		for _, q := range r.Questions {
@@ -227,7 +262,7 @@ func (m Model) conversation(t *store.Task, w int) string {
 	}
 	msgs, _ := st.OperatorMessages(t.ID)
 	for _, msg := range msgs {
-		head := "✉ Bạn nhắn agent"
+		head := "→ Bạn nhắn agent"
 		if !msg.Consumed {
 			head += " (chưa gửi: agent nhận ở lượt chạy tới)"
 		}
@@ -236,7 +271,7 @@ func (m Model) conversation(t *store.Task, w int) string {
 	sort.SliceStable(ops, func(i, j int) bool { return ops[i].at.Before(ops[j].at) })
 
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("📋 Ticket") + "\n" + wrap(clipLines(t.Body, 25), w) + "\n")
+	b.WriteString(titleStyle.Render("Ticket") + "\n" + wrap(clipLines(t.Body, 25), w) + "\n")
 	next := 0 // the next operator event to place
 	flush := func(before time.Time) {
 		for next < len(ops) && (before.IsZero() || ops[next].at.Before(before)) {
@@ -282,7 +317,7 @@ func (m Model) conversation(t *store.Task, w int) string {
 				}
 				switch it.kind {
 				case "text":
-					b.WriteString(titleStyle.Render("🤖 Agent") + "\n" + mdWrap(it.text, w) + "\n")
+					b.WriteString(titleStyle.Render("Agent") + "\n" + mdWrap(it.text, w) + "\n")
 				case "tool":
 					tools++
 					if tools <= maxToolRun {

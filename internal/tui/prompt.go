@@ -67,7 +67,7 @@ func (m Model) onDraft(msg draftMsg) (tea.Model, tea.Cmd) {
 	if m.modal != nil || m.conf != nil {
 		// Don't replace what the operator is typing; "N" shows it later.
 		m.tasks.draft = &msg
-		m.msg = "Claude đã soạn xong task từ prompt — bấm N ở tab Tasks để xem"
+		m.msg = "Claude đã soạn xong task từ prompt: bấm N ở tab Tasks để xem"
 		return m, nil
 	}
 	m.tab = tabTasks
@@ -75,7 +75,7 @@ func (m Model) onDraft(msg draftMsg) (tea.Model, tea.Cmd) {
 		m.msg = "soạn task: " + msg.err.Error()
 		return m.promptTaskForm(msg.prompt, msg.err.Error())
 	}
-	hint := "Claude đã soạn từ prompt của bạn — kiểm tra rồi Ctrl+S để gửi."
+	hint := "Claude đã soạn từ prompt của bạn: kiểm tra rồi Ctrl+S để gửi."
 	if msg.draft.Note != "" {
 		hint = "Claude: " + msg.draft.Note + "\n" + hint
 	}

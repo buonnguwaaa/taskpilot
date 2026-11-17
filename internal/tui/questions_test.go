@@ -36,7 +36,7 @@ var storageQ = store.Question{Question: "Lưu thông tin trả góp ở đâu?",
 func TestQuickPickAnswersWithADigit(t *testing.T) {
 	m, st, r := questionTask(t, store.QuestionGate, []store.Question{storageQ})
 	v := m.View()
-	for _, want := range []string{"❓ Agent hỏi bạn", "1-3 chọn · 0 tự gõ", "1) Bảng mới", "(khuyến nghị) tách bạch", "3) Không lưu", "0) Khác"} {
+	for _, want := range []string{"Agent hỏi bạn", "1-3 chọn · 0 tự gõ", "1) Bảng mới", "(khuyến nghị) tách bạch", "3) Không lưu", "0) Khác"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("missing %q in:\n%s", want, v)
 		}

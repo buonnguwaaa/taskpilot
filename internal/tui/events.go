@@ -64,10 +64,10 @@ func summarizeEvent(line []byte) []string {
 	switch ev.Type {
 	case "system":
 		if ev.Subtype == "init" {
-			return []string{"● session started"}
+			return []string{"● bắt đầu session"}
 		}
 	case "result":
-		return []string{fmt.Sprintf("■ turn ended (%s, $%.2f)", ev.Subtype, ev.TotalCostUSD)}
+		return []string{fmt.Sprintf("■ kết thúc lượt (%s, $%.2f)", ev.Subtype, ev.TotalCostUSD)}
 	case "assistant", "user":
 		var blocks []contentBlock
 		if json.Unmarshal(ev.Message.Content, &blocks) != nil {
@@ -78,7 +78,7 @@ func summarizeEvent(line []byte) []string {
 			switch b.Type {
 			case "text":
 				if s := firstLine(b.Text); s != "" && ev.Type == "assistant" {
-					out = append(out, "💬 "+s)
+					out = append(out, "· "+s)
 				}
 			case "tool_use":
 				out = append(out, "→ "+b.Name+" "+briefInput(b.Input))

@@ -109,7 +109,7 @@ func (m Model) answerForm(t *store.Task, r *store.ApprovalRequest, approve bool)
 		}
 		f.addText("o"+strconv.Itoa(i), "Câu trả lời khác / bổ sung (không bắt buộc)", "", false)
 	}
-	f.addArea("note", "Ghi chú cho agent (không bắt buộc; @tệp hoặc Ctrl+O để đính kèm)", "", false)
+	f.addArea("note", "Ghi chú cho agent (không bắt buộc; @tệp, Ctrl+O hoặc Ctrl+V/Alt+V dán ảnh để đính kèm)", "", false)
 	m.modal = f
 	m.msg = "trả lời " + r.ID + " (Ctrl+S gửi)"
 	return m, f.start()

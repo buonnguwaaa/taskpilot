@@ -206,7 +206,7 @@ func TestApproveAndRejectFromTasksTab(t *testing.T) {
 	st.SaveTask(tk)
 	st.AddRequest(tk.ID, "plan", "Sửa ở bom-api", "chi tiết plan dài")
 	m.reloadTasks()
-	if v := m.View(); !strings.Contains(v, "Chờ bạn duyệt: plan-1") || !strings.Contains(v, "1 Tasks (1 cần bạn)") {
+	if v := m.View(); !strings.Contains(v, "Chờ bạn duyệt: plan-1") || !strings.Contains(v, "1 Tasks ● 1 cần bạn") {
 		t.Fatalf("view:\n%s", v)
 	}
 	m, _ = press(t, m, "x")
@@ -989,12 +989,12 @@ func TestWorkflowSteps(t *testing.T) {
 		prs     []*store.PullRequest
 		want    string
 	}{
-		"new":             {running, nil, nil, nil, nil, "●○○○○○"},
-		"plan waiting":    {&store.Task{State: store.StateAwaitApproval}, []*store.ApprovalRequest{req("plan-1", "plan")}, nil, req("plan-1", "plan"), nil, "⏸○○○○○"},
+		"new":             {running, nil, nil, nil, nil, "▸○○○○○"},
+		"plan waiting":    {&store.Task{State: store.StateAwaitApproval}, []*store.ApprovalRequest{req("plan-1", "plan")}, nil, req("plan-1", "plan"), nil, "●○○○○○"},
 		"plan rejected":   {running, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": no("plan-1")}, nil, nil, "↺○○○○○"},
-		"coding":          {running, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": ok("plan-1")}, nil, nil, "✓●○○○○"},
+		"coding":          {running, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": ok("plan-1")}, nil, nil, "✓▸○○○○"},
 		"question":        {&store.Task{State: store.StateAwaitApproval}, []*store.ApprovalRequest{req("plan-1", "plan"), req("q-1", store.QuestionGate)}, map[string]*store.Decision{"plan-1": ok("plan-1")}, req("q-1", store.QuestionGate), nil, "✓?○○○○"},
-		"opening PRs":     {running, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1")}, nil, nil, "✓✓✓●○○"},
+		"opening PRs":     {running, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1")}, nil, nil, "✓✓✓▸○○"},
 		"qc rejected":     {running, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr"), req("qc-1", "qc")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1"), "qc-1": no("qc-1")}, nil, pr, "✓✓✓✓↺○"},
 		"stopped":         {&store.Task{State: store.StateNeedsAttention}, []*store.ApprovalRequest{req("plan-1", "plan")}, map[string]*store.Decision{"plan-1": ok("plan-1")}, nil, nil, "✓✗○○○○"},
 		"done without qc": {&store.Task{State: store.StateDone}, []*store.ApprovalRequest{req("plan-1", "plan"), req("pr-1", "pr")}, map[string]*store.Decision{"plan-1": ok("plan-1"), "pr-1": ok("pr-1")}, nil, pr, "✓✓✓✓–✓"},

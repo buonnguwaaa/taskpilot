@@ -20,8 +20,12 @@ anything outside it is denied without asking. A denial covers that one command
 only: it does not mean Bash is unavailable, so keep using the allowed commands
 (the verify command, `git add`, `git commit`, ...). Change files with Edit and
 Write, never with shell redirection (`cat > file`, `sed -i`, `tee`). If a
-command you genuinely need is not allowed, say so in your gate request or final
-status instead of looking for a workaround.
+command you genuinely need is not allowed, do not look for a workaround: call
+`request_permission` with the narrowest rule (`Bash(curl *)`, never `Bash(*)`),
+the denied command and why, then end your turn. The operator allows it for
+the task or the project (`granted_tools` in `task_info`) and the session
+resumes; run the command again. If they refuse, find another way or report
+what is blocked.
 
 ## Scope: one project, one workspace
 

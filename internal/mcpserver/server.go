@@ -276,8 +276,10 @@ func (h *Handlers) TaskInfo() (string, error) {
 		"repos":         repos,
 		"context_files": proj.ContextFiles,
 		"allowed_tools": proj.AllowedToolList(),
+		"granted_tools": h.grantedView(t.ID, t.Project),
 		"tool_rules": "Only allowed_tools run; anything else is denied without asking. A denial applies to that one " +
-			"command, not to Bash as a whole: keep using the allowed commands. Change files with Edit/Write, never " +
+			"command, not to Bash as a whole: keep using the allowed commands. When a command you really need is denied, call " +
+			"request_permission (narrowest rule, the command, why) and end your turn; granted_tools lists what the operator allowed. Change files with Edit/Write, never " +
 			"with shell redirection (cat > file, sed -i, tee). Writes are only allowed inside the workspace.",
 		"gates":             gates,
 		"approval_history":  history,
@@ -1237,6 +1239,14 @@ func NewServer(h *Handlers) *mcp.Server {
 			"options each, recommended first; the operator picks quickly or writes another answer. After calling this, end your turn.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in AskOperatorIn) (*mcp.CallToolResult, any, error) {
 		return reply(h.AskOperator(in))
+	})
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "request_permission",
+		Description: "A command you need was denied because it is not in allowed_tools: ask the operator to allow it. " +
+			"Give the narrowest rule (Bash(curl *), not Bash(*)), the denied command and why. After calling this, end your turn; " +
+			"once allowed, run the command again.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in RequestPermissionIn) (*mcp.CallToolResult, any, error) {
+		return reply(h.RequestPermission(in))
 	})
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "complete_task",

@@ -99,10 +99,10 @@ type logsTab struct {
 
 // Special entries of the saved-search list.
 const (
-	itemGroups      = "⚠ Nhóm lỗi theo service"
-	itemInvestigate = "🔎 Điều tra sự cố…"
-	itemBuilder     = "✎ Tìm theo điều kiện…"
-	itemAsk         = "✨ Hỏi bằng lời (Claude viết SPL)…"
+	itemGroups      = "Nhóm lỗi theo service"
+	itemInvestigate = "Điều tra sự cố…"
+	itemBuilder     = "Tìm theo điều kiện…"
+	itemAsk         = "Hỏi bằng lời (Claude viết SPL)…"
 )
 
 func (m Model) logProjects() []string { return m.d.Config.LogProjects() }
@@ -207,12 +207,11 @@ func splitWindow(v string) (string, string) {
 
 // envLine is the first line of the Logs list box: which environment is shown.
 func (m Model) envLine() string {
-	prod := " Production · Splunk "
-	qc := " QC · Argo CD "
-	if m.logs.env == envQC {
-		return tabStyle.Render(prod) + " " + activeTabStyle.Render(qc) + dimStyle.Render("  e")
+	prod, qc := tabStyle.Render("Production · Splunk"), activeTabStyle.Render("QC · Argo CD")
+	if m.logs.env != envQC {
+		prod, qc = activeTabStyle.Render("Production · Splunk"), tabStyle.Render("QC · Argo CD")
 	}
-	return activeTabStyle.Render(prod) + " " + tabStyle.Render(qc) + dimStyle.Render("  e")
+	return " " + prod + "   " + qc + " " + dimStyle.Render("  e")
 }
 
 func (m Model) logsView() string {
@@ -269,7 +268,7 @@ func (m Model) prodView() string {
 	}
 	extra := ""
 	if pl.Filter == "" {
-		extra = quote(warnStyle.Render(wrap(fmt.Sprintf("Chưa có filter prod cho %s: đặt logs_production.filter trong config.", name), m.listWidth()-4)), "208")
+		extra = quote(warnStyle.Render(wrap(fmt.Sprintf("Chưa có filter prod cho %s: đặt logs_production.filter trong config.", name), m.listWidth()-4)), cAccent)
 	}
 	ps := m.logProjects()
 	return m.logsLeft(ps, m.logs.proj%len(ps), m.prodRows(), m.logs.cursor, m.logs.groupsFocus, extra)
@@ -623,8 +622,8 @@ func (m Model) onLogsResult(msg logsResultMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		var b strings.Builder
 		b.WriteString(section("✗ Lỗi", "", w) + "\n")
-		b.WriteString(quote(accentStyle.Render(wrap(msg.spl, w-2)), "12") + "\n")
-		b.WriteString(warnStyle.Render("◷ "+window) + "\n\n" + quote(errStyle.Render(wrap(msg.err.Error(), w-2)), "9") + "\n")
+		b.WriteString(quote(accentStyle.Render(wrap(msg.spl, w-2)), cRule) + "\n")
+		b.WriteString(dimStyle.Render("◷ "+window) + "\n\n" + quote(errStyle.Render(wrap(msg.err.Error(), w-2)), cErr) + "\n")
 		if errors.Is(msg.err, splunk.ErrUnauthorized) || errors.Is(msg.err, splunk.ErrNoCredentials) {
 			b.WriteString("\n" + warnStyle.Render("→ tab 4 Status, phím ") + keyCap("s") + warnStyle.Render(" để đăng nhập Splunk") + "\n")
 		}

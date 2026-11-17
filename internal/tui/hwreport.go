@@ -211,7 +211,7 @@ func (m Model) reportForm(t *store.Task) (tea.Model, tea.Cmd) {
 	f.hint = "Ghi thật lên Hasaki Work: tạo subtask dưới " + code + " (cùng dự án và sprint), giao cho bạn, ghi kết quả + giờ thực tế " +
 		"rồi đánh trạng thái cho SUBTASK. Task " + code + " không bị đổi." + agentTimeHint(m.d.Store, t) + draftNote(draftErr, draft != nil)
 	if l := m.tasks.hwLink; l != nil {
-		f.hint += fmt.Sprintf("\n⚠ Đã tạo %s cho task này lúc %s: gửi nữa sẽ tạo thêm một subtask.", l.Code, l.CreatedAt.Local().Format("02/01 15:04"))
+		f.hint += fmt.Sprintf("\nLưu ý: đã tạo %s cho task này lúc %s: gửi nữa sẽ tạo thêm một subtask.", l.Code, l.CreatedAt.Local().Format("02/01 15:04"))
 	}
 	if t.State != store.StateDone {
 		f.hint += "\nLưu ý: task trong taskpilot chưa xong (" + string(t.State) + ")."

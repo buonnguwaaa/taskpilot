@@ -16,37 +16,36 @@ import (
 type stateLook struct{ icon, label, color string }
 
 var stateLooks = map[store.State]stateLook{
-	store.StateQueued:         {"◷", "chờ chạy", "12"},
-	store.StatePreparing:      {"◌", "chuẩn bị", "12"},
-	store.StateRunning:        {"▶", "đang chạy", "14"},
-	store.StateAwaitApproval:  {"⏸", "chờ bạn duyệt", "11"},
-	store.StateNeedsAttention: {"⚠", "cần bạn", "208"},
-	store.StateDone:           {"✓", "xong", "10"},
-	store.StateFailed:         {"✗", "lỗi", "9"},
+	store.StateQueued:         {"○", "chờ chạy", cMuted},
+	store.StatePreparing:      {"◌", "chuẩn bị", cMuted},
+	store.StateRunning:        {"▸", "đang chạy", cBright},
+	store.StateAwaitApproval:  {"●", "chờ bạn duyệt", cAccent},
+	store.StateNeedsAttention: {"●", "cần bạn", cAccent},
+	store.StateDone:           {"✓", "xong", cOk},
+	store.StateFailed:         {"✗", "lỗi", cErr},
 }
 
 func lookOf(s store.State) stateLook {
 	if l, ok := stateLooks[s]; ok {
 		return l
 	}
-	return stateLook{"•", string(s), "7"}
+	return stateLook{"•", string(s), cSub}
 }
 
-// stateChip is the state as a colored pill, e.g. " ⚠ cần bạn ".
+// stateChip is the state as its mark and label in its color, e.g. "● cần bạn".
 func stateChip(s store.State) string {
 	l := lookOf(s)
-	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color(l.color)).
-		Render(" " + l.icon + " " + l.label + " ")
+	return fg(l.color).Render(l.icon + " " + l.label)
 }
 
 // section is a detail heading: the title, a hint, then a rule to the edge.
 func section(title, hint string, w int) string {
-	head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(title)
+	head := fg(cBright).Render(title)
 	if hint != "" {
 		head += " " + dimStyle.Render(hint)
 	}
 	if rest := w - lipgloss.Width(head) - 1; rest > 0 {
-		head += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", rest))
+		head += " " + lipgloss.NewStyle().Foreground(clr(cRule)).Render(strings.Repeat("─", rest))
 	}
 	return head
 }
@@ -54,7 +53,7 @@ func section(title, hint string, w int) string {
 // quote puts a colored bar in front of every line of s (already wrapped to
 // two columns less than the pane).
 func quote(s, color string) string {
-	bar := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render("▌") + " "
+	bar := lipgloss.NewStyle().Foreground(clr(color)).Render("▌") + " "
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
 		lines[i] = bar + l
@@ -63,7 +62,7 @@ func quote(s, color string) string {
 }
 
 // ruleStyle draws rules and section fills.
-var ruleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+var ruleStyle = lipgloss.NewStyle().Foreground(clr(cRule))
 
 // kvIndent lines up a value's continuation lines under it.
 const kvIndent = "           "
@@ -122,34 +121,34 @@ type part struct{ text, color string }
 func entryLines(selected, faded bool, w int, icon, iconColor, title string, parts []part) [2]string {
 	var bg lipgloss.TerminalColor = lipgloss.NoColor{}
 	if selected {
-		bg = lipgloss.Color("237")
+		bg = clr(cSurface)
 	}
 	st := func(color string) lipgloss.Style {
 		s := lipgloss.NewStyle().Background(bg)
 		if color != "" {
-			s = s.Foreground(lipgloss.Color(color))
+			s = s.Foreground(clr(color))
 		}
 		return s
 	}
 	bar := st("").Render("  ")
 	if selected {
-		bar = st("12").Render("▌ ")
+		bar = st(cSub).Render("▌ ")
 	}
-	tc := map[bool]string{true: "15", false: "7"}[selected]
+	tc := map[bool]string{true: cBright, false: cText}[selected]
 	if faded && !selected {
-		tc = "8"
+		tc = cMuted
 	}
-	line1 := bar + st(iconColor).Render(icon+" ") + st(tc).Bold(selected).Render(ansi.Truncate(title, max(1, w-4), "…"))
+	line1 := bar + st(iconColor).Render(icon+" ") + st(tc).Render(ansi.Truncate(title, max(1, w-4), "…"))
 
 	line2, used := bar+st("").Render("  "), 4
 	for i, p := range parts {
 		if i > 0 {
-			line2 += st("8").Render(" · ")
+			line2 += st(cMuted).Render(" · ")
 			used += 3
 		}
 		c := p.color
 		if c == "" {
-			c = "8"
+			c = cMuted
 		}
 		text := p.text
 		if i == len(parts)-1 {
@@ -164,7 +163,8 @@ func entryLines(selected, faded bool, w int, icon, iconColor, title string, part
 		}
 		return s
 	}
-	return [2]string{pad(line1), pad(line2)}
+	cut := func(s string) string { return ansi.Truncate(s, max(1, w), "…") }
+	return [2]string{pad(cut(line1)), pad(cut(line2))}
 }
 
 // taskEntry renders the lines of one task in the list, w columns wide.

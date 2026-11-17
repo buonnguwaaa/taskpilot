@@ -65,7 +65,7 @@ func (m Model) openWorkspace(t *store.Task) (tea.Model, tea.Cmd) {
 	}
 	m.msg = fmt.Sprintf("đã mở %s (%s) trong IDE", dir, strings.Join(repos, ", "))
 	if t.State == store.StateRunning || t.State == store.StatePreparing {
-		m.msg += " — agent đang chạy: chỉ xem, đừng sửa file lúc này"
+		m.msg += "; agent đang chạy: chỉ xem, đừng sửa file lúc này"
 	}
 	return m, nil
 }
@@ -136,6 +136,6 @@ func (m Model) reviewInClone(t *store.Task) (tea.Model, tea.Cmd) {
 				parts = append(parts, tg.repo+": đang xem "+tg.branch+" (detached)")
 			}
 		}
-		return infoMsg(strings.Join(parts, " · ") + " — W lần nữa: cập nhật / quay về nhánh cũ")
+		return infoMsg(strings.Join(parts, " · ") + " · W lần nữa: cập nhật / quay về nhánh cũ")
 	}
 }

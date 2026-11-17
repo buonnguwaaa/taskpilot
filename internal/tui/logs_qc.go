@@ -350,7 +350,7 @@ func (m Model) onQCSync(msg qcSyncMsg) (tea.Model, tea.Cmd) {
 		m.msg = "sync " + msg.app + ": " + msg.err.Error()
 		return m, nil
 	}
-	m.msg = "đã yêu cầu sync " + msg.app + " — đang tải lại trạng thái"
+	m.msg = "đã yêu cầu sync " + msg.app + "; đang tải lại trạng thái"
 	return m.loadQCApps()
 }
 
@@ -376,7 +376,7 @@ func (m *Model) refreshQC() {
 	sel := -1
 	switch {
 	case q.err != "":
-		b.WriteString(quote(errStyle.Render(wrap(q.err, w-2)), "9"))
+		b.WriteString(quote(errStyle.Render(wrap(q.err, w-2)), cErr))
 	case q.loading:
 		b.WriteString(dimStyle.Render("◌ Đang tải ứng dụng từ Argo CD…"))
 	case q.fetching:
@@ -399,18 +399,18 @@ func (m *Model) refreshQC() {
 			}
 			break
 		}
-		fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(app.Name))
-		fmt.Fprintf(&b, "%s%s%s\n\n", healthBadge(app.Health), dimStyle.Render("  ·  "), syncBadge(app.Sync))
+		fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(clr(cBright)).Render(app.Name))
+		fmt.Fprintf(&b, "%s%s%s\n\n", healthBadge(app.Health), dimStyle.Render(" · "), syncBadge(app.Sync))
 		fmt.Fprintf(&b, "%s\n", kv("namespace", app.Namespace))
 		fmt.Fprintf(&b, "%s\n", kv("nhánh", "⎇ "+app.TargetRevision))
 		fmt.Fprintf(&b, "%s\n", kv("revision", shortRev(app.Revision)))
 		if app.OperationPhase != "" {
 			phase := app.OperationPhase
-			c := map[string]string{"Succeeded": "10", "Failed": "9", "Error": "9", "Running": "12"}[phase]
+			c := map[string]string{"Succeeded": cOk, "Failed": cErr, "Error": cErr, "Running": cBright}[phase]
 			if c == "" {
-				c = "7"
+				c = cSub
 			}
-			line := lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(phase) + dimStyle.Render(" "+app.FinishedAt)
+			line := lipgloss.NewStyle().Foreground(clr(c)).Render(phase) + dimStyle.Render(" "+app.FinishedAt)
 			if msg := firstLine(app.OperationMsg); msg != "" {
 				line += "\n" + kvIndent + dimStyle.Render(wrap(msg, w-len(kvIndent)))
 			}
@@ -421,7 +421,7 @@ func (m *Model) refreshQC() {
 		}
 		b.WriteString("\n")
 		if q.logsFor != app.Name {
-			b.WriteString(quote(keyCap("Enter")+" xem log pod   "+keyCap("S")+" sync   "+keyCap("o")+" mở Argo CD", "12"))
+			b.WriteString(quote(keyCap("Enter")+" xem log pod   "+keyCap("S")+" sync   "+keyCap("o")+" mở Argo CD", cRule))
 			break
 		}
 		m.renderQCErrs(&b, w)
@@ -438,7 +438,7 @@ func (m *Model) refreshQC() {
 
 func (m *Model) renderQCErrs(b *strings.Builder, w int) {
 	for _, e := range m.logs.qc.errs {
-		b.WriteString(quote(warnStyle.Render(wrap("không đọc được log "+e, w-2)), "208") + "\n")
+		b.WriteString(quote(warnStyle.Render(wrap("không đọc được log "+e, w-2)), cAccent) + "\n")
 	}
 }
 
@@ -456,11 +456,11 @@ func (m *Model) renderQCEntries(b *strings.Builder, title string, w int) {
 }
 
 func healthBadge(h string) string {
-	c := map[string]string{"Healthy": "10", "Progressing": "12", "Degraded": "9", "Missing": "208", "Suspended": "8"}[h]
+	c := map[string]string{"Healthy": cOk, "Progressing": cSub, "Degraded": cErr, "Missing": cAccent, "Suspended": cMuted}[h]
 	if c == "" {
-		c = "8"
+		c = cMuted
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(healthIcon(h) + " " + h)
+	return lipgloss.NewStyle().Foreground(clr(c)).Render(healthIcon(h) + " " + h)
 }
 
 func healthIcon(h string) string {
@@ -478,11 +478,11 @@ func syncIcon(s string) string {
 }
 
 func syncBadge(s string) string {
-	c := map[string]string{"Synced": "10", "OutOfSync": "11"}[s]
+	c := map[string]string{"Synced": cOk, "OutOfSync": cAccent}[s]
 	if c == "" {
-		c = "8"
+		c = cMuted
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(syncIcon(s) + " " + s)
+	return lipgloss.NewStyle().Foreground(clr(c)).Render(syncIcon(s) + " " + s)
 }
 
 func padBadge(styled, plain string, w int) string {

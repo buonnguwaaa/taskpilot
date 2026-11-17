@@ -145,7 +145,7 @@ func (m Model) qcBuilderForm() (tea.Model, tea.Cmd) {
 	return m, f.start()
 }
 
-// qcSymptomForm is "🔎 Điều tra sự cố" on QC: a reported symptom, no log yet.
+// qcSymptomForm is "Điều tra sự cố" on QC: a reported symptom, no log yet.
 func (m Model) qcSymptomForm() (tea.Model, tea.Cmd) {
 	project := m.qcProject()
 	if project == "" {
@@ -259,7 +259,7 @@ func (m Model) qcInvestigate() (tea.Model, tea.Cmd) {
 		in.Symptom = fmt.Sprintf("%s: %d dòng (%d dòng lỗi) — xem dòng mẫu bên dưới.", q.last.describe(project), len(q.entries), len(errs))
 		from = "các dòng log đang xem"
 	default:
-		m.msg = "chưa có log nào đang xem: chọn app rồi Enter, g (nhóm lỗi), / (tìm) — hoặc mục 🔎 để mô tả triệu chứng"
+		m.msg = "chưa có log nào đang xem: chọn app rồi Enter, g (nhóm lỗi), / (tìm), hoặc mục Điều tra sự cố để mô tả triệu chứng"
 		return m, nil
 	}
 	oldest := time.Time{}

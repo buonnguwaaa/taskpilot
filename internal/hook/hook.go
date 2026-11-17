@@ -71,6 +71,9 @@ type Options struct {
 	// of a run without a graph query is turned back once with a reminder to
 	// ask the graph (the next search goes through).
 	Graphify bool
+	// Allowed is the allowlist the agent started with (the project's); with
+	// the operator's grants it decides what a grant covers.
+	Allowed []string
 }
 
 // RunWith is Run with options.
@@ -107,6 +110,19 @@ func RunWith(r io.Reader, w io.Writer, st *store.Store, taskID string, pol *gate
 				tool = "graphify"
 			}
 			return deny(w, format, graphifyReminder(tool))
+		}
+		if t, err := st.LoadTask(taskID); err == nil {
+			if gs, _ := st.Grants(taskID, t.Project); len(gs) > 0 {
+				rules := append([]string{}, opts.Allowed...)
+				var names []string
+				for _, g := range gs {
+					rules = append(rules, g.Rule)
+					names = append(names, g.Rule)
+				}
+				if covered(in.ToolName, in.ToolInput, rules) && !covered(in.ToolName, in.ToolInput, opts.Allowed) {
+					return grantAllow(w, format, strings.Join(names, ", "))
+				}
+			}
 		}
 		return allow(w, format)
 	}

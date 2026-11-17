@@ -40,14 +40,14 @@ func (m Model) logsLeft(projects []string, active int, rows []logRow, cursor int
 	var tabs []string
 	for i, p := range projects {
 		if i == active {
-			tabs = append(tabs, activeTabStyle.Render(" "+p+" "))
+			tabs = append(tabs, " "+activeTabStyle.Render(p)+" ")
 		} else {
 			tabs = append(tabs, tabStyle.Render(" "+p+" "))
 		}
 	}
 	b.WriteString(label("Dự án") + strings.Join(tabs, " ") + dimStyle.Render("  ←/→") + "\n")
-	b.WriteString(label("Thời gian") + warnStyle.Render(" ◷ "+m.presetLabel()) + dimStyle.Render("  t/T đổi") + "\n")
-	b.WriteString(ruleStyle.Render(strings.Repeat("─", max(4, lw-2))) + "\n")
+	b.WriteString(label("Thời gian") + accentStyle.Render(" ◷ "+m.presetLabel()) + dimStyle.Render("  t/T đổi") + "\n")
+	b.WriteString("\n") // the first section title draws the rule
 	visible := m.listRows() - logsHeaderRows - 4
 	start := m.logsScroll(rows, cursor, visible)
 	note := ""
@@ -59,14 +59,14 @@ func (m Model) logsLeft(projects []string, active int, rows []logRow, cursor int
 			// A section title: bold, the rest of the line filled.
 			t := truncate(strings.TrimPrefix(r.plain, "── "), cw-2)
 			fill := max(0, cw-1-lipgloss.Width(t))
-			b.WriteString(accentStyle.Bold(true).Render(t) + " " + ruleStyle.Render(strings.Repeat("─", fill)) + "\n")
+			b.WriteString(fg(cBright).Render(t) + " " + ruleStyle.Render(strings.Repeat("─", fill)) + "\n")
 		case r.item < 0:
 			b.WriteString(dimStyle.Render(truncate(r.plain, cw)) + "\n")
 		case r.item == cursor && !dimCursor:
-			sel := lipgloss.NewStyle().Background(lipgloss.Color("237"))
+			sel := lipgloss.NewStyle().Background(clr(cSurface))
 			text := truncate(r.plain, cw-2)
-			b.WriteString(sel.Foreground(lipgloss.Color("12")).Render("▌ ") +
-				sel.Bold(true).Foreground(lipgloss.Color("15")).Render(text+strings.Repeat(" ", max(0, cw-2-lipgloss.Width(text)))) + "\n")
+			b.WriteString(sel.Foreground(clr(cSub)).Render("▌ ") +
+				sel.Foreground(clr(cBright)).Render(text+strings.Repeat(" ", max(0, cw-2-lipgloss.Width(text)))) + "\n")
 			note = r.note
 		case r.item == cursor:
 			b.WriteString(accentStyle.Render("› "+truncate(r.plain, cw-2)) + "\n")
@@ -77,13 +77,13 @@ func (m Model) logsLeft(projects []string, active int, rows []logRow, cursor int
 		}
 	}
 	if note != "" {
-		b.WriteString("\n" + quote(dimStyle.Render(wrap(note, cw-2)), "238") + "\n")
+		b.WriteString("\n" + quote(dimStyle.Render(wrap(note, cw-2)), cRule) + "\n")
 	}
 	if extra != "" {
 		b.WriteString("\n" + extra)
 	}
-	left := boxStyle.Width(lw).Height(h).Render(b.String())
-	right := boxStyle.Width(m.logs.vp.Width + 2).Height(h).Render(m.logs.vp.View())
+	left := boxStyle.Width(lw).Height(h).Render(fit(b.String(), lw-2, h))
+	right := boxStyle.Width(m.logs.vp.Width + 2).Height(h).Render(fit(m.logs.vp.View(), m.logs.vp.Width, h))
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
@@ -154,10 +154,10 @@ func renderGroupList(b *strings.Builder, title string, gs []splunk.ErrorGroup, c
 	}
 	b.WriteString(section(title, "", w) + "\n")
 	b.WriteString(titleStyle.Render(fmt.Sprint(len(gs))) + dimStyle.Render(" nhóm · ") +
-		errStyle.Bold(true).Render(fmt.Sprint(total)) + dimStyle.Render(" lỗi") + "\n")
+		errStyle.Render(fmt.Sprint(total)) + dimStyle.Render(" lỗi") + "\n")
 	b.WriteString(dimStyle.Render(wrap(keys, w)) + "\n\n")
 	if len(gs) == 0 {
-		b.WriteString(quote(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓ Không có lỗi nào trong khoảng thời gian này."), "10"))
+		b.WriteString(quote(lipgloss.NewStyle().Foreground(clr(cOk)).Render("✓ Không có lỗi nào trong khoảng thời gian này."), cOk))
 		return 0
 	}
 	const svcW = 22
@@ -171,24 +171,24 @@ func renderGroupList(b *strings.Builder, title string, gs []splunk.ErrorGroup, c
 		selected := i == cursor && focus
 		var bg lipgloss.TerminalColor = lipgloss.NoColor{}
 		if selected {
-			bg = lipgloss.Color("237")
+			bg = clr(cSurface)
 		}
 		st := func(c string) lipgloss.Style {
 			s := lipgloss.NewStyle().Background(bg)
 			if c != "" {
-				s = s.Foreground(lipgloss.Color(c))
+				s = s.Foreground(clr(c))
 			}
 			return s
 		}
 		bar := st("").Render("  ")
 		if selected {
 			sel = strings.Count(b.String(), "\n")
-			bar = st("12").Render("▌ ")
+			bar = st(cSub).Render("▌ ")
 		}
 		sig := truncate(strings.TrimSpace(g.Signature), max(1, w-2-6-2-svcW-1-5-2))
-		row := bar + st(countColor(g.Count)).Bold(true).Render(fmt.Sprintf("%6d", g.Count)) + st("").Render("  ") +
-			st("14").Render(fmt.Sprintf("%-*s", svcW, truncate(g.Service, svcW))) + st("").Render(" ") +
-			st("8").Render(last) + st("").Render("  ") + st(map[bool]string{true: "15", false: "7"}[selected]).Render(sig)
+		row := bar + st(countColor(g.Count)).Render(fmt.Sprintf("%6d", g.Count)) + st("").Render("  ") +
+			st(cSub).Render(fmt.Sprintf("%-*s", svcW, truncate(g.Service, svcW))) + st("").Render(" ") +
+			st(cMuted).Render(last) + st("").Render("  ") + st(map[bool]string{true: cBright, false: cText}[selected]).Render(sig)
 		if n := w - lipgloss.Width(row); n > 0 {
 			row += st("").Render(strings.Repeat(" ", n))
 		}
@@ -205,11 +205,11 @@ func renderGroupList(b *strings.Builder, title string, gs []splunk.ErrorGroup, c
 func countColor(n int) string {
 	switch {
 	case n >= 100:
-		return "9"
+		return cErr
 	case n >= 10:
-		return "208"
+		return cAccent
 	}
-	return "11"
+	return cSub
 }
 
 // groupDetail draws one error group: when, how often, a sample, its fields
@@ -220,7 +220,7 @@ func groupDetail(b *strings.Builder, g splunk.ErrorGroup, w int) {
 		span = fmt.Sprintf(" · %s → %s", g.First.Local().Format("02/01 15:04"), g.Last.Local().Format("02/01 15:04"))
 	}
 	b.WriteString(section(g.Service, fmt.Sprintf("%d lần%s", g.Count, span), w) + "\n")
-	b.WriteString(quote(errStyle.Render(wrap(g.Sample, w-2)), "9") + "\n")
+	b.WriteString(quote(errStyle.Render(wrap(g.Sample, w-2)), cErr) + "\n")
 	for _, f := range [][2]string{{"caller", g.Caller}, {"prefix", g.Prefix}, {"request_id", g.RequestID}} {
 		if f[1] != "" {
 			b.WriteString(kv(f[0], f[1]) + "\n")
@@ -228,7 +228,7 @@ func groupDetail(b *strings.Builder, g splunk.ErrorGroup, w int) {
 	}
 	if st := strings.TrimSpace(g.Stacktrace); st != "" {
 		lines := strings.Split(st, "\n")
-		b.WriteString(dimStyle.Render("stacktrace") + "\n" + quote(dimStyle.Render(strings.Join(lines[:min(6, len(lines))], "\n")), "238") + "\n")
+		b.WriteString(dimStyle.Render("stacktrace") + "\n" + quote(dimStyle.Render(strings.Join(lines[:min(6, len(lines))], "\n")), cRule) + "\n")
 	}
 }
 
@@ -236,16 +236,16 @@ func groupDetail(b *strings.Builder, g splunk.ErrorGroup, w int) {
 // environments.
 func renderResultHeader(b *strings.Builder, title, window string, n int, took time.Duration, limit bool, keys string, w int) {
 	b.WriteString(section("Kết quả", "", w) + "\n")
-	b.WriteString(quote(accentStyle.Render(wrap(title, w-2)), "12") + "\n")
+	b.WriteString(quote(accentStyle.Render(wrap(title, w-2)), cRule) + "\n")
 	info := titleStyle.Render(fmt.Sprint(n)) + dimStyle.Render(" dòng")
 	if window != "" {
-		info = warnStyle.Render("◷ "+window) + dimStyle.Render(" · ") + info
+		info = dimStyle.Render("◷ "+window) + dimStyle.Render(" · ") + info
 	}
 	if took > 0 {
 		info += dimStyle.Render(fmt.Sprintf(" · %.1fs", took.Seconds()))
 	}
 	if limit {
-		info += " " + warnStyle.Render("⚠ đã đạt giới hạn: thu hẹp tìm kiếm")
+		info += " " + warnStyle.Render("đã đạt giới hạn: thu hẹp tìm kiếm")
 	}
 	b.WriteString(info + "\n" + dimStyle.Render(wrap(keys, w)) + "\n\n")
 	if n == 0 {
@@ -256,7 +256,7 @@ func renderResultHeader(b *strings.Builder, title, window string, n int, took ti
 // logLineRe splits a formatted log line: "01-02 15:04:05 LEVEL service message".
 var logLineRe = regexp.MustCompile(`^(\d\d-\d\d \d\d:\d\d:\d\d) ([A-Z]+ *) (\S+ *) (.*)$`)
 
-var levelColors256 = map[string]string{"ERROR": "9", "FATAL": "9", "PANIC": "9", "DPANI": "9", "DPANIC": "9", "WARN": "208", "WARNING": "208", "INFO": "12", "DEBUG": "8"}
+var levelColors256 = map[string]string{"ERROR": cErr, "FATAL": cErr, "PANIC": cErr, "DPANI": cErr, "DPANIC": cErr, "WARN": cAccent, "WARNING": cAccent, "INFO": cSub, "DEBUG": cMuted}
 
 // colorLogLine colors a formatted log line: the time dim, the level by its
 // color, the service, the message red on errors.
@@ -274,17 +274,17 @@ func colorLogLine(l string) string {
 	level := strings.TrimSpace(p[2])
 	c := levelColors256[level]
 	if c == "" {
-		c = "7"
+		c = cSub
 	}
 	msg := p[4]
 	switch c {
-	case "9":
+	case cErr:
 		msg = errStyle.Render(msg)
-	case "208":
-		msg = lipgloss.NewStyle().Foreground(lipgloss.Color("223")).Render(msg)
+	case cAccent:
+		msg = lipgloss.NewStyle().Foreground(clr(cText)).Render(msg)
 	}
-	return dimStyle.Render(p[1]) + " " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(c)).Render(p[2]) + " " +
-		lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(p[3]) + " " + msg
+	return dimStyle.Render(p[1]) + " " + fg(c).Render(p[2]) + " " +
+		lipgloss.NewStyle().Foreground(clr(cSub)).Render(p[3]) + " " + msg
 }
 
 // logsIntro is the help shown before the first search: a line, then keys.

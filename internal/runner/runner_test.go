@@ -234,3 +234,9 @@ func TestGraphifyNoteInEveryRun(t *testing.T) {
 		t.Fatal("a project without graphs gets no note")
 	}
 }
+
+func TestSummarizeAgent(t *testing.T) {
+	if s := summarize([]byte(`{"subagent_type":"taskpilot:reviewer","description":"review diff","prompt":"…"}`)); s != "taskpilot:reviewer review diff" {
+		t.Fatalf("summary = %q", s)
+	}
+}

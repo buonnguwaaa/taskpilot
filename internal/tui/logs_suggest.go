@@ -17,7 +17,7 @@ import (
 // one row (Enter/space opens it); n, f, x and z act on the whole flow, or on
 // one group when the cursor is on it.
 
-const itemSuggest = "🔔 Đề xuất sửa lỗi"
+const itemSuggest = "Đề xuất sửa lỗi"
 
 const suggestKeys = "↑↓ chọn · Enter mở luồng / xem log · n điều tra · f tạo task sửa · x bỏ qua hẳn · z ẩn 7 ngày · esc về danh sách"
 

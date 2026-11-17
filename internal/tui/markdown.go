@@ -38,6 +38,16 @@ func mdStyle() glamour.TermRendererOption {
 	for _, h := range []*string{&st.H2.Prefix, &st.H3.Prefix, &st.H4.Prefix, &st.H5.Prefix, &st.H6.Prefix} {
 		*h = ""
 	}
+	// The palette's dark values (palette.go): headings bright instead of
+	// blue, inline code on a surface step instead of red on red, links muted.
+	tone := func(c string) *string { return &c }
+	dark := func(token string) *string { return tone(palette[token].Dark) }
+	st.Document.Color = dark(cText)
+	st.Heading.Color = dark(cBright)
+	st.H1.Color, st.H1.BackgroundColor = dark(cBright), nil
+	st.Code.Color, st.Code.BackgroundColor = dark(cText), dark(cSurface)
+	st.Link.Color, st.LinkText.Color = dark(cSub), dark(cBright)
+	st.HorizontalRule.Color = dark(cRule)
 	return glamour.WithStyles(st)
 }
 

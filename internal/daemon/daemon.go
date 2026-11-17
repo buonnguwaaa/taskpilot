@@ -283,6 +283,15 @@ func (d *Daemon) advance(t *store.Task) error {
 					"Take this into account and continue; ask again (with better options) only if you really cannot proceed.", req.ID, comment)
 			}
 		}
+		if rule, err := d.Store.PermissionRule(t.ID, req.ID); err != nil {
+			return err
+		} else if rule != "" {
+			prompt, err := d.applyPermission(t, rule, dec)
+			if err != nil {
+				return err
+			}
+			t.NextPrompt = prompt
+		}
 		t.NextTrigger = map[bool]string{true: "approval", false: "rejection"}[dec.Approved]
 		t.Transition(store.StateQueued, fmt.Sprintf("%s %s", strings.ToLower(verdict), req.ID))
 		return d.Store.SaveTask(t)

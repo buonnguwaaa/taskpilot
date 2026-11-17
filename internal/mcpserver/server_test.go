@@ -767,3 +767,25 @@ func TestTestFiles(t *testing.T) {
 		t.Fatalf("test files = %v", got)
 	}
 }
+
+func TestRequestPermission(t *testing.T) {
+	st, _ := store.New(t.TempDir())
+	tk := &store.Task{ID: "mock-perm", Project: "bom"}
+	tk.Transition(store.StateRunning, "")
+	st.SaveTask(tk)
+	h := &Handlers{Store: st, Config: &config.Config{Projects: map[string]config.Project{"bom": {Name: "BOM"}}}, TaskID: "mock-perm"}
+	if _, err := h.RequestPermission(RequestPermissionIn{Rule: "Bash(*)", Reason: "x"}); err == nil {
+		t.Fatal("Bash(*) is too broad")
+	}
+	out, err := h.RequestPermission(RequestPermissionIn{Rule: "Bash(curl *)", Command: "curl -s https://qc/api", Reason: "gọi API QC để kiểm tra"})
+	if err != nil || !strings.Contains(out, "End your turn") {
+		t.Fatalf("%q %v", out, err)
+	}
+	p, _ := st.PendingRequest("mock-perm")
+	if p == nil || p.Gate != store.QuestionGate || len(p.Questions) != 1 || len(p.Questions[0].Options) != 3 {
+		t.Fatalf("pending = %+v", p)
+	}
+	if rule, _ := st.PermissionRule("mock-perm", p.ID); rule != "Bash(curl *)" {
+		t.Fatalf("rule = %q", rule)
+	}
+}

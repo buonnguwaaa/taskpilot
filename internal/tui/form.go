@@ -84,6 +84,7 @@ func (f *form) addText(key, label, initial string, required bool) *form {
 func (f *form) addArea(key, label, initial string, required bool) *form {
 	ta := textarea.New()
 	ta.CharLimit = 20000
+	ta.MaxHeight = 0 // no line limit (the default keeps 99 lines); long pastes go to a file (paste.go)
 	ta.ShowLineNumbers = false
 	ta.SetHeight(6)
 	ta.SetValue(initial)
@@ -291,9 +292,9 @@ func (f *form) view(width int) string {
 			opts := fl.options(f)
 			marked := make([]option, len(opts))
 			for j, o := range opts {
-				box := "☐ "
+				box := "[ ] "
 				if fl.checked[j] {
-					box = "☑ "
+					box = "[x] "
 				}
 				marked[j] = option{Label: box + o.Label, Value: o.Value}
 			}
@@ -315,7 +316,7 @@ func (f *form) view(width int) string {
 		help += " · Space: đánh dấu"
 	}
 	if fl := f.fields[f.focus]; fl.kind == fieldText || fl.kind == fieldArea {
-		help += " · Ctrl+O: đính kèm tệp (hoặc gõ @đường/dẫn)"
+		help += " · Ctrl+O: đính kèm tệp (hoặc gõ @đường/dẫn) · Ctrl+V/Alt+V: dán ảnh/tệp từ clipboard"
 	}
 	b.WriteString(dimStyle.Render(help))
 	return modalStyle.Width(w).Render(b.String())

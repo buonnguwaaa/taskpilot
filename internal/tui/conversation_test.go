@@ -78,7 +78,7 @@ func TestTaskDetailScrollChatAndAssessment(t *testing.T) {
 	// t: the conversation, at its end.
 	m, _ = press(t, m, "t")
 	body := ansi.Strip(m.tasks.lastBody)
-	for _, want := range []string{"Lượt 1 · bắt đầu", "Mình đã đọc ticket", "→ Bash rg timeout", "✉ Bạn nhắn agent", "dùng retry có backoff",
+	for _, want := range []string{"Lượt 1 · bắt đầu", "Mình đã đọc ticket", "→ Bash rg timeout", "→ Bạn nhắn agent", "dùng retry có backoff",
 		"Lượt 2 · sau tin nhắn của bạn", "Đã sửa theo góp ý của bạn", "opus/high"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("conversation lacks %q:\n%s", want, body)

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // urlRe matches the URLs worth making clickable. Trailing punctuation that
@@ -239,4 +241,33 @@ outer:
 		return i
 	}
 	return -1
+}
+
+// linkAt returns the URL of the hyperlink (OSC 8) drawn at column x of a
+// rendered line, or "". The TUI captures the mouse, so a click on a link
+// reaches the TUI instead of the terminal: the TUI opens it itself.
+func linkAt(line string, x int) string {
+	col, url := 0, ""
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b && i+1 < len(line) {
+			j := skipEscape(line, i)
+			if line[i+1] == ']' && strings.HasPrefix(line[i:], "\x1b]8;") {
+				body := strings.TrimSuffix(strings.TrimSuffix(line[i+4:j], "\\"), "\x1b")
+				body = strings.TrimSuffix(body, "\x07")
+				if _, u, ok := strings.Cut(body, ";"); ok {
+					url = u
+				}
+			}
+			i = j
+			continue
+		}
+		r, n := utf8.DecodeRuneInString(line[i:])
+		w := ansi.StringWidth(string(r))
+		if x >= col && x < col+max(w, 1) && w > 0 {
+			return url
+		}
+		col += w
+		i += n
+	}
+	return ""
 }

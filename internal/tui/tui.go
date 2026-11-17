@@ -82,6 +82,10 @@ type Deps struct {
 	AuthStatus func() []string
 	OpenURL    func(string) error
 	Copy       func(string) error
+	// PasteFiles reads an image or files from the clipboard (Alt+V in a form).
+	PasteFiles func(ctx context.Context, dir string) ([]string, error)
+	// PasteText reads the clipboard's text (Ctrl+V in a form when it holds no image).
+	PasteText func(ctx context.Context) (string, error)
 	// OpenEditor opens a directory in the operator's IDE (key w).
 	OpenEditor func(dir string) error
 	// Draft turns a free-form prompt into a ticket draft (nil: "N" is unavailable).
@@ -143,8 +147,12 @@ type Model struct {
 	// mouseOff hands the mouse back to the terminal (F2), so text can be
 	// selected and copied; clicks and the wheel then do nothing in the TUI.
 	mouseOff bool
+	zoom     bool      // the detail pane fills the screen (F3, zoom.go)
+	sel      selection // a mouse selection inside one pane (selection.go)
 	prefs    uiPrefs
 	dragging bool // the panel divider is being dragged (split.go)
+	dragFrom int  // the column the drag started at
+	dragX    int  // where the divider is being dragged to (drawn as a guide)
 
 	width, height int
 	tab           tabID
@@ -175,6 +183,12 @@ func New(d Deps) Model {
 	}
 	if d.Copy == nil {
 		d.Copy = desktop.Copy
+	}
+	if d.PasteFiles == nil {
+		d.PasteFiles = desktop.PasteFiles
+	}
+	if d.PasteText == nil {
+		d.PasteText = desktop.PasteText
 	}
 	if d.OpenEditor == nil {
 		editor := ""
@@ -219,6 +233,23 @@ func (m *Model) refreshBanner() {
 	}
 }
 
+// bodyView is the current tab between the header and the footer.
+func (m Model) bodyView() string {
+	switch {
+	case m.zoom && m.tab != tabStatus:
+		return m.zoomView()
+	case m.tab == tabTasks:
+		return m.tasksView()
+	case m.tab == tabHasaki:
+		return m.hwView()
+	case m.tab == tabLogs:
+		return m.logsView()
+	case m.tab == tabStatus:
+		return lipgloss.NewStyle().Width(m.width).Height(m.stVP.Height).Render(m.stVP.View()) // the cards have their own frames
+	}
+	return ""
+}
+
 // ---- layout ---------------------------------------------------------------
 
 func (m Model) innerHeight() int { return max(3, m.height-4) } // header + footer + box borders
@@ -232,6 +263,11 @@ const listTop = 3
 func (m *Model) resize() {
 	dw := max(20, m.width-m.listWidth()-6)
 	h := m.innerHeight()
+	if m.zoom {
+		// The detail pane alone, without frame: a terminal selection then
+		// takes only its text (zoom.go).
+		dw, h = max(20, m.width-1), h+2
+	}
 	m.tasks.vp.Width, m.tasks.vp.Height = dw, h
 	m.hw.vp.Width, m.hw.vp.Height = dw, h
 	m.logs.vp.Width, m.logs.vp.Height = dw, h
@@ -252,10 +288,16 @@ func (m *Model) resize() {
 	} else {
 		m.refreshQC()
 	}
-	m.stVP.Width, m.stVP.Height = max(20, m.width-1), h+2
+	sw, sh := max(20, m.width-1), h+2
+	statusChanged := sw != m.stVP.Width || sh != m.stVP.Height
+	m.stVP.Width, m.stVP.Height = sw, sh
 	m.refreshTaskDetail(true)
 	m.refreshHWDetail()
-	m.refreshStatus()
+	if statusChanged {
+		// Status takes the whole width: the divider does not move it, and it
+		// is slow to build (it reads the runs' logs).
+		m.refreshStatus()
+	}
 }
 
 // tabAt maps a header x position to a tab.
@@ -275,15 +317,42 @@ func (m Model) tabLabel(t tabID) string {
 	label := fmt.Sprintf(" %d %s ", int(t)+1, tabNames[t])
 	if t == tabLogs {
 		if n := m.logs.suggestions; n > 0 {
-			label = fmt.Sprintf(" 3 Logs (%d đề xuất) ", n)
+			label = fmt.Sprintf(" 3 Logs · %d đề xuất ", n)
 		}
 	}
 	if t == tabTasks {
 		if n := m.tasks.needsYou; n > 0 {
-			label = fmt.Sprintf(" 1 Tasks (%d cần bạn) ", n)
+			label = fmt.Sprintf(" 1 Tasks ● %d cần bạn ", n)
 		}
 	}
 	return label
+}
+
+// tabView renders a tab label: the number muted, the name bright and
+// underlined when active, a count after it (amber when tasks wait on you).
+// It is as wide as tabLabel, which the mouse hit test measures.
+func (m Model) tabView(t tabID) string {
+	label := strings.TrimSpace(m.tabLabel(t))
+	num, rest, _ := strings.Cut(label, " ")
+	name, extra := rest, ""
+	for _, sep := range []string{" ● ", " · "} {
+		if i := strings.Index(rest, sep); i >= 0 {
+			name, extra = rest[:i], rest[i:]
+			break
+		}
+	}
+	nameStyle := tabStyle
+	if t == m.tab {
+		nameStyle = activeTabStyle
+	}
+	out := " " + dimStyle.Render(num) + " " + nameStyle.Render(name)
+	switch {
+	case strings.HasPrefix(extra, " ● "):
+		out += " " + warnStyle.Render(strings.TrimPrefix(extra, " "))
+	case extra != "":
+		out += dimStyle.Render(extra)
+	}
+	return out + " "
 }
 
 // ---- update ---------------------------------------------------------------
@@ -296,9 +365,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 
+	case clipPastedMsg:
+		return m.onClipPasted(msg)
 	case infoMsg:
 		m.msg = string(msg)
 		m.reloadTasks()
+		m.refreshHWDetail()
 		return m, nil
 	case qcResultMsg:
 		return m.onQCResult(msg)
@@ -402,6 +474,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.sel = selection{} // a key press ends a mouse selection
 	// Overlays first, top-most wins.
 	if m.conf != nil {
 		switch k.String() {
@@ -423,6 +496,13 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.output.vp, cmd = m.output.vp.Update(k)
 		return m, cmd
+	}
+	if m.modal != nil && k.Paste && m.modal.picker == nil {
+		// A paste from the terminal (Ctrl+Shift+V, right click) arrives whole.
+		return m.insertPaste(string(k.Runes)), nil
+	}
+	if m.modal != nil && (k.String() == "alt+v" || k.String() == "ctrl+v") && m.modal.picker == nil {
+		return m.pasteIntoForm()
 	}
 	if m.modal != nil {
 		cmd, done := m.modal.update(k)
@@ -451,6 +531,10 @@ func (m Model) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch k.String() {
+	case "f3":
+		return m.toggleZoom(), nil
+	case "y":
+		return m.copyDetail(), nil
 	case "f2":
 		m.mouseOff = !m.mouseOff
 		if m.mouseOff {
@@ -550,6 +634,18 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	if m.modal != nil || m.conf != nil || m.palette {
+		return m, nil
+	}
+	if mm, cmd, ok := m.onSelect(ev); ok {
+		return mm, cmd
+	} else {
+		m = mm
+	}
+	if m.zoom && m.tab != tabStatus && ev.Y > 0 {
+		// One pane: the wheel scrolls it, clicks do nothing (no list).
+		if ev.Button == tea.MouseButtonWheelUp || ev.Button == tea.MouseButtonWheelDown {
+			m.zoomScroll(ev.Button == tea.MouseButtonWheelUp)
+		}
 		return m, nil
 	}
 	if mm, ok := m.onDividerDrag(ev); ok {
@@ -773,20 +869,7 @@ func splitArgs(s string) []string {
 
 // View implements tea.Model.
 func (m Model) View() string {
-	header := m.headerView()
-	var body string
-	switch m.tab {
-	case tabTasks:
-		body = m.tasksView()
-	case tabHasaki:
-		body = m.hwView()
-	case tabLogs:
-		body = m.logsView()
-	case tabStatus:
-		body = lipgloss.NewStyle().Width(m.width).Height(m.stVP.Height).Render(m.stVP.View()) // the cards have their own frames
-	}
-	footer := m.footerView()
-	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	screen := m.dragGuide(m.highlight(m.screen()))
 
 	var overlay string
 	switch {
@@ -810,12 +893,7 @@ func (m Model) View() string {
 func (m Model) headerView() string {
 	var tabs []string
 	for i := range tabNames {
-		label := m.tabLabel(tabID(i))
-		if tabID(i) == m.tab {
-			tabs = append(tabs, activeTabStyle.Render(label))
-		} else {
-			tabs = append(tabs, tabStyle.Render(label))
-		}
+		tabs = append(tabs, m.tabView(tabID(i)))
 	}
 	left := strings.Join(tabs, " ")
 	daemon := ""
@@ -869,7 +947,7 @@ func (m Model) footerView() string {
 			keys = "Claude đang soạn task từ prompt… · " + keys
 		}
 	case tabHasaki:
-		keys = "↑↓ chọn · Enter giao cho agent · n tạo subtask · s lọc trạng thái · r tải lại"
+		keys = "↑↓ chọn · Enter giao cho agent · a gộp vào task đang làm · n tạo subtask · s lọc trạng thái · r tải lại"
 	case tabLogs:
 		common := "↑↓ chọn · Enter chạy · g nhóm lỗi · n điều tra · / tìm · t/T thời gian · r chạy lại · c copy"
 		if m.logs.env == envQC {
@@ -891,20 +969,31 @@ func (m Model) footerView() string {
 	case tabStatus:
 		keys = "l Hasaki · s/S Splunk (S: tạo token) · a Argo CD · v Vault QC · K Kafka UI · t dán token · b Bitbucket · d doctor · r làm mới"
 	}
-	keys += " · 1-4 tab · </> độ rộng panel · : lệnh · F2 bôi đen · ? trợ giúp · q thoát"
+	// The tab's keys come first and give way; the way to the rest stays at the
+	// right edge (mouse, F3, y, </> and : are in the help).
+	const tail = "? trợ giúp · q thoát"
+	if m.zoom {
+		keys = "[khung chi tiết toàn màn hình: Shift + kéo để bôi đen · F3 trở lại] · " + keys
+	}
 	if m.mouseOff {
 		keys = "[chuột: bôi đen, F2 tắt] · " + keys
 	}
 	if m.msg != "" {
-		return truncate(accentStyle.Render(m.msg)+"   "+dimStyle.Render(keys), m.width+40)
+		return truncate(accentStyle.Render(m.msg)+"   "+dimStyle.Render(keys+" · "+tail), m.width+40)
 	}
-	return dimStyle.Render(truncate(keys, m.width))
+	room := m.width - lipgloss.Width(tail) - 2
+	keys = truncate(keys, max(0, room))
+	gap := max(2, m.width-lipgloss.Width(keys)-lipgloss.Width(tail))
+	return dimStyle.Render(keys + strings.Repeat(" ", gap) + tail)
 }
 
 func (m Model) helpView() string {
-	h := `taskpilot — làm mọi thứ bằng phím hoặc chuột
+	h := `taskpilot · phím tắt (bấm phím hoặc click)
 
 Chung      1 2 3 4 / Tab: đổi tab (hoặc click tên tab) · : gõ lệnh taskpilot bất kỳ
+           Kéo chuột (không cần Shift) để bôi đen: vùng chọn chỉ nằm trong khung bạn bắt đầu kéo (danh sách hoặc chi tiết),
+             thả chuột là copy vào clipboard · Shift + kéo vẫn là bôi đen của terminal (lấy cả hàng màn hình)
+           F3 phóng to khung chi tiết (ẩn danh sách và viền: bôi đen copy không dính panel khác) · y copy cả khung chi tiết
            < > thu hẹp / mở rộng panel bên trái · = về mặc định · hoặc kéo đường chia giữa hai panel bằng chuột (được nhớ)
            F2 bật/tắt chuột trong TUI: tắt để kéo bôi đen và copy (hoặc giữ Shift khi kéo)
            ? trợ giúp · q thoát
@@ -932,13 +1021,14 @@ Tasks      ↑↓ / click: chọn task · cuộn chuột bên phải: đọc pla
            N tạo task từ prompt: mô tả bằng lời, Claude điền project/repo/tiêu đề/mô tả để bạn sửa rồi gửi
 
 Hasaki     ↑↓ / click: chọn task · Enter (hoặc click lần 2): giao cho agent
+           a gộp vào task đang làm (vd bug của tính năng task đó): agent nhận ticket như tin nhắn, cùng session + branch
            n tạo subtask dưới task đang chọn (mỗi dòng một subtask, cùng dự án + sprint, giao cho bạn)
            s đổi bộ lọc (đang mở / chờ duyệt / đã xong) · r tải lại
 
 Logs       e đổi môi trường: QC (Argo CD, cả 3 project) ↔ Production (Splunk, bom + payment) — cùng bố cục, cùng phím:
            ←/→ project · ↑↓ chọn · Enter chạy · t/T thời gian (15 phút … hôm nay, hôm qua, 7 ngày) · r chạy lại · c copy
            g nhóm lỗi theo service: ↑↓ chọn nhóm · Enter xem log · n điều tra · f sửa ngay · s chỉ service đó · esc
-           n điều tra sự cố: từ nhóm lỗi, từ log đang xem, hoặc mục 🔎 (mô tả triệu chứng) — agent tìm nguyên nhân gốc,
+           n điều tra sự cố: từ nhóm lỗi, từ log đang xem, hoặc mục Điều tra sự cố (mô tả triệu chứng) — agent tìm nguyên nhân gốc,
              báo cáo ở cổng plan, chỉ sửa khi bạn duyệt
            / tìm theo điều kiện: service, mức, chuỗi, request_id
   QC       log đọc từ Argo CD (không có trên Splunk) · danh sách app: Enter xem log pod · S sync · o mở Argo CD
@@ -956,27 +1046,27 @@ Nhấn phím bất kỳ để đóng.`
 // ---- styles -----------------------------------------------------------------
 
 var (
-	titleStyle     = lipgloss.NewStyle().Bold(true)
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
-	warnStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
-	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	selStyle       = lipgloss.NewStyle().Reverse(true)
-	boxStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	modalStyle     = lipgloss.NewStyle().Border(lipgloss.ThickBorder()).BorderForeground(lipgloss.Color("12")).Padding(1, 2)
-	tabStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
-	activeTabStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12"))
+	titleStyle     = fg(cBright)
+	dimStyle       = fg(cMuted)
+	accentStyle    = fg(cBright) // highlighted text; amber is warnStyle
+	warnStyle      = fg(cAccent)
+	errStyle       = lipgloss.NewStyle().Foreground(clr(cErr))
+	selStyle       = lipgloss.NewStyle().Foreground(clr(cBright)).Background(clr(cSurface))
+	boxStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(clr(cRule)).Padding(0, 1)
+	modalStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(clr(cSub)).Padding(1, 2)
+	tabStyle       = fg(cSub)
+	activeTabStyle = fg(cBright).Underline(true)
 	stateColors    = map[store.State]string{
-		store.StateQueued:         "12",
-		store.StatePreparing:      "12",
-		store.StateRunning:        "14",
-		store.StateAwaitApproval:  "11",
-		store.StateNeedsAttention: "208",
-		store.StateDone:           "10",
-		store.StateFailed:         "9",
+		store.StateQueued:         cMuted,
+		store.StatePreparing:      cMuted,
+		store.StateRunning:        cBright,
+		store.StateAwaitApproval:  cAccent,
+		store.StateNeedsAttention: cAccent,
+		store.StateDone:           cOk,
+		store.StateFailed:         cErr,
 	}
 )
 
 func stateBadge(s store.State) string {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(stateColors[s])).Render(string(s))
+	return lipgloss.NewStyle().Foreground(clr(stateColors[s])).Render(string(s))
 }

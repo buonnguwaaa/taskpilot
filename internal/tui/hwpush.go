@@ -260,7 +260,7 @@ func (m Model) hwPushForm(t *store.Task) (tea.Model, tea.Cmd) {
 	f.hint = "Ghi thật lên Hasaki Work: task nằm dưới EPIC và sprint của loại đã chọn, giao cho bạn; rồi ghi kết quả, giờ thực tế và trạng thái." +
 		agentTimeHint(st, t)
 	if l := m.tasks.hwLink; l != nil {
-		f.hint += fmt.Sprintf("\n⚠ Task này đã đẩy lên Hasaki Work: %s (%s). Gửi sẽ tạo thêm một task MỚI; task cũ giữ nguyên (huỷ trên web nếu không cần).",
+		f.hint += fmt.Sprintf("\nLưu ý: task này đã đẩy lên Hasaki Work: %s (%s). Gửi sẽ tạo thêm một task MỚI; task cũ giữ nguyên (huỷ trên web nếu không cần).",
 			l.Code, l.CreatedAt.Local().Format("02/01 15:04"))
 	}
 	if t.State != store.StateDone {

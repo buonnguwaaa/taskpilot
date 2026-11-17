@@ -28,6 +28,7 @@ var hwFilters = []struct{ value, label string }{
 }
 
 type hwTab struct {
+	content  string // the detail pane's text (copy, zoom)
 	list     []hasakiwork.Task
 	epics    int // EPICs left out of list: they group tasks, there is nothing to do on them
 	cursor   int
@@ -55,20 +56,20 @@ func (h *hwTab) offset(rows int) int { return entryOffset(h.cursor, rows) }
 
 // hwLooks are the icon, label and color of the Hasaki Work task statuses.
 var hwLooks = map[int]stateLook{
-	hasakiwork.StatusNew:             {"○", "mới", "12"},
-	hasakiwork.StatusProcessing:      {"▶", "đang làm", "14"},
-	hasakiwork.StatusFinished:        {"✓", "xong", "10"},
-	hasakiwork.StatusLate:            {"⚠", "trễ hạn", "9"},
-	hasakiwork.StatusCancelled:       {"✗", "đã huỷ", "8"},
-	hasakiwork.StatusWaitingApproval: {"⏸", "chờ duyệt", "11"},
-	hasakiwork.StatusFailed:          {"✗", "không đạt", "9"},
+	hasakiwork.StatusNew:             {"○", "mới", cSub},
+	hasakiwork.StatusProcessing:      {"▸", "đang làm", cBright},
+	hasakiwork.StatusFinished:        {"✓", "xong", cOk},
+	hasakiwork.StatusLate:            {"!", "trễ hạn", cErr},
+	hasakiwork.StatusCancelled:       {"✗", "đã huỷ", cMuted},
+	hasakiwork.StatusWaitingApproval: {"◌", "chờ duyệt", cSub},
+	hasakiwork.StatusFailed:          {"✗", "không đạt", cErr},
 }
 
 func hwLook(status int) stateLook {
 	if l, ok := hwLooks[status]; ok {
 		return l
 	}
-	return stateLook{"•", hasakiwork.StatusName(status), "7"}
+	return stateLook{"•", hasakiwork.StatusName(status), cSub}
 }
 
 // hwOpen reports whether a task still has work to do (a deadline matters).
@@ -93,11 +94,11 @@ func hwDeadline(t *hasakiwork.Task, now time.Time) part {
 	case !hwOpen(t.Status):
 		return part{text, ""}
 	case left < 0:
-		return part{"quá " + text, "9"}
+		return part{"quá " + text, cErr}
 	case left < 48*time.Hour:
-		return part{text, "208"}
+		return part{text, cAccent}
 	}
-	return part{text, "7"}
+	return part{text, cSub}
 }
 
 // hwEntry renders one task of the list.
@@ -106,8 +107,8 @@ func (m Model) hwEntry(t *hasakiwork.Task, selected bool, w int) [2]string {
 	icon, color := l.icon, l.color
 	parts := []part{{l.label, l.color}}
 	if m.dispatched(t) {
-		icon, color = "◆", "13"
-		parts = append(parts, part{"đã giao agent", "13"})
+		icon, color = "◆", cSub
+		parts = append(parts, part{"đã giao agent", cSub})
 	}
 	if d := hwDeadline(t, time.Now()); d.text != "" {
 		parts = append(parts, d)
@@ -217,9 +218,7 @@ func (m Model) scope(t *hasakiwork.Task) string {
 	return name
 }
 
-func (m Model) dispatched(t *hasakiwork.Task) bool {
-	return t.Code != "" && m.d.Store.Exists(store.TaskID(hwSource, t.Code))
-}
+func (m Model) dispatched(t *hasakiwork.Task) bool { return m.hwHost(t.Code) != "" }
 
 func (m *Model) refreshHWDetail() {
 	h := &m.hw
@@ -234,9 +233,9 @@ func (m *Model) refreshHWDetail() {
 	case t == nil:
 		b.WriteString(dimStyle.Render("Không có task nào với bộ lọc này (s: đổi bộ lọc)."))
 	default:
-		fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(wrap(t.Name, w)))
+		fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(clr(cBright)).Render(wrap(t.Name, w)))
 		l := hwLook(t.Status)
-		chip := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color(l.color)).Render(" " + l.icon + " " + l.label + " ")
+		chip := fg(l.color).Render(l.icon + " " + l.label)
 		chips := []string{chip, t.Code}
 		if t.Project != nil {
 			chips = append(chips, t.Project.Name)
@@ -244,13 +243,13 @@ func (m *Model) refreshHWDetail() {
 		if scope := m.scope(t); scope != "" {
 			chips = append(chips, dimStyle.Render("taskpilot: ")+scope)
 		}
-		fmt.Fprintf(&b, "%s\n\n", truncateANSI(strings.Join(chips, dimStyle.Render("  ·  ")), w))
+		fmt.Fprintf(&b, "%s\n\n", truncateANSI(strings.Join(chips, dimStyle.Render(" · ")), w))
 		if d := hwDeadline(t, time.Now()); d.text != "" {
 			c := d.color
 			if c == "" {
-				c = "7"
+				c = cSub
 			}
-			fmt.Fprintf(&b, "%s\n", kv("Hạn", lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(strings.TrimPrefix(strings.TrimPrefix(d.text, "quá "), "hạn "))+
+			fmt.Fprintf(&b, "%s\n", kv("Hạn", lipgloss.NewStyle().Foreground(clr(c)).Render(strings.TrimPrefix(strings.TrimPrefix(d.text, "quá "), "hạn "))+
 				map[bool]string{true: errStyle.Render("  (đã quá hạn)"), false: ""}[strings.HasPrefix(d.text, "quá ")]))
 		}
 		if t.Milestone != nil {
@@ -268,16 +267,16 @@ func (m *Model) refreshHWDetail() {
 		b.WriteString("\n")
 		switch scope := m.scope(t); {
 		case m.dispatched(t):
-			b.WriteString(quote(accentStyle.Render("Đã giao cho agent: task "+store.TaskID(hwSource, t.Code))+dimStyle.Render(" · Enter mở ở tab 1"), "13") + "\n")
+			b.WriteString(quote(accentStyle.Render("Đã giao cho agent: task "+m.hwHost(t.Code))+dimStyle.Render(" · Enter mở ở tab 1"), cRule) + "\n")
 		case scope == "":
-			b.WriteString(quote(warnStyle.Render("Project này chưa có trong config taskpilot nên không giao được."), "208") + "\n")
+			b.WriteString(quote(warnStyle.Render("Project này chưa có trong config taskpilot nên không giao được."), cAccent) + "\n")
 		default:
-			b.WriteString(quote(keyCap("Enter")+" giao cho agent "+dimStyle.Render("(phạm vi: "+scope+")")+"   "+keyCap("n")+" tạo task con", "12") + "\n")
+			b.WriteString(quote(keyCap("Enter")+" giao cho agent "+dimStyle.Render("(phạm vi: "+scope+")")+"   "+keyCap("a")+" gộp vào task đang làm   "+keyCap("n")+" tạo task con", cRule) + "\n")
 		}
 		b.WriteString("\n" + section("Mô tả", "", w) + "\n")
 		if full, ok := h.details[t.ID]; ok {
 			if strings.TrimSpace(full.Note) == "" {
-				b.WriteString(dimStyle.Render("(task không có mô tả — nên bổ sung khi giao)"))
+				b.WriteString(dimStyle.Render("(task không có mô tả; nên bổ sung khi giao)"))
 			} else {
 				b.WriteString(mdWrap(full.Note, w))
 			}
@@ -305,7 +304,8 @@ func (m *Model) refreshHWDetail() {
 		id = t.ID
 	}
 	y := h.vp.YOffset
-	h.vp.SetContent(b.String())
+	h.content = b.String()
+	h.vp.SetContent(h.content)
 	if id != h.shownID {
 		h.vp.GotoTop()
 	} else {
@@ -332,8 +332,8 @@ func (m Model) hwView() string {
 	if len(lines) == 0 && !m.hw.loading {
 		lines = append(lines, dimStyle.Render("(trống)"))
 	}
-	left := boxStyle.Width(lw).Height(h).Render(dimStyle.Render(title) + "\n" + strings.Join(lines, "\n"))
-	right := boxStyle.Width(m.hw.vp.Width + 2).Height(h).Render(m.hw.vp.View())
+	left := boxStyle.Width(lw).Height(h).Render(fit(dimStyle.Render(title)+"\n"+strings.Join(lines, "\n"), lw-2, h))
+	right := boxStyle.Width(m.hw.vp.Width + 2).Height(h).Render(fit(m.hw.vp.View(), m.hw.vp.Width, h))
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
@@ -359,6 +359,8 @@ func (m Model) hwKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.loadHW()
 	case "enter":
 		return m.dispatchHW()
+	case "a":
+		return m.attachHW()
 	case "n":
 		t := m.hw.current()
 		if t == nil {
@@ -378,8 +380,7 @@ func (m Model) dispatchHW() (tea.Model, tea.Cmd) {
 	if t == nil {
 		return m, nil
 	}
-	if m.dispatched(t) {
-		id := store.TaskID(hwSource, t.Code)
+	if id := m.hwHost(t.Code); id != "" {
 		m.tab = tabTasks
 		m.tasks.inboxOnly = false
 		m.reloadTasks()

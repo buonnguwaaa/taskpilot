@@ -123,17 +123,19 @@ var stepLooks = map[stepState]struct {
 	mark  string
 	color string
 }{
-	stepTodo:     {"○", "8"},
-	stepActive:   {"●", "14"},
-	stepWaiting:  {"⏸", "11"},
-	stepRejected: {"↺", "208"},
-	stepStopped:  {"✗", "208"},
-	stepAsked:    {"?", "11"},
-	stepDone:     {"✓", "10"},
-	stepSkipped:  {"–", "8"},
+	stepTodo:     {"○", cMuted},
+	stepActive:   {"▸", cBright},
+	stepWaiting:  {"●", cAccent},
+	stepRejected: {"↺", cAccent},
+	stepStopped:  {"✗", cAccent},
+	stepAsked:    {"?", cAccent},
+	stepDone:     {"✓", cOk},
+	stepSkipped:  {"–", cMuted},
 }
 
-// workflowBar draws the progress bar and the steps of a task.
+// workflowBar draws a task's gates as one signal track: every step with its
+// mark, the stretch it has cleared lit, the step that holds it in its own
+// color; under it how far it is and what it waits on.
 func workflowBar(steps []step, w int) string {
 	done := 0
 	for _, s := range steps {
@@ -141,24 +143,43 @@ func workflowBar(steps []step, w int) string {
 			done++
 		}
 	}
-	var parts []string
-	var now string
+	// The links shrink to one dash when the full track would not fit.
+	link := " ── "
+	width := 3 * (len(steps) - 1)
 	for _, s := range steps {
+		width += 4 + lipgloss.Width(s.label)
+	}
+	if width > w {
+		link = " ─ "
+	}
+	var track strings.Builder
+	var now, nowColor string
+	for i, s := range steps {
 		l := stepLooks[s.state]
-		st := lipgloss.NewStyle().Foreground(lipgloss.Color(l.color))
+		cleared := s.state == stepDone || s.state == stepSkipped
+		if i > 0 {
+			ls := ruleStyle
+			if cleared {
+				ls = fg(cSub)
+			}
+			track.WriteString(ls.Render(link))
+		}
+		label := fg(cMuted)
+		switch {
+		case cleared:
+			label = fg(cSub)
+		case s.state != stepTodo:
+			label = fg(l.color)
+		}
+		track.WriteString(fg(l.color).Render(l.mark) + " " + label.Render(s.label))
 		if prefix, ok := map[stepState]string{stepActive: "agent đang làm: ", stepWaiting: "chờ bạn duyệt: ",
 			stepStopped: "đang dừng ở: ", stepAsked: "chờ bạn trả lời câu hỏi: ", stepRejected: "agent đang sửa theo góp ý: "}[s.state]; ok {
-			st = st.Bold(true)
-			now = prefix + s.label
+			now, nowColor = prefix+s.label, l.color
 		}
-		parts = append(parts, st.Render(l.mark+" "+s.label))
 	}
-	barW := min(30, max(10, w-20))
-	fill := barW * done / len(steps)
-	bar := accentStyle.Render(strings.Repeat("━", fill)) + dimStyle.Render(strings.Repeat("━", barW-fill))
-	head := fmt.Sprintf("%s %s", bar, dimStyle.Render(fmt.Sprintf("%d/%d", done, len(steps))))
+	status := dimStyle.Render(fmt.Sprintf("%d/%d", done, len(steps)))
 	if now != "" {
-		head += "  " + dimStyle.Render(now)
+		status += dimStyle.Render(" · ") + fg(nowColor).Render(now)
 	}
-	return head + "\n" + strings.Join(parts, dimStyle.Render(" ─ "))
+	return track.String() + "\n" + status
 }

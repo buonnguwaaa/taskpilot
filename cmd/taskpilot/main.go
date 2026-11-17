@@ -100,6 +100,9 @@ Kafka (QC through Kafka UI, read-only; agents use qc_kafka_* within kafka_topics
   taskpilot auth kafka [-token]                 log in with SSO (Chrome profile) or paste the Cookie
   taskpilot kafka whoami|topics|topic|messages|groups|group   look at QC topics yourself
 
+Permissions agents asked for while running (request_permission, answered in the TUI):
+  taskpilot grants [list] | rm task|project TARGET RULE
+
 claude.ai artifacts (prototypes linked from tasks; agents use read_claude_artifact):
   taskpilot auth claude                         paste the claude.ai sessionKey cookie
   taskpilot claude whoami|artifact URL [-o DIR] check the session, download an artifact yourself
@@ -171,6 +174,8 @@ func main() {
 		err = cmdKafka(args)
 	case "claude":
 		err = cmdClaude(args)
+	case "grants":
+		err = cmdGrants(args)
 	case "graphify", "graph":
 		err = cmdGraph(args)
 	case "scan":
@@ -513,6 +518,11 @@ func cmdHook(args []string) error {
 		return hook.Deny(os.Stdout, "taskpilot hook has an invalid policy ("+err.Error()+"); blocked to be safe")
 	}
 	var opts hook.Options
+	if t, err := st.LoadTask(*task); err == nil {
+		if p, ok := cfg.Projects[t.Project]; ok {
+			opts.Allowed = p.AllowedToolList()
+		}
+	}
 	if t, err := st.LoadTask(*task); err == nil && cfg.Graphify != nil && len(cfg.ProjectGraphLines(t.Project)) > 0 {
 		opts.Graphify = true
 	}

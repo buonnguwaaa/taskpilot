@@ -640,6 +640,14 @@ func summarize(raw json.RawMessage) string {
 	if json.Unmarshal(raw, &m) != nil {
 		return ""
 	}
+	// Agent: "taskpilot:explorer <description>" (the fold stats count the type).
+	if st, ok := m["subagent_type"].(string); ok {
+		d, _ := m["description"].(string)
+		if st == "" {
+			st = "general-purpose"
+		}
+		return clip(strings.TrimSpace(st+" "+d), 300)
+	}
 	// graphify: "affected bom-report::…" (the action is what the stats count).
 	if a, ok := m["action"].(string); ok && a != "" {
 		t, _ := m["text"].(string)

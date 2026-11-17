@@ -110,7 +110,10 @@ func CheckSession(ctx context.Context, hc *http.Client, session string) (string,
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case resp.StatusCode == http.StatusUnauthorized:
+		return "", ErrUnauthorized
+	case resp.StatusCode == http.StatusForbidden && strings.Contains(resp.Header.Get("Content-Type"), "json"):
+		// claude.ai's own refusal; Cloudflare blocking the client answers HTML.
 		return "", ErrUnauthorized
 	case resp.StatusCode != http.StatusOK:
 		return "", fmt.Errorf("claude.ai /api/account: HTTP %d", resp.StatusCode)
@@ -181,6 +184,12 @@ func (f *Fetcher) Fetch(ctx context.Context, link, dir string) (*Artifact, error
 	}
 	ctx, cancel := context.WithTimeout(ctx, wait+2*time.Minute)
 	defer cancel()
+	// An expired session still opens the page, but the artifact never shows:
+	// say so now rather than after the wait. Other errors (network,
+	// Cloudflare) are left to the browser, which may get through.
+	if _, err := checkSession(ctx, nil, f.Session); errors.Is(err, ErrUnauthorized) {
+		return nil, err
+	}
 	ch := f.Chrome
 	launched := false
 	if !ch.Running(ctx) {
@@ -239,6 +248,9 @@ func (f *Fetcher) Fetch(ctx context.Context, link, dir string) (*Artifact, error
 		return ok, nil
 	})
 	if err != nil {
+		if _, cerr := checkSession(ctx, nil, f.Session); errors.Is(cerr, ErrUnauthorized) {
+			return nil, cerr
+		}
 		return nil, fmt.Errorf("the artifact did not load (wrong link, or no access with this account?): %w", err)
 	}
 
@@ -347,6 +359,9 @@ func fetchJS(p string) string {
   return btoa(s);
 })()`
 }
+
+// checkSession is CheckSession, a variable so tests can stub claude.ai.
+var checkSession = CheckSession
 
 // Eval is hasakiwork.Eval, a variable so tests can stub the browser.
 var Eval = hasakiwork.Eval

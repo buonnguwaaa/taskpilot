@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // The width of the left panel (lists) against the right one (details) is
@@ -96,15 +98,58 @@ func (m Model) onDividerDrag(ev tea.MouseMsg) (Model, bool) {
 	switch {
 	case ev.Action == tea.MouseActionPress && ev.Button == tea.MouseButtonLeft && ev.Y > 0 &&
 		(ev.X == edge-1 || ev.X == edge):
-		m.dragging = true
+		m.dragging, m.dragFrom, m.dragX = true, ev.X, ev.X
 		return m, true
 	case m.dragging && ev.Action == tea.MouseActionMotion:
-		m.setListWidth(ev.X - 1)
+		// Only the guide moves: laying the panels out again renders their
+		// whole content (a long conversation takes a large part of a second),
+		// once per mouse move.
+		lw := m.listWidth()
+		lo, hi := minListWidth, max(minListWidth, m.width-minDetailWidth-6)
+		m.dragX = m.dragFrom + clamp(lw+ev.X-m.dragFrom, lo, hi) - lw
 		return m, true
 	case m.dragging && ev.Action == tea.MouseActionRelease:
 		m.dragging = false
-		m.savePrefs()
+		if w := m.listWidth() + m.dragX - m.dragFrom; w != m.listWidth() {
+			m.setListWidth(w)
+			m.savePrefs()
+		}
 		return m, true
 	}
 	return m, false
+}
+
+var dragGuideStyle = fg(cSub)
+
+// dragGuide draws where the divider goes while it is dragged.
+func (m Model) dragGuide(screen string) string {
+	if !m.dragging {
+		return screen
+	}
+	lines := strings.Split(screen, "\n")
+	x := m.listWidth() + 1 + m.dragX - m.dragFrom // the left box's right border, moved
+	for y := 1; y < len(lines)-1 && y <= m.innerHeight()+2; y++ {
+		l := lines[y]
+		w := ansi.StringWidth(l)
+		if x >= w {
+			continue
+		}
+		lines[y] = ansi.Cut(l, 0, x) + dragGuideStyle.Render("┃") + ansi.Cut(l, x+1, w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// fit cuts a panel's content to w columns and h rows: a longer line would be
+// wrapped by the box, which then grows taller than its neighbour.
+func fit(s string, w, h int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for i, l := range lines {
+		if ansi.StringWidth(l) > w {
+			lines[i] = ansi.Truncate(l, max(1, w), "…")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
