@@ -35,6 +35,9 @@ type Daemon struct {
 	Scanner interface{ Tick(ctx context.Context) }
 	// Indexer, when set, keeps the graphify graphs up to date.
 	Indexer interface{ Tick(ctx context.Context) }
+	// OnRun, when set, is called as a run of a task starts (taskpilot opens
+	// a herdr tab watching it, so herdr lists the background agent).
+	OnRun func(t *store.Task)
 
 	cur      atomic.Pointer[config.Config]
 	scanning atomic.Bool
@@ -420,6 +423,9 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	t.Transition(store.StateRunning, fmt.Sprintf("run %d", t.Runs))
 	if err := d.Store.SaveTask(t); err != nil {
 		return err
+	}
+	if d.OnRun != nil {
+		d.OnRun(t)
 	}
 	kind := d.Runner.KindFor(t)
 	model, effort := d.Runner.Profile(t)

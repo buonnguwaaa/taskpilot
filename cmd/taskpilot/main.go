@@ -33,6 +33,7 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/kafbat"
 	"github.com/buonnguwaaa/taskpilot/internal/mcpserver"
 	"github.com/buonnguwaaa/taskpilot/internal/plugin"
+	"github.com/buonnguwaaa/taskpilot/internal/recipe"
 	"github.com/buonnguwaaa/taskpilot/internal/refs"
 	"github.com/buonnguwaaa/taskpilot/internal/runner"
 	"github.com/buonnguwaaa/taskpilot/internal/scan"
@@ -87,6 +88,11 @@ Graphify graphs (graphify: graphify per repo and line, gRPC links between repos;
   taskpilot graphify links PROJECT [-line L] [FILTER]   gRPC calls between the repos
   taskpilot graphify ask PROJECT LINE ACTION ARG…  query / explain / path / affected, as the agent does
   taskpilot graphify task TASK [ACTION ARG…]    build / update a task's own graph (its branch), then ask it
+
+Debugging recipes (read-only lookups you repeat, run without Claude; agents use run_recipe):
+  taskpilot recipe list|show|run|check|add|rm   see taskpilot recipe
+  taskpilot reflect [-project P] [-days N]      propose recipes from recent tasks (one Claude turn)
+  taskpilot reflect list|show|accept|reject ID  review the proposals
 
 Production error scans (logs_production.scan: times, min_count, ignore):
   taskpilot scan run PROJECT                    scan now (since the previous scan, at most max_window)
@@ -156,6 +162,8 @@ func main() {
 		err = cmdSplunk(args)
 	case "takeover":
 		err = cmdTakeover(args)
+	case "watch":
+		err = cmdWatch(args)
 	case "export":
 		err = cmdExport(args)
 	case "import":
@@ -180,6 +188,10 @@ func main() {
 		err = cmdGraph(args)
 	case "scan":
 		err = cmdScan(args)
+	case "recipe", "recipes":
+		err = cmdRecipe(args)
+	case "reflect":
+		err = cmdReflect(args)
 	case "mcp":
 		err = cmdMCP(args)
 	case "hook":
@@ -226,6 +238,7 @@ func (c common) load() (*config.Config, *store.Store, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	st.SuggestionWindow = cfg.ScanWindow
 	return cfg, st, nil
 }
 
@@ -540,6 +553,9 @@ func newDaemon(cfg *config.Config, st *store.Store, exe string, logw io.Writer) 
 	if err != nil {
 		return nil, fmt.Errorf("write plugin: %w", err)
 	}
+	if err := recipe.SyncSkills(cfg.Home); err != nil {
+		return nil, fmt.Errorf("write recipe skills: %w", err)
+	}
 	if _, err := gate.Compile(cfg.Rules); err != nil {
 		return nil, err
 	}
@@ -553,5 +569,8 @@ func newDaemon(cfg *config.Config, st *store.Store, exe string, logw io.Writer) 
 			return splunkClient(ctx, d.CurrentConfig(), "daemon:scan")
 		}, Group: flowGrouper(d.CurrentConfig)}
 	d.Indexer = &graphify.Indexer{Config: d.CurrentConfig, Logf: d.Log.Printf}
+	if w := herdrWatcher(cfg, exe); w != nil {
+		d.OnRun = func(t *store.Task) { c := *t; go w(&c) } // the run goes on mutating t
+	}
 	return d, nil
 }

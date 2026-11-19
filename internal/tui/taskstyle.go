@@ -170,6 +170,9 @@ func entryLines(selected, faded bool, w int, icon, iconColor, title string, part
 // taskEntry renders the lines of one task in the list, w columns wide.
 func (m Model) taskEntry(t *store.Task, selected bool, w int) [2]string {
 	l := lookOf(t.State)
+	if m.tasks.group(t) == groupPostponed {
+		l.color = cMuted // on hold: no longer the amber "waiting on you"
+	}
 	parts := []part{{l.label, l.color}}
 	if a := m.tasks.assess[t.ID]; a != nil && levelLabels[a.Level] != "" {
 		parts = append(parts, part{"● " + levelLabels[a.Level], levelColors[a.Level]})
@@ -179,7 +182,7 @@ func (m Model) taskEntry(t *store.Task, selected bool, w int) [2]string {
 		meta = t.Project + " · " + meta
 	}
 	parts = append(parts, part{meta, ""})
-	return entryLines(selected, isDone(t), w, l.icon, l.color, t.Title, parts)
+	return entryLines(selected, m.tasks.group(t) != groupActive, w, l.icon, l.color, t.Title, parts)
 }
 
 // entryOffset is the first entry shown so the cursor's entry stays in view

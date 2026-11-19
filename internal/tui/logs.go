@@ -95,6 +95,10 @@ type logsTab struct {
 	flowOpen    map[int64]bool // expanded flows
 	suggCursor  int            // in suggEntries()
 	suggFocus   bool
+	scanning    string // project being scanned now (key r), "" when none
+	suggHidden  bool   // the list shows the hidden suggestions (key v)
+
+	rec recState // debugging recipes (logs_recipe.go)
 }
 
 // Special entries of the saved-search list.
@@ -133,6 +137,7 @@ func (m Model) logItems() []config.LogQuery {
 		{Name: itemBuilder, Note: "Chọn service, mức, chuỗi cần tìm, request_id: taskpilot tự viết SPL."},
 		{Name: itemAsk, Note: "Mô tả bằng lời (vd \"refund TCB lỗi sáng nay\"); Claude đọc tài liệu log của dự án và viết SPL để bạn sửa trước khi chạy."},
 	}...)
+	items = append(items, config.LogQuery{Name: itemRecipes, Note: "Những bước tra cứu bạn hay lặp lại khi debug (DB QC, Splunk, log QC…), chạy ngay không tốn Claude; agent cũng dùng được. R: Claude đọc các task gần đây và đề xuất quy trình mới."})
 	return append(items, pl.Queries...)
 }
 
@@ -156,6 +161,17 @@ func (m Model) prodRows() []logRow {
 			label := q.Name
 			if n > 0 {
 				label += " " + warnStyle.Render(fmt.Sprintf("%d", n))
+			}
+			rows = append(rows, logRow{plain: plain, label: label, note: q.Note, item: i})
+			continue
+		}
+		if q.Name == itemRecipes {
+			n, fresh := m.recipeCounts(name)
+			plain := fmt.Sprintf("%s (%d)", q.Name, n)
+			label := plain
+			if fresh > 0 {
+				plain += fmt.Sprintf(" · %d mới", fresh)
+				label += " " + warnStyle.Render(fmt.Sprintf("· %d mới", fresh))
 			}
 			rows = append(rows, logRow{plain: plain, label: label, note: q.Note, item: i})
 			continue
@@ -275,6 +291,11 @@ func (m Model) prodView() string {
 }
 
 func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.logs.rec.focus {
+		if mm, cmd, ok := m.recipeKey(k); ok {
+			return mm, cmd
+		}
+	}
 	if m.logs.suggFocus {
 		if mm, cmd, ok := m.suggestKey(k); ok {
 			return mm, cmd
@@ -322,6 +343,9 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.logs.cursor = itemIndex(items, itemGroups)
 		return m.runLogItem()
 	case "r":
+		if m.logs.cursor < len(items) && items[m.logs.cursor].Name == itemSuggest {
+			return m.scanNow()
+		}
 		if m.logs.lastSPL != "" {
 			e, l := m.logs.lastEarliest, m.logs.lastLatest
 			if m.logs.preset > 0 { // a new preset applies to the rerun
@@ -329,6 +353,13 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				e, l = p.Earliest, p.Latest
 			}
 			return m.runLogSearch(m.logs.lastSPL, e, l, m.logs.lastGroups)
+		}
+	case "v":
+		if m.logs.cursor < len(items) && items[m.logs.cursor].Name == itemSuggest {
+			mm, _ := m.openSuggestions()
+			m = mm.(Model)
+			mm2, cmd, _ := m.suggestKey(k)
+			return mm2, cmd
 		}
 	case "o":
 		if m.logs.lastSPL == "" {
@@ -340,7 +371,19 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.msg = "đã mở truy vấn trên Splunk Web"
 		}
+	case "R":
+		if m.logs.cursor < len(items) && items[m.logs.cursor].Name == itemRecipes {
+			return m.confirmReflect(), nil
+		}
 	case "c":
+		if run := m.logs.rec.shown; run != nil {
+			if err := m.d.Copy(run.out); err != nil {
+				m.msg = "copy: " + err.Error()
+			} else {
+				m.msg = "đã copy kết quả quy trình"
+			}
+			break
+		}
 		if m.logs.lastSPL == "" {
 			m.msg = "chưa chạy truy vấn nào"
 			break
@@ -351,6 +394,9 @@ func (m Model) prodKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.msg = "đã copy SPL"
 		}
 	case "n":
+		if run := m.logs.rec.shown; run != nil {
+			return m.investigateFromRecipe(run)
+		}
 		if m.logs.lastSPL != "" && !m.logs.lastGroups {
 			return m.investigateFromResults()
 		}
@@ -383,6 +429,8 @@ func (m Model) runLogItem() (tea.Model, tea.Cmd) {
 	switch q.Name {
 	case itemSuggest:
 		return m.openSuggestions()
+	case itemRecipes:
+		return m.openRecipes()
 	case itemGroups:
 		return m.runGroups("")
 	case itemInvestigate:
@@ -616,6 +664,7 @@ func (m Model) searchCmd(spl, earliest, latest string, groups bool) tea.Cmd {
 
 func (m Model) onLogsResult(msg logsResultMsg) (tea.Model, tea.Cmd) {
 	m.logs.running = false
+	m.logs.rec.shown = nil
 	m.logs.lastSPL, m.logs.lastEarliest, m.logs.lastLatest, m.logs.lastGroups = msg.spl, msg.earliest, msg.latest, msg.groups
 	w := max(20, m.logs.vp.Width)
 	window := splunk.Describe(msg.earliest, msg.latest)

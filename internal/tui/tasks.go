@@ -22,9 +22,11 @@ import (
 )
 
 type tasksTab struct {
-	list      []*store.Task
-	cursor    int
-	inboxOnly bool
+	list   []*store.Task
+	cursor int
+	// filter: the groups shown (key f); postponed: the tasks on hold (key z).
+	filter    listFilter
+	postponed map[string]bool
 	needsYou  int
 
 	// search filters the list as you type (key /); query is its folded value.
@@ -101,23 +103,26 @@ func (m *Model) reloadTasks() {
 	if cur := m.tasks.current(); cur != nil {
 		selected = cur.ID
 	}
-	m.tasks.list = m.tasks.list[:0]
+	m.tasks.postponed, err = m.d.Store.PostponedIDs()
+	if err != nil {
+		m.msg = "đọc task tạm hoãn: " + err.Error()
+	}
 	m.tasks.needsYou = 0
-	var done []*store.Task
+	var groups [len(groupNames)][]*store.Task
 	for _, t := range all {
-		if needsOperator(t.State) {
+		if m.tasks.waitsOnYou(t) {
 			m.tasks.needsYou++
 		}
-		if m.tasks.inboxOnly && !needsOperator(t.State) || !matchTask(t, m.tasks.query) {
+		if !m.tasks.shows(t) || !matchTask(t, m.tasks.query) {
 			continue
 		}
-		if isDone(t) {
-			done = append(done, t) // the "Đã xong" group comes last
-		} else {
-			m.tasks.list = append(m.tasks.list, t)
-		}
+		g := m.tasks.group(t)
+		groups[g] = append(groups[g], t)
 	}
-	m.tasks.list = append(m.tasks.list, done...)
+	m.tasks.list = m.tasks.list[:0]
+	for _, g := range groups {
+		m.tasks.list = append(m.tasks.list, g...)
+	}
 	m.tasks.assess = map[string]*store.Assessment{}
 	for _, t := range m.tasks.list {
 		if a, _ := m.d.Store.TaskAssessment(t.ID); a != nil {
@@ -187,6 +192,10 @@ func (m *Model) taskDetail(t *store.Task) string {
 	fmt.Fprintf(&b, "%s\n\n", workflowBar(workflowSteps(t, reqs, decs, tt.pending, tt.prs), w))
 	fmt.Fprintf(&b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(clr(cBright)).Render(wrap(t.Title, w)))
 	chips := []string{stateChip(t.State)}
+	if tt.group(t) == groupPostponed {
+		l := lookOf(t.State)
+		chips[0] = fg(cMuted).Render(l.icon + " " + l.label)
+	}
 	for _, c := range []string{t.Project, "⎇ " + t.Branch, t.TicketID, t.ID} {
 		if strings.TrimSpace(strings.TrimPrefix(c, "⎇ ")) != "" && (c != t.ID || t.ID != t.TicketID) {
 			chips = append(chips, c)
@@ -268,8 +277,13 @@ func (m *Model) taskDetail(t *store.Task) string {
 		}
 		fmt.Fprintf(&b, "%s\n", quote(strings.TrimRight(c.String(), "\n"), cAccent))
 	}
-	switch t.State {
-	case store.StateNeedsAttention, store.StateFailed:
+	postponed, _ := m.d.Store.Postponed(t.ID)
+	switch {
+	case postponed != nil && !isDone(t):
+		// One quiet notice: on hold is not "waiting on you".
+		fmt.Fprintf(&b, "\n%s\n", quote(dimStyle.Render("Tạm hoãn từ "+postponed.At.Local().Format("02/01 15:04")+" · ")+
+			keyCap("z")+dimStyle.Render(" làm tiếp · ")+keyCap("m")+dimStyle.Render(" nhắn agent · ")+keyCap("o")+dimStyle.Render(" tự làm"), cRule))
+	case t.State == store.StateNeedsAttention || t.State == store.StateFailed:
 		fmt.Fprintf(&b, "\n%s\n", quote(warnStyle.Render("Task đang dừng: ")+"bấm "+keyCap("m")+" để nhắn agent chạy tiếp, hoặc "+keyCap("o")+" để tự làm", cAccent))
 	}
 	if len(tt.prs) > 0 {
@@ -344,9 +358,9 @@ func (m Model) tasksView() string {
 		}
 		lines = append(lines, m.taskEntry(m.tasks.list[r.task], r.task == m.tasks.cursor, cw)[ln.sub])
 	}
-	title := "Tasks  (/ tìm)"
-	if m.tasks.inboxOnly {
-		title = "Tasks cần bạn (f: hiện tất cả)"
+	title := "Tasks  (/ tìm · f lọc)"
+	if f := m.tasks.filter; f != filterAll {
+		title = fmt.Sprintf("Tasks: %s (%d)  (f lọc)", filterNames[f], len(m.tasks.list))
 	}
 	switch {
 	case m.tasks.searching:
@@ -443,9 +457,13 @@ func (m Model) tasksKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tasks.query = ""
 			m.reloadTasks()
 		}
-	case "f":
-		m.tasks.inboxOnly = !m.tasks.inboxOnly
+	case "f", "F":
+		step := map[string]listFilter{"f": 1, "F": filterCount - 1}[k.String()]
+		m.tasks.filter = (m.tasks.filter + step) % filterCount
 		m.reloadTasks()
+		m.msg = "lọc: " + filterNames[m.tasks.filter] + " (f tiếp · F lùi)"
+	case "z":
+		return m.togglePostpone(t)
 	case "r":
 		m.reloadTasks()
 		m.msg = "đã tải lại"

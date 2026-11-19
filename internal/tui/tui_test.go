@@ -466,7 +466,7 @@ func TestLogsProductionTab(t *testing.T) {
 		t.Fatalf("logs tab (plm must be hidden: no_logs):\n%s", m.View())
 	}
 	// A saved stats search runs with the prod filter; its rows come from /results.
-	m, cmd := press(t, m, "j", "j", "j", "j", "enter") // past the 4 shared actions
+	m, cmd := press(t, m, "j", "j", "j", "j", "j", "enter") // past the 5 shared actions
 	m = drainLogs(t, m, cmd)
 	if len(sent) != 1 || sent[0] != "search kubernetes.namespace_name=bom-prod level=error | stats count by kubernetes.container_name @-1h→now" {
 		t.Fatalf("sent = %q", sent)

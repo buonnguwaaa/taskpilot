@@ -42,6 +42,8 @@ type hwTab struct {
 	dispatchAfterLoad int64
 	vp                viewport.Model
 	shownID           int64
+	// focus sends the movement keys to the detail pane (scroll) instead of the list.
+	focus bool
 }
 
 func (h *hwTab) current() *hasakiwork.Task {
@@ -332,13 +334,46 @@ func (m Model) hwView() string {
 	if len(lines) == 0 && !m.hw.loading {
 		lines = append(lines, dimStyle.Render("(trống)"))
 	}
-	left := boxStyle.Width(lw).Height(h).Render(fit(dimStyle.Render(title)+"\n"+strings.Join(lines, "\n"), lw-2, h))
-	right := boxStyle.Width(m.hw.vp.Width + 2).Height(h).Render(fit(m.hw.vp.View(), m.hw.vp.Width, h))
+	if vp := m.hw.vp; vp.TotalLineCount() > vp.Height {
+		title += fmt.Sprintf(" · chi tiết %d%%", int(vp.ScrollPercent()*100))
+	}
+	// Hairline borders; the pane that takes the keys is one step brighter (as in Tasks).
+	lbox, rbox := boxStyle.BorderForeground(clr(cSub)), boxStyle.BorderForeground(clr(cRule))
+	if m.hw.focus {
+		lbox, rbox = rbox, lbox
+	}
+	left := lbox.Width(lw).Height(h).Render(fit(dimStyle.Render(title)+"\n"+strings.Join(lines, "\n"), lw-2, h))
+	right := rbox.Width(m.hw.vp.Width + 2).Height(h).Render(fit(m.hw.vp.View(), m.hw.vp.Width, h))
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
 func (m Model) hwKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.hw.focus {
+		vp := &m.hw.vp
+		switch k.String() {
+		case "j", "down":
+			vp.ScrollDown(1)
+			return m, nil
+		case "k", "up":
+			vp.ScrollUp(1)
+			return m, nil
+		case "g", "home":
+			vp.GotoTop()
+			return m, nil
+		case "G", "end":
+			vp.GotoBottom()
+			return m, nil
+		case "esc", "left", "h":
+			m.hw.focus = false
+			return m, nil
+		}
+	}
 	switch k.String() {
+	case "l", "right":
+		if m.hw.current() != nil {
+			m.hw.focus = true
+		}
+		return m, nil
 	case "j", "down":
 		return m.moveHW(1)
 	case "k", "up":
@@ -382,7 +417,7 @@ func (m Model) dispatchHW() (tea.Model, tea.Cmd) {
 	}
 	if id := m.hwHost(t.Code); id != "" {
 		m.tab = tabTasks
-		m.tasks.inboxOnly = false
+		m.tasks.filter = filterAll
 		m.reloadTasks()
 		for i, x := range m.tasks.list {
 			if x.ID == id {

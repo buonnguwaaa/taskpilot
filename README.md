@@ -101,7 +101,7 @@ taskpilot                    # mở TUI; daemon chạy bên trong, không cần 
 | Tab | Làm gì |
 |---|---|
 | (mọi tab) | `F2` bật/tắt chuột trong TUI: tắt để kéo bôi đen và copy (hoặc giữ Shift khi kéo) |
-| **1 Tasks** | Task của agent. `a` duyệt, `A` duyệt kèm ghi chú, `x` từ chối kèm nhận xét, `m` nhắn agent, `u` thu hồi tin nhắn / quyết định vừa gửi, `p` mở PR, `h` tạo task trên Hasaki Work từ task đã làm (tự chọn EPIC DEV / Improve / Issue Production + sprint của dự án, giao cho bạn), `v` mở/thu gọn Hoạt động, `o` tự làm trong session của agent, `n` tạo task mới bằng form, `N` tạo task từ prompt (mô tả bằng lời, Claude điền form), `f` chỉ hiện task cần bạn, `/` tìm task, `c` đánh dấu xong, `d` xoá task. Danh sách chia hai nhóm: Đang làm ở trên, Đã xong ở dưới |
+| **1 Tasks** | Task của agent. `a` duyệt, `A` duyệt kèm ghi chú, `x` từ chối kèm nhận xét, `m` nhắn agent, `u` thu hồi tin nhắn / quyết định vừa gửi, `p` mở PR, `h` tạo task trên Hasaki Work từ task đã làm (tự chọn EPIC DEV / Improve / Issue Production + sprint của dự án, giao cho bạn), `v` mở/thu gọn Hoạt động, `o` tự làm trong session của agent, `n` tạo task mới bằng form, `N` tạo task từ prompt (mô tả bằng lời, Claude điền form), `f`/`F` lọc danh sách (Tất cả → Đang làm → Tạm hoãn → Đã xong → Cần bạn), `/` tìm task, `c` đánh dấu xong, `z` tạm hoãn / làm tiếp, `d` xoá task. Danh sách chia ba nhóm: Đang làm, Tạm hoãn, Đã xong |
 | **2 Hasaki Work** | `n` tạo subtask dưới task đang chọn (mỗi dòng một subtask, cùng dự án và sprint, giao cho bạn). Task của bạn trên Hasaki Work, kèm phạm vi (bom/plm/payment) và mô tả. **Enter** (hoặc click lần hai) mở form giao cho agent: chọn project, repo bắt đầu, ghi chú. `s` đổi bộ lọc |
 | **3 Logs** | Bấm `e` để đổi môi trường. **QC · Argo CD** (cả bom, payment, plm): danh sách app kèm health và sync, revision, image; Enter xem log pod, `/` lọc, `t` khoảng thời gian, `o` mở trên Argo CD, `S` sync (hỏi xác nhận). **Production · Splunk** (bom, payment; PLM không có log prod): `g` nhóm lỗi, `n` tạo task điều tra sự cố, truy vấn có sẵn (hỏi tham số), `/` tìm theo điều kiện, `a` hỏi bằng lời, `t` thời gian, `o` Splunk Web, `c` copy SPL, `i` kiến thức log của project |
 | **4 Status** | Đăng nhập (`l` đăng nhập Hasaki Work, `t` dán JWT, `b` lưu token Bitbucket), `d` chạy doctor, log của daemon |
@@ -129,6 +129,13 @@ Phím `o` mở session của agent ở **pane herdr bên phải** qua lệnh
 `taskpilot takeover TASK`. Lệnh này đánh dấu task đang làm tay (kèm PID, nên
 nếu pane bị đóng đột ngột thì dấu cũ không chặn daemon mãi), chạy
 `claude --resume`, rồi trả task cho daemon khi bạn thoát.
+
+Agent chạy ngầm cũng hiện trong herdr: mỗi khi daemon bắt đầu một lượt chạy, nó
+mở tab **"tp TASK"** (nếu chưa có) chạy `taskpilot watch TASK`. Tab này hiện hoạt
+động mới nhất của agent và báo trạng thái cho herdr (`working` khi chạy,
+`blocked` khi chờ duyệt / cần bạn / lỗi), nên task có mặt trong danh sách agent
+của herdr. Tab chỉ để xem (duyệt, nhắn, làm tay vẫn ở TUI) và tự đóng khi task
+xong; đóng tay thì lượt chạy sau mở lại.
 
 Muốn daemon chạy bên trong TUI như cũ thì dùng `taskpilot -embedded-daemon`.
 
@@ -490,15 +497,56 @@ projects:
         min_count: 3                         # nhóm ít hơn thì bỏ qua
         ignore: ["context canceled"]         # lỗi nhiễu đã biết
         services: []                         # trống = mọi service
+        max_window: 24h                      # mỗi lần quét đọc tối đa từng này; danh sách cũng chỉ hiện lỗi còn thấy trong khoảng này
 ```
 
 - Tab 3 Logs → Production → **🔔 Đề xuất sửa lỗi (N)** (số đề xuất cũng hiện trên tên tab): `n` tạo task điều tra, `f`
-  tạo task sửa, `Enter` xem log của nhóm, `x` bỏ qua hẳn, `z` ẩn 7 ngày (hiện lại nếu lỗi còn).
+  tạo task sửa, `Enter` xem log của nhóm, `x` bỏ qua hẳn, `z` ẩn 7 ngày (hiện lại nếu lỗi còn; cả hai hỏi xác nhận), `v` xem các đề xuất đã ẩn (`u` bỏ ẩn, `U` bỏ ẩn tất cả), `r` quét ngay (ngoài lịch; hoặc `taskpilot scan run PROJECT`).
+- Danh sách chỉ hiện nhóm lỗi còn xuất hiện trong `max_window` (mặc định 24h) tính tới lần quét thành công gần nhất; nhóm cũ hơn tự ẩn và hiện lại nếu lần quét sau thấy lại.
 - Lỗi lặp lại ở các lần quét sau cộng dồn vào cùng một đề xuất; đề xuất đã có task hoặc đã bỏ qua không hiện lại. Đề xuất
   chỉ được đánh dấu "đã có task" khi bạn thật sự gửi form.
 - Quét lỗi (Splunk không tới được…) thì thử lại sau 15 phút; khoảng thời gian luôn tính từ lần quét **thành công** gần
   nhất nên không bỏ sót.
 - CLI: `taskpilot scan run PROJECT` (quét ngay), `taskpilot scan list [PROJECT]`.
+
+### Quy trình debug và reflect
+
+Những bước tra cứu bạn hay lặp lại khi debug ("check đơn X": dòng trong DB QC, log production, log QC…) được đóng gói
+thành **quy trình**. Mỗi quy trình là một danh sách tra cứu chỉ-đọc có tham số, cộng với hướng dẫn cách đọc kết quả.
+
+- **Chạy**: tab 3 Logs, mục **Quy trình debug** (Production), chọn quy trình rồi Enter, điền tham số. Taskpilot tự chạy
+  các bước, **không tốn Claude**. Xong bấm `n` để giao kết quả cho agent điều tra tiếp, hoặc `c` để copy.
+- **Agent dùng**: mỗi quy trình thành một skill `recipe-<tên>` trong plugin, và agent chạy nó bằng tool MCP
+  `run_recipe`. Agent chỉ thấy quy trình của project mình. Thay đổi có hiệu lực từ lượt chạy tới của agent.
+- **Reflect** (`R` trong mục, hoặc `taskpilot reflect -project P`): một lượt Claude không có tool. Claude đọc các task
+  **có tra cứu** của project kể từ lần reflect trước (lần đầu: 30 ngày), gồm tin bạn nhắn, các truy vấn agent đã chạy
+  (đánh dấu lệnh lỗi) và kết luận, rồi đề xuất 0–3 quy trình. Chi phí khoảng $0,5–1 mỗi project.
+- **Duyệt đề xuất** (dòng ◆): Enter chạy thử, `a` chấp nhận, `e` sửa YAML trong `$EDITOR`, `x` bỏ (không đề xuất lại).
+  Với quy trình đã lưu: `e` sửa, `d` xoá. **Chưa chấp nhận thì không có gì được dùng.**
+- **An toàn**: các bước chỉ thuộc các loại `sql` (DB QC), `splunk`, `qc_logs`, `vault`, `kafka`. Mỗi bước đi qua đúng các
+  kiểm tra như tool của agent (SQL chỉ đọc, filter prod, `vault_paths`, `kafka_topics`, app QC của project). Giá trị tham
+  số không được chứa nháy, `\`, `;`, `|`, ngoặc hay xuống dòng.
+- Quy trình nằm trong `~/.taskpilot/recipes/<tên>.yaml`: sửa tay được, đưa vào git được. Ví dụ:
+
+```yaml
+name: tra-don-payment
+project: payment
+description: Tra một đơn/transaction payment: trạng thái trong DB QC và log production.
+params:
+  - {name: code, desc: order code hoặc HSK_T…, example: 261116VN91SQ}
+steps:
+  - title: Transaction trong DB QC
+    sql: {query: "SELECT id, status, created_at FROM transactions WHERE order_code = '{code}' LIMIT 20"}
+  - title: Log production
+    splunk: {query: '"{code}"', earliest: -1d}
+  - qc_logs: {app: payment-qc-payment, filter: "{code}"}
+guide: |
+  status = … mà không có callback thì xem worker …
+```
+
+- CLI: `taskpilot recipe list|show|run NAME k=v|run -file F k=v|check F|add F|rm NAME`,
+  `taskpilot reflect [-project P] [-days N] [-dry]` (`-dry` in ra những gì Claude sẽ đọc, không gọi Claude),
+  `taskpilot reflect list|show ID|accept ID|reject ID`.
 
 ### Logs Production
 
@@ -589,7 +637,8 @@ luôn các bản chép.
 | `d` | xoá task (hỏi lại trước): xoá lịch sử, lượt chạy, workspace và ticket trong inbox; giữ nhánh git, PR trên Bitbucket và task trên Hasaki Work. Không xoá được task đang chạy |
 | `/` | tìm task theo id, tên, project, nhánh, ticket (gõ không dấu được, nhiều từ thì phải khớp hết); Enter giữ bộ lọc, Esc xoá |
 | `N` | tạo task từ prompt: gõ yêu cầu bằng lời, Claude chọn project/repo, viết tiêu đề + mô tả + acceptance criteria, rồi mở form điền sẵn để bạn sửa và `Ctrl+S` gửi |
-| `f` | lọc inbox: chỉ hiện task đang cần bạn |
+| `f` / `F` | đổi bộ lọc (tới / lùi): Tất cả → Đang làm → Tạm hoãn → Đã xong → Cần bạn |
+| `z` | tạm hoãn task đang dừng (chuyển sang nhóm Tạm hoãn, không tính vào "cần bạn"); bấm lại để làm tiếp. Nhắn/duyệt cho agent chạy lại hoặc đánh dấu xong thì tự bỏ tạm hoãn |
 | `q` | thoát |
 
 Các lệnh CLI tương đương: `taskpilot list | approve TASK | reject TASK -comment C | message TASK -text M`.

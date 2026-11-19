@@ -490,6 +490,14 @@ type ErrorScan struct {
 	MaxWindow time.Duration `yaml:"max_window"`
 }
 
+// ScanWindow is the max_window of a project's error scan (0: not scanned).
+func (c *Config) ScanWindow(project string) time.Duration {
+	if p, ok := c.Projects[project]; ok && p.LogsProduction != nil && p.LogsProduction.Scan != nil {
+		return p.LogsProduction.Scan.MaxWindow
+	}
+	return 0
+}
+
 // LogQuery is a saved search. SPL may use {filter}, {service} and any other
 // {name} placeholder, which the TUI asks for before running.
 type LogQuery struct {

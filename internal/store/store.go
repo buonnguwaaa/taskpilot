@@ -221,6 +221,11 @@ type SplunkQuery struct {
 type Store struct {
 	Home string
 	DB   *db.DB
+	// SuggestionWindow, when set, keeps only the suggestions of a project
+	// seen in that long before its latest good scan ended (the scan's
+	// max_window): a group no scan saw since hides by itself, and comes back
+	// if a later scan sees it again. Nil or 0: every waiting suggestion.
+	SuggestionWindow func(project string) time.Duration
 }
 
 // New opens (and migrates) the database under home.
@@ -330,6 +335,13 @@ func (s *Store) SaveTask(t *Task) error {
 	for _, e := range t.History[min(t.persisted, len(t.History)):] {
 		if _, err := tx.Exec(`INSERT INTO task_transitions (task_id, at, state, note) VALUES (?,?,?,?)`,
 			t.ID, ts(e.At), string(e.State), e.Note); err != nil {
+			return err
+		}
+	}
+	switch t.State {
+	case StateQueued, StatePreparing, StateRunning, StateDone:
+		// Running again or finished: no longer on hold (postpone.go).
+		if _, err := tx.Exec(`DELETE FROM task_postponed WHERE task_id = ?`, t.ID); err != nil {
 			return err
 		}
 	}
@@ -1082,8 +1094,25 @@ func (s *Store) UpsertSuggestion(g *Suggestion, scanID int64, now time.Time) (fr
 // Suggestions lists a project's suggestions to act on ("" = every project):
 // status new, most frequent in their latest scan first.
 func (s *Store) Suggestions(project string) ([]*Suggestion, error) {
+	return s.suggestions(project, `status = 'new'`, true)
+}
+
+// HiddenSuggestions lists the suggestions the operator hid (snoozed or
+// dismissed), whenever last seen: they can be brought back (Unhide).
+func (s *Store) HiddenSuggestions(project string) ([]*Suggestion, error) {
+	return s.suggestions(project, `status IN ('snoozed', 'dismissed')`, false)
+}
+
+// Unhide puts a hidden suggestion back in the waiting list.
+func (s *Store) Unhide(id int64) error {
+	_, err := s.DB.ExecContext(bg(), `UPDATE error_suggestions SET status = 'new', snooze_until = NULL
+		WHERE id = ? AND status IN ('snoozed', 'dismissed')`, id)
+	return err
+}
+
+func (s *Store) suggestions(project, cond string, windowed bool) ([]*Suggestion, error) {
 	q := `SELECT id, project, service, signature, status, coalesce(snooze_until, ''), coalesce(task_id, ''), count, last_count,
-		first_seen, last_seen, sample, caller, prefix, request_id, stacktrace, coalesce(flow_id, 0) FROM error_suggestions WHERE status = 'new'`
+		first_seen, last_seen, sample, caller, prefix, request_id, stacktrace, coalesce(flow_id, 0) FROM error_suggestions WHERE ` + cond
 	var args []any
 	if project != "" {
 		q += ` AND project = ?`
@@ -1095,6 +1124,22 @@ func (s *Store) Suggestions(project string) ([]*Suggestion, error) {
 	}
 	defer rows.Close()
 	var out []*Suggestion
+	cutoff := map[string]time.Time{} // per project; zero: no cut
+	stale := func(g *Suggestion) bool {
+		if !windowed || s.SuggestionWindow == nil {
+			return false
+		}
+		c, ok := cutoff[g.Project]
+		if !ok {
+			if w := s.SuggestionWindow(g.Project); w > 0 {
+				if last, _ := s.LastGoodScan(g.Project); last != nil {
+					c = last.Latest.Add(-w)
+				}
+			}
+			cutoff[g.Project] = c
+		}
+		return !c.IsZero() && g.LastSeen.Before(c)
+	}
 	for rows.Next() {
 		var g Suggestion
 		var snooze, first, last string
@@ -1105,7 +1150,17 @@ func (s *Store) Suggestions(project string) ([]*Suggestion, error) {
 		g.SnoozeUntil, g.FirstSeen, g.LastSeen = parseTS(snooze), parseTS(first), parseTS(last)
 		out = append(out, &g)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close() // stale reads the scans: free the connection first
+	kept := out[:0]
+	for _, g := range out {
+		if !stale(g) {
+			kept = append(kept, g)
+		}
+	}
+	return kept, nil
 }
 
 // SetSuggestion changes a suggestion's status: dismissed (never again),
@@ -1173,6 +1228,19 @@ func (s *Store) SuggestionFlows(project string) ([]*ErrorFlow, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.flowsOf(gs)
+}
+
+// HiddenFlows is HiddenSuggestions grouped by flow, as SuggestionFlows.
+func (s *Store) HiddenFlows(project string) ([]*ErrorFlow, error) {
+	gs, err := s.HiddenSuggestions(project)
+	if err != nil {
+		return nil, err
+	}
+	return s.flowsOf(gs)
+}
+
+func (s *Store) flowsOf(gs []*Suggestion) ([]*ErrorFlow, error) {
 	var out []*ErrorFlow
 	byID := map[int64]*ErrorFlow{}
 	for _, g := range gs {

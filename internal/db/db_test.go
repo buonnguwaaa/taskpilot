@@ -25,7 +25,7 @@ func TestOpenMigratesAndIsPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := d.SchemaVersion(context.Background()); err != nil || v != 14 {
+	if v, err := d.SchemaVersion(context.Background()); err != nil || v != 16 {
 		t.Fatalf("schema version = %d, %v", v, err)
 	}
 	d.Close()

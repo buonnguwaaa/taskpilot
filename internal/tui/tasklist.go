@@ -12,11 +12,68 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/store"
 )
 
-// The task list is split in two groups, each under a header row:
-// "Đang làm" (anything not done, failed included) then "Đã xong".
+// The task list is split in three groups, each under a header row:
+// "Đang làm" (anything not done nor on hold, failed included), "Tạm hoãn"
+// (put on hold by the operator, key z) then "Đã xong". Key f shows one
+// group only, or the tasks waiting on you.
 
-// isDone reports whether a task belongs to the "Đã xong" group.
+// isDone reports whether a task is finished.
 func isDone(t *store.Task) bool { return t.State == store.StateDone }
+
+type taskGroup int
+
+const (
+	groupActive taskGroup = iota
+	groupPostponed
+	groupDone
+)
+
+var groupNames = [...]string{"Đang làm", "Tạm hoãn", "Đã xong"}
+
+// group is the list group of a task.
+func (t *tasksTab) group(x *store.Task) taskGroup {
+	switch {
+	case isDone(x):
+		return groupDone
+	case t.postponed[x.ID]:
+		return groupPostponed
+	}
+	return groupActive
+}
+
+// listFilter is what the list shows (key f cycles through them).
+type listFilter int
+
+const (
+	filterAll listFilter = iota
+	filterActive
+	filterPostponed
+	filterDone
+	filterInbox
+	filterCount
+)
+
+var filterNames = [...]string{"Tất cả", "Đang làm", "Tạm hoãn", "Đã xong", "Cần bạn"}
+
+// shows reports whether the filter keeps a task.
+func (t *tasksTab) shows(x *store.Task) bool {
+	switch t.filter {
+	case filterActive:
+		return t.group(x) == groupActive
+	case filterPostponed:
+		return t.group(x) == groupPostponed
+	case filterDone:
+		return t.group(x) == groupDone
+	case filterInbox:
+		return t.waitsOnYou(x)
+	}
+	return true
+}
+
+// waitsOnYou: the task is parked on the operator and not put on hold.
+func (t *tasksTab) waitsOnYou(x *store.Task) bool {
+	return needsOperator(x.State) && !t.postponed[x.ID]
+}
 
 // listRow is one row of the task list: a group header (task < 0) or a task.
 type listRow struct {
@@ -25,22 +82,17 @@ type listRow struct {
 }
 
 // rows lays out the list: the groups with their headers, in list order
-// (reloadTasks puts the active tasks first).
+// (reloadTasks sorts the list by group).
 func (t *tasksTab) rows() []listRow {
-	active := 0
+	var count [len(groupNames)]int
 	for _, x := range t.list {
-		if !isDone(x) {
-			active++
-		}
+		count[t.group(x)]++
 	}
-	done := len(t.list) - active
 	var out []listRow
 	for i, x := range t.list {
-		if i == 0 && active > 0 {
-			out = append(out, listRow{task: -1, header: fmt.Sprintf("Đang làm (%d)", active)})
-		}
-		if isDone(x) && (i == 0 || !isDone(t.list[i-1])) {
-			out = append(out, listRow{task: -1, header: fmt.Sprintf("Đã xong (%d)", done)})
+		// One group shown (key f): the list title names it, no header.
+		if g := t.group(x); t.filter == filterAll && (i == 0 || g != t.group(t.list[i-1])) {
+			out = append(out, listRow{task: -1, header: fmt.Sprintf("%s (%d)", groupNames[g], count[g])})
 		}
 		out = append(out, listRow{task: i})
 	}

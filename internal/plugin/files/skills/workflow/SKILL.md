@@ -87,6 +87,13 @@ result, or a symptom someone reported. The evidence it carries (signature,
 counts, caller, request_id, sample lines, the SPL) is a starting point, not the
 answer.
 
+- Recipes first: the operator keeps debugging recipes (skills named
+  `recipe-*`, or `run_recipe` without a name to list them). When one fits the
+  question (check an order, a transaction, a callback…), run it with
+  `run_recipe` before writing the same lookups yourself; it returns every
+  result at once plus how to read them. Continue with your own lookups where
+  it stops.
+
 - Profile: treat it as **Hard** at least (`opus`/`high`) unless the cause is
   obvious from the ticket. The planning run is where the investigation happens,
   so say in your first status line if the default profile is too weak.

@@ -22,6 +22,7 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/desktop"
 	"github.com/buonnguwaaa/taskpilot/internal/hasakiwork"
 	"github.com/buonnguwaaa/taskpilot/internal/intake"
+	"github.com/buonnguwaaa/taskpilot/internal/recipe"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
@@ -98,6 +99,14 @@ type Deps struct {
 	Assess func(ctx context.Context, in worklog.AssessInput) (*worklog.Assessment, error)
 	// SPLGen writes a Splunk search from a question (nil: "Hỏi bằng lời" is unavailable).
 	SPLGen func(ctx context.Context, lc splgen.Context, question string) (*splgen.Result, error)
+	// ScanNow runs a project's production error scan now, outside its
+	// schedule (key r on "Đề xuất sửa lỗi"); it returns the new suggestions.
+	ScanNow func(ctx context.Context, project string) (int, error)
+	// RunRecipe runs a debugging recipe as the operator (read-only lookups,
+	// no Claude) and returns its results.
+	RunRecipe func(ctx context.Context, r *recipe.Recipe, vals map[string]string) (string, error)
+	// Reflect proposes recipes from a project's recent tasks and returns a summary.
+	Reflect func(ctx context.Context, project string) (string, error)
 }
 
 type tabID int
@@ -372,6 +381,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reloadTasks()
 		m.refreshHWDetail()
 		return m, nil
+	case suggChangedMsg:
+		return m.onSuggChanged(msg)
+	case recipeStartMsg:
+		mm, cmd := m.runRecipe(msg.r, msg.vals)
+		return mm, cmd
+	case recipeDoneMsg:
+		return m.onRecipeDone(msg)
+	case recipesChangedMsg:
+		return m.onRecipesChanged(msg)
+	case reflectStartMsg:
+		m.logs.rec.reflecting = string(msg)
+		m.msg = "Claude đang reflect " + string(msg) + "…"
+		if m.logs.rec.focus {
+			m.renderRecipes()
+		}
+		return m, nil
+	case reflectDoneMsg:
+		return m.onReflectDone(msg)
+	case scanDoneMsg:
+		return m.onScanDone(msg)
 	case qcResultMsg:
 		return m.onQCResult(msg)
 	case qcStartedMsg:
@@ -693,6 +722,9 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if wheel {
 			return m.moveHW(map[bool]int{true: -1, false: 1}[up])
 		}
+		if ev.Button == tea.MouseButtonLeft {
+			m.hw.focus = !inList && m.hw.current() != nil
+		}
 		if inList && ev.Button == tea.MouseButtonLeft && row >= 0 && row < m.listRows() {
 			if i := m.hw.offset(m.listRows()) + row/taskEntryLines; i < len(m.hw.list) {
 				if i == m.hw.cursor {
@@ -936,7 +968,7 @@ func (m Model) footerView() string {
 	keys := ""
 	switch m.tab {
 	case tabTasks:
-		keys = "↑↓ chọn · n task mới · d xoá · c xong · a duyệt · x từ chối · m nhắn · u thu hồi · t trò chuyện · Enter cuộn chi tiết · / tìm · p PR · h Hasaki Work · A duyệt+ghi chú · H subtask · o làm tay · v hoạt động · w/W xem code · e model · N task từ prompt · f lọc"
+		keys = "↑↓ chọn · n task mới · d xoá · c xong · z tạm hoãn · a duyệt · x từ chối · m nhắn · u thu hồi · t trò chuyện · Enter cuộn chi tiết · / tìm · p PR · h Hasaki Work · A duyệt+ghi chú · H subtask · o làm tay · v hoạt động · w/W xem code · e model · N task từ prompt · f/F lọc"
 		if p := m.tasks.pending; p != nil && len(p.Questions) > 0 {
 			keys = "câu hỏi: " + inlineKeys(p) + " · ↑↓ task khác"
 		}
@@ -947,7 +979,10 @@ func (m Model) footerView() string {
 			keys = "Claude đang soạn task từ prompt… · " + keys
 		}
 	case tabHasaki:
-		keys = "↑↓ chọn · Enter giao cho agent · a gộp vào task đang làm · n tạo subtask · s lọc trạng thái · r tải lại"
+		keys = "↑↓ chọn · Enter giao cho agent · a gộp vào task đang làm · n tạo subtask · →/l cuộn chi tiết · s lọc trạng thái · r tải lại"
+		if m.hw.focus {
+			keys = "chi tiết: j/k ↑↓ cuộn · PgUp/PgDn nửa trang · g/G đầu/cuối · Esc/← về danh sách · Enter giao cho agent"
+		}
 	case tabLogs:
 		common := "↑↓ chọn · Enter chạy · g nhóm lỗi · n điều tra · / tìm · t/T thời gian · r chạy lại · c copy"
 		if m.logs.env == envQC {
@@ -955,8 +990,10 @@ func (m Model) footerView() string {
 		} else {
 			keys = "e QC · ←/→ project · " + common + " · a hỏi bằng lời · o Splunk Web · i kiến thức"
 		}
-		if m.logs.suggFocus {
-			keys = "đề xuất: " + suggestKeys
+		if m.logs.rec.focus {
+			keys = "quy trình: " + recipeKeys
+		} else if m.logs.suggFocus {
+			keys = "đề xuất: " + m.suggKeys()
 		} else if m.logs.groupsFocus || m.logs.qc.groupsFocus {
 			keys = "nhóm lỗi: ↑↓ chọn · Enter xem log · n điều tra · f sửa ngay · s chỉ service này · esc về danh sách"
 		}

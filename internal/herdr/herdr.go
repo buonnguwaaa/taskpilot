@@ -146,3 +146,77 @@ func Command(argv ...string) string {
 	}
 	return strings.Join(q, " ")
 }
+
+// Tab is a herdr tab.
+type Tab struct {
+	ID    string `json:"tab_id"`
+	Label string `json:"label"`
+}
+
+// Tabs lists the tabs of the session.
+func (c *Client) Tabs(ctx context.Context) ([]Tab, error) {
+	out, err := c.run(ctx, "tab", "list")
+	if err != nil {
+		return nil, err
+	}
+	var e struct {
+		Result struct {
+			Tabs []Tab `json:"tabs"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out, &e); err != nil {
+		return nil, fmt.Errorf("herdr: unexpected output: %s", strings.TrimSpace(string(out)))
+	}
+	if e.Error != nil {
+		return nil, errors.New("herdr: " + e.Error.Message)
+	}
+	return e.Result.Tabs, nil
+}
+
+// CloseTab closes a tab and its panes.
+func (c *Client) CloseTab(ctx context.Context, tabID string) error {
+	_, err := c.run(ctx, "tab", "close", tabID)
+	return err
+}
+
+// Agent states a pane reports (herdr pane report-agent).
+const (
+	AgentIdle    = "idle"
+	AgentWorking = "working"
+	AgentBlocked = "blocked"
+)
+
+// reportSource names taskpilot as the reporter of the agent state.
+const reportSource = "taskpilot"
+
+// ReportAgent makes the pane show as a Claude agent in state (idle, working,
+// blocked) with a short message; sessionID is the Claude session, if any.
+func (c *Client) ReportAgent(ctx context.Context, paneID, state, message, sessionID string) error {
+	args := []string{"pane", "report-agent", paneID, "--source", reportSource, "--agent", "claude", "--state", state}
+	if message != "" {
+		args = append(args, "--message", message)
+	}
+	if sessionID != "" {
+		args = append(args, "--agent-session-id", sessionID)
+	}
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// ReportTitle sets the title herdr shows for the pane's agent.
+func (c *Client) ReportTitle(ctx context.Context, paneID, title string) error {
+	_, err := c.run(ctx, "pane", "report-metadata", paneID, "--source", reportSource, "--title", title)
+	return err
+}
+
+// ReleaseAgent stops reporting the pane as an agent.
+func (c *Client) ReleaseAgent(ctx context.Context, paneID string) error {
+	_, err := c.run(ctx, "pane", "release-agent", paneID, "--source", reportSource, "--agent", "claude")
+	return err
+}
+
+// WatchLabel is the label of the tab that shows a background task.
+func WatchLabel(taskID string) string { return "tp " + taskID }

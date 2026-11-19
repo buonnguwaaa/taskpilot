@@ -4,3 +4,4 @@ bin/
 *.db-shm
 taskpilot-data-*.tar.gz
 taskpilot-secrets-*.tar.gz
+/taskpilot

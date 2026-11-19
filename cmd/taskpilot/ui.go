@@ -19,6 +19,8 @@ import (
 	"github.com/buonnguwaaa/taskpilot/internal/herdr"
 	"github.com/buonnguwaaa/taskpilot/internal/intake"
 	"github.com/buonnguwaaa/taskpilot/internal/logring"
+	"github.com/buonnguwaaa/taskpilot/internal/recipe"
+	"github.com/buonnguwaaa/taskpilot/internal/scan"
 	"github.com/buonnguwaaa/taskpilot/internal/source"
 	"github.com/buonnguwaaa/taskpilot/internal/splgen"
 	"github.com/buonnguwaaa/taskpilot/internal/splunk"
@@ -89,6 +91,19 @@ func cmdTUI(args []string) error {
 		},
 		Splunk: func(ctx context.Context) (*splunk.Client, error) { return splunkClient(ctx, cfg, "operator:tui") },
 		ArgoCD: func(ctx context.Context) (*argocd.Client, error) { return argocdClient(ctx, cfg, "operator:tui") },
+		ScanNow: (&scan.Scanner{Config: func() *config.Config { return cfg }, Store: st,
+			Splunk: func(ctx context.Context) (*splunk.Client, error) { return splunkClient(ctx, cfg, "operator:scan") },
+			Group:  flowGrouper(func() *config.Config { return cfg })}).Run,
+		RunRecipe: func(ctx context.Context, r *recipe.Recipe, vals map[string]string) (string, error) {
+			return runRecipe(ctx, cfg, st, r, vals)
+		},
+		Reflect: func(ctx context.Context, project string) (string, error) {
+			out, err := (&recipe.Reflector{Config: cfg, Store: st}).Reflect(ctx, project, time.Time{})
+			if err != nil {
+				return "", err
+			}
+			return reflectSummary(project, out), nil
+		},
 	}
 
 	var hc *herdr.Client

@@ -67,6 +67,9 @@ type Handlers struct {
 	Store  *store.Store
 	Config *config.Config
 	TaskID string
+	// Project scopes the read-only lookups when there is no task (TaskID
+	// empty): the operator running a recipe from the TUI or the CLI.
+	Project string
 	// Bitbucket returns a client with the operator's credentials; the token
 	// stays inside this process and never reaches the agent.
 	Bitbucket func(ctx context.Context) (*bitbucket.Client, error)
@@ -94,6 +97,22 @@ type Handlers struct {
 	// graphUsed: graphify was called in this run; graphNudged: a plan
 	// request was sent back once to use it first.
 	graphUsed, graphNudged atomic.Bool
+}
+
+// project is the project the lookups are scoped to: the task's, or Project
+// when there is no task.
+func (h *Handlers) project() (string, error) {
+	if h.TaskID == "" {
+		if h.Project == "" {
+			return "", errors.New("no task and no project")
+		}
+		return h.Project, nil
+	}
+	t, err := h.Store.LoadTask(h.TaskID)
+	if err != nil {
+		return "", err
+	}
+	return t.Project, nil
 }
 
 // RequestApproval records an approval request for the operator.
@@ -786,14 +805,14 @@ func (h *Handlers) SplunkSearch(ctx context.Context, in SplunkSearchIn) (string,
 	if max < 0 {
 		max = 0 // no limit
 	}
-	t, err := h.Store.LoadTask(h.TaskID)
+	project, err := h.project()
 	if err != nil {
 		return "", err
 	}
-	if p := h.Config.Projects[t.Project]; p.NoLogs {
+	if p := h.Config.Projects[project]; p.NoLogs {
 		return "", fmt.Errorf("project %s has no logs in Splunk (no_logs); investigate with the code, the database or the ticket instead", p.Name)
 	}
-	query := splunk.Scope(h.Config.Projects[t.Project].SplunkFilter, in.Query)
+	query := splunk.Scope(h.Config.Projects[project].SplunkFilter, in.Query)
 	if h.Splunk == nil {
 		return "", splunk.ErrNoCredentials
 	}
@@ -808,7 +827,9 @@ func (h *Handlers) SplunkSearch(ctx context.Context, in SplunkSearchIn) (string,
 	if err != nil {
 		rec.Error = err.Error()
 	}
-	_ = h.Store.AppendSplunkQuery(h.TaskID, rec)
+	if h.TaskID != "" {
+		_ = h.Store.AppendSplunkQuery(h.TaskID, rec)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -823,18 +844,18 @@ type DBQueryIn struct {
 
 // DBQuery runs one read-only statement on the task project's QC database.
 func (h *Handlers) DBQuery(ctx context.Context, in DBQueryIn) (string, error) {
-	t, err := h.Store.LoadTask(h.TaskID)
+	project, err := h.project()
 	if err != nil {
 		return "", err
 	}
-	p := h.Config.Projects[t.Project]
+	p := h.Config.Projects[project]
 	if p.QCDB == nil {
 		return "", fmt.Errorf("project %s has no QC database configured; ask the operator if you need data", p.Name)
 	}
 	if err := qcdb.Validate(in.SQL); err != nil {
 		return "", err
 	}
-	dsn, err := qcdb.DSN(ctx, t.Project, p.QCDB, h.Secret)
+	dsn, err := qcdb.DSN(ctx, project, p.QCDB, h.Secret)
 	if err != nil {
 		return "", err
 	}
@@ -849,7 +870,9 @@ func (h *Handlers) DBQuery(ctx context.Context, in DBQueryIn) (string, error) {
 	} else {
 		rec.Rows = len(res.Rows)
 	}
-	_ = h.Store.AppendDBQuery(h.TaskID, rec)
+	if h.TaskID != "" {
+		_ = h.Store.AppendDBQuery(h.TaskID, rec)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -864,11 +887,11 @@ type QCConfigIn struct {
 // qcConfig checks the path against the project's vault_paths and returns a
 // client; every call is audited.
 func (h *Handlers) qcConfig(ctx context.Context, action, p string) (*vault.Client, []string, error) {
-	t, err := h.Store.LoadTask(h.TaskID)
+	project, err := h.project()
 	if err != nil {
 		return nil, nil, err
 	}
-	proj := h.Config.Projects[t.Project]
+	proj := h.Config.Projects[project]
 	if h.Config.Vault.URL == "" || len(proj.VaultPaths) == 0 {
 		return nil, nil, fmt.Errorf("project %s has no QC Vault paths configured (vault_paths); ask the operator", proj.Name)
 	}
@@ -887,7 +910,9 @@ func (h *Handlers) auditVault(action, p string, keys int, err error) {
 	if err != nil {
 		r.Error = err.Error()
 	}
-	_ = h.Store.AppendVaultRead(h.TaskID, r)
+	if h.TaskID != "" {
+		_ = h.Store.AppendVaultRead(h.TaskID, r)
+	}
 }
 
 // QCConfigList lists keys of the QC Vault under an allowed path.
@@ -972,11 +997,11 @@ type QCKafkaGroupsIn struct {
 
 // qcKafka returns a client and cluster when the project may read Kafka.
 func (h *Handlers) qcKafka(ctx context.Context) (*kafbat.Client, string, []string, error) {
-	t, err := h.Store.LoadTask(h.TaskID)
+	project, err := h.project()
 	if err != nil {
 		return nil, "", nil, err
 	}
-	proj := h.Config.Projects[t.Project]
+	proj := h.Config.Projects[project]
 	if h.Config.Kafka.URL == "" || len(proj.KafkaTopics) == 0 {
 		return nil, "", nil, fmt.Errorf("project %s has no QC Kafka topics configured (kafka_topics); ask the operator", proj.Name)
 	}
@@ -1112,11 +1137,11 @@ func (h *Handlers) projectApps(ctx context.Context) (*argocd.Client, []argocd.Ap
 	if h.ArgoCD == nil {
 		return nil, nil, argocd.ErrNoCredentials
 	}
-	t, err := h.Store.LoadTask(h.TaskID)
+	project, err := h.project()
 	if err != nil {
 		return nil, nil, err
 	}
-	p := h.Config.Projects[t.Project]
+	p := h.Config.Projects[project]
 	cl, err := h.ArgoCD(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -1399,6 +1424,14 @@ func NewServer(h *Handlers) *mcp.Server {
 			"Use it to verify a change on QC or to investigate a QC bug report.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in QCLogsIn) (*mcp.CallToolResult, any, error) {
 		return reply(h.QCLogs(ctx, in))
+	})
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "run_recipe",
+		Description: "Run one of the operator's debugging recipes of this project (skills named recipe-*): a fixed list of read-only " +
+			"lookups (QC SQL, Splunk, QC logs, QC Vault, QC Kafka) filled with your parameters, all results in one answer, " +
+			"plus how to read them. Prefer it to writing the same lookups yourself. Without a name it lists the project's recipes.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in RunRecipeIn) (*mcp.CallToolResult, any, error) {
+		return reply(h.RunRecipe(ctx, in))
 	})
 	if h.Config.Graphify != nil {
 		mcp.AddTool(s, &mcp.Tool{

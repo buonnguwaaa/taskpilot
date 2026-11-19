@@ -35,8 +35,17 @@ func TestSuggestionsFromScans(t *testing.T) {
 	if v := m.View(); !strings.Contains(v, "Đề xuất sửa lỗi — bom") || !strings.Contains(v, "lịch 09:00, 14:00") || !strings.Contains(v, "x bỏ qua hẳn") {
 		t.Fatalf("view:\n%s", v)
 	}
-	// x: never again.
+	// x: never again, once confirmed.
 	m, _ = press(t, m, "j", "x")
+	if m.conf == nil {
+		t.Fatal("x asks first")
+	}
+	if gs, _ := st.Suggestions("bom"); len(gs) != 2 {
+		t.Fatal("nothing hidden before y")
+	}
+	m, cmd := press(t, m, "y")
+	tm, _ := m.Update(cmd())
+	m = tm.(Model)
 	if gs, _ := st.Suggestions("bom"); len(gs) != 1 || gs[0].Service != "bom-api" {
 		t.Fatalf("after x: %+v", gs)
 	}

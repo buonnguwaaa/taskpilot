@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -19,7 +20,18 @@ import (
 
 const itemSuggest = "Đề xuất sửa lỗi"
 
-const suggestKeys = "↑↓ chọn · Enter mở luồng / xem log · n điều tra · f tạo task sửa · x bỏ qua hẳn · z ẩn 7 ngày · esc về danh sách"
+const (
+	suggestKeys = "↑↓ chọn · Enter mở luồng / xem log · n điều tra · f tạo task sửa · x bỏ qua hẳn · z ẩn 7 ngày · v xem đã ẩn · r quét ngay · esc về danh sách"
+	hiddenKeys  = "↑↓ chọn · Enter mở luồng / xem log · u bỏ ẩn · U bỏ ẩn tất cả · v về đề xuất · esc về danh sách"
+)
+
+// suggKeys are the keys of the suggestion list in its current view.
+func (m Model) suggKeys() string {
+	if m.logs.suggHidden {
+		return hiddenKeys
+	}
+	return suggestKeys
+}
 
 // suggestionCount is the number of error groups waiting ("" = every project).
 func (m Model) suggestionCount(project string) int {
@@ -79,7 +91,11 @@ func (m Model) currentEntry() *suggEntry {
 // loadFlows reads the project's waiting flows.
 func (m *Model) loadFlows() error {
 	name, _ := m.logProject()
-	fs, err := m.d.Store.SuggestionFlows(name)
+	load := m.d.Store.SuggestionFlows
+	if m.logs.suggHidden {
+		load = m.d.Store.HiddenFlows
+	}
+	fs, err := load(name)
 	if err != nil {
 		return err
 	}
@@ -89,18 +105,20 @@ func (m *Model) loadFlows() error {
 	}
 	n := len(m.suggEntries())
 	m.logs.suggCursor = min(m.logs.suggCursor, max(0, n-1))
-	m.logs.suggFocus = n > 0
+	m.logs.suggFocus = n > 0 || m.logs.suggHidden // the hidden view keeps the keys (v back)
 	return nil
 }
 
 // openSuggestions shows the project's suggestions with the cursor in them.
 func (m Model) openSuggestions() (tea.Model, tea.Cmd) {
 	m.logs.suggCursor = 0
+	m.logs.suggHidden = false
 	if err := m.loadFlows(); err != nil {
 		m.msg = "đọc đề xuất: " + err.Error()
 		return m, nil
 	}
 	m.logs.groupsFocus = false
+	m.logs.rec.focus, m.logs.rec.shown = false, nil
 	m.renderSuggestions()
 	m.logs.vp.GotoTop()
 	return m, nil
@@ -140,6 +158,9 @@ func (m *Model) renderSuggestions() {
 	name, _ := m.logProject()
 	var b strings.Builder
 	title := "Đề xuất sửa lỗi — " + name
+	if m.logs.suggHidden {
+		title = "Đề xuất đã ẩn — " + name
+	}
 	if last, _ := m.d.Store.LastScan(name); last != nil {
 		title += fmt.Sprintf(" · lần quét cuối %s (%s → %s)", last.StartedAt.Local().Format("02/01 15:04"),
 			last.Earliest.Local().Format("02/01 15:04"), last.Latest.Local().Format("15:04"))
@@ -150,16 +171,22 @@ func (m *Model) renderSuggestions() {
 	if p := m.d.Config.Projects[name]; p.LogsProduction != nil && p.LogsProduction.Scan != nil {
 		title += " · lịch " + strings.Join(p.LogsProduction.Scan.Times, ", ")
 	}
+	if m.logs.scanning == name {
+		b.WriteString(accentStyle.Render("Đang quét lỗi production…") + "\n")
+	}
 	groups, total := 0, 0
 	for _, f := range m.logs.flows {
 		groups += len(f.Members)
 		total += f.Total()
 	}
 	b.WriteString(titleStyle.Render(wrap(title, w)) + "\n")
-	b.WriteString(dimStyle.Render(fmt.Sprintf("%d luồng · %d nhóm · %d lỗi · %s", len(m.logs.flows), groups, total, suggestKeys)) + "\n\n")
+	b.WriteString(dimStyle.Render(fmt.Sprintf("%d luồng · %d nhóm · %d lỗi · %s", len(m.logs.flows), groups, total, m.suggKeys())) + "\n\n")
 	es := m.suggEntries()
-	if len(es) == 0 {
-		b.WriteString(dimStyle.Render("Không có đề xuất nào đang chờ."))
+	switch {
+	case len(es) == 0 && m.logs.suggHidden:
+		b.WriteString(dimStyle.Render("Không có đề xuất nào đang ẩn."))
+	case len(es) == 0:
+		b.WriteString(dimStyle.Render("Không có đề xuất nào đang chờ. v xem các đề xuất đã ẩn."))
 	}
 	sel := 0
 	for i, e := range es {
@@ -172,9 +199,9 @@ func (m *Model) renderSuggestions() {
 			}
 			row = fmt.Sprintf("%s %6d  %s  (%d nhóm: %s)", mark, e.flow.Total(), flowName(e.flow), len(e.flow.Members), flowServices(e.flow))
 		case multi(e.flow):
-			row = fmt.Sprintf("    %6d  %-20s %s", e.member.LastCount, truncate(e.member.Service, 20), e.member.Signature)
+			row = fmt.Sprintf("    %6d  %s%-20s %s", e.member.LastCount, m.hiddenTag(e.member), truncate(e.member.Service, 20), e.member.Signature)
 		default:
-			row = fmt.Sprintf("  %6d  %-20s %s", e.member.LastCount, truncate(e.member.Service, 20), e.member.Signature)
+			row = fmt.Sprintf("  %6d  %s%-20s %s", e.member.LastCount, m.hiddenTag(e.member), truncate(e.member.Service, 20), e.member.Signature)
 		}
 		row = truncate(row, w)
 		switch {
@@ -224,25 +251,24 @@ func (m *Model) renderSuggestions() {
 	}
 }
 
+// hiddenTag is the column saying how a suggestion is hidden (hidden view only).
+func (m Model) hiddenTag(s *store.Suggestion) string {
+	if !m.logs.suggHidden {
+		return ""
+	}
+	tag := "bỏ qua hẳn"
+	if s.Status == "snoozed" {
+		tag = "ẩn tới " + s.SnoozeUntil.Local().Format("02/01")
+	}
+	return fmt.Sprintf("%-13s ", tag)
+}
+
 // targets are the suggestions an action on the entry applies to.
 func (e suggEntry) targets() []*store.Suggestion {
 	if e.member != nil {
 		return []*store.Suggestion{e.member}
 	}
 	return e.flow.Members
-}
-
-// setSuggestions changes suggestions and reloads the list.
-func (m *Model) setSuggestions(ss []*store.Suggestion, status string, until time.Time) {
-	for _, s := range ss {
-		if err := m.d.Store.SetSuggestion(s.ID, status, until, ""); err != nil {
-			m.msg = "đề xuất: " + err.Error()
-			return
-		}
-	}
-	if err := m.loadFlows(); err != nil {
-		m.msg = "đọc đề xuất: " + err.Error()
-	}
 }
 
 // suggestionsDone marks suggestions once their task was submitted.
@@ -306,23 +332,59 @@ func (m Model) suggestKey(k tea.KeyMsg) (Model, tea.Cmd, bool) {
 		m.logs.suggCursor = max(0, m.logs.suggCursor-1)
 	case "esc":
 		m.logs.suggFocus = false
+	case "r":
+		mm, cmd := m.scanNow()
+		return mm.(Model), cmd, true
+	case "v":
+		m.logs.suggHidden = !m.logs.suggHidden
+		m.logs.suggCursor = 0
+		if err := m.loadFlows(); err != nil {
+			m.msg = "đọc đề xuất: " + err.Error()
+		}
 	case "x", "z":
 		if e == nil {
 			return m, nil, true
 		}
+		if m.logs.suggHidden {
+			m.msg = "đề xuất này đang ẩn: u bỏ ẩn, v về danh sách đề xuất"
+			return m, nil, true
+		}
+		return m.confirmHide(e, k.String() == "x"), nil, true
+	case "u":
+		if e == nil || !m.logs.suggHidden {
+			m.msg = "u bỏ ẩn trong danh sách đã ẩn (v)"
+			return m, nil, true
+		}
 		ts := e.targets()
-		what := truncate(e.targets()[0].Signature, 60)
-		if e.member == nil {
-			what = fmt.Sprintf("luồng %s (%d nhóm)", truncate(flowName(e.flow), 50), len(ts))
-		}
-		if k.String() == "x" {
-			m.setSuggestions(ts, "dismissed", time.Time{})
-			m.msg = "đã bỏ qua hẳn: " + what
+		if err := unhide(m.d.Store, ts); err != nil {
+			m.msg = "bỏ ẩn: " + err.Error()
 		} else {
-			until := time.Now().Add(7 * 24 * time.Hour)
-			m.setSuggestions(ts, "snoozed", until)
-			m.msg = "ẩn đến " + until.Local().Format("02/01") + " (hiện lại nếu lỗi còn): " + what
+			m.msg = fmt.Sprintf("đã bỏ ẩn %s (v về danh sách đề xuất)", entryName(*e))
 		}
+		m.logs.suggestions = m.suggestionCount("")
+		if err := m.loadFlows(); err != nil {
+			m.msg = "đọc đề xuất: " + err.Error()
+		}
+	case "U":
+		if !m.logs.suggHidden || len(m.logs.flows) == 0 {
+			m.msg = "U bỏ ẩn tất cả trong danh sách đã ẩn (v)"
+			return m, nil, true
+		}
+		var all []*store.Suggestion
+		for _, f := range m.logs.flows {
+			all = append(all, f.Members...)
+		}
+		name, _ := m.logProject()
+		st := m.d.Store
+		m.conf = &confirm{text: fmt.Sprintf("Bỏ ẩn cả %d nhóm lỗi đã ẩn của %s?\nChúng quay lại danh sách đề xuất (chỉ hiện nhóm còn thấy trong khoảng quét gần nhất).", len(all), name),
+			onYes: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := unhide(st, all); err != nil {
+						return suggChangedMsg("bỏ ẩn: " + err.Error())
+					}
+					return suggChangedMsg(fmt.Sprintf("đã bỏ ẩn %d nhóm lỗi của %s", len(all), name))
+				}
+			}}
 	case "enter", " ":
 		if e == nil {
 			return m, nil, true
@@ -363,4 +425,115 @@ func (m Model) suggestKey(k tea.KeyMsg) (Model, tea.Cmd, bool) {
 	}
 	m.renderSuggestions()
 	return m, nil, true
+}
+
+// scanDoneMsg reports a scan started with key r.
+type scanDoneMsg struct {
+	project string
+	fresh   int
+	err     error
+}
+
+// scanNow runs the project's error scan now, outside its schedule: it reads
+// the time since the last good scan (at most max_window), like the daemon.
+func (m Model) scanNow() (tea.Model, tea.Cmd) {
+	name, _ := m.logProject()
+	p := m.d.Config.Projects[name]
+	switch {
+	case m.d.ScanNow == nil:
+		m.msg = "không quét được từ TUI; chạy: taskpilot scan run " + name
+		return m, nil
+	case p.LogsProduction == nil || p.LogsProduction.Scan == nil:
+		m.msg = name + " chưa bật quét lỗi (logs_production.scan trong config)"
+		return m, nil
+	case m.logs.scanning != "":
+		m.msg = "đang quét " + m.logs.scanning + ", đợi xong đã"
+		return m, nil
+	}
+	m.logs.scanning = name
+	m.msg = "đang quét lỗi production của " + name + "…"
+	m.renderSuggestions()
+	scan := m.d.ScanNow
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		n, err := scan(ctx, name)
+		return scanDoneMsg{name, n, err}
+	}
+}
+
+func (m Model) onScanDone(msg scanDoneMsg) (tea.Model, tea.Cmd) {
+	m.logs.scanning = ""
+	if msg.err != nil {
+		m.msg = "quét " + msg.project + ": " + msg.err.Error()
+	} else {
+		m.msg = fmt.Sprintf("đã quét %s: %d đề xuất mới", msg.project, msg.fresh)
+	}
+	m.logs.suggestions = m.suggestionCount("")
+	if name, _ := m.logProject(); name == msg.project {
+		if err := m.loadFlows(); err == nil {
+			m.renderSuggestions()
+		}
+	}
+	return m, nil
+}
+
+// suggChangedMsg reports a change of suggestions made after a confirmation.
+type suggChangedMsg string
+
+func (m Model) onSuggChanged(msg suggChangedMsg) (tea.Model, tea.Cmd) {
+	m.msg = string(msg)
+	m.logs.suggestions = m.suggestionCount("")
+	if err := m.loadFlows(); err != nil {
+		m.msg = "đọc đề xuất: " + err.Error()
+	}
+	m.renderSuggestions()
+	return m, nil
+}
+
+// entryName names a list entry in messages.
+func entryName(e suggEntry) string {
+	if e.member == nil {
+		return fmt.Sprintf("luồng %s (%d nhóm)", truncate(flowName(e.flow), 50), len(e.flow.Members))
+	}
+	return truncate(e.member.Signature, 60)
+}
+
+// confirmHide asks before hiding an entry: x for good, z for 7 days.
+func (m Model) confirmHide(e *suggEntry, forGood bool) Model {
+	ts, what, st := e.targets(), entryName(*e), m.d.Store
+	until := time.Now().Add(7 * 24 * time.Hour)
+	text := fmt.Sprintf("Ẩn %s đến %s?\nHiện lại sau ngày đó nếu lỗi còn. Lấy lại sớm: v xem đã ẩn, u bỏ ẩn.", what, until.Local().Format("02/01"))
+	if forGood {
+		text = fmt.Sprintf("Bỏ qua hẳn %s?\nKhông hiện lại kể cả khi lỗi còn. Lấy lại: v xem đã ẩn, u bỏ ẩn.", what)
+	}
+	m.conf = &confirm{text: text, onYes: func() tea.Cmd {
+		return func() tea.Msg {
+			for _, s := range ts {
+				var err error
+				if forGood {
+					err = st.SetSuggestion(s.ID, "dismissed", time.Time{}, "")
+				} else {
+					err = st.SetSuggestion(s.ID, "snoozed", until, "")
+				}
+				if err != nil {
+					return suggChangedMsg("đề xuất: " + err.Error())
+				}
+			}
+			if forGood {
+				return suggChangedMsg("đã bỏ qua hẳn: " + what + " (v xem đã ẩn)")
+			}
+			return suggChangedMsg("ẩn đến " + until.Local().Format("02/01") + ": " + what + " (v xem đã ẩn)")
+		}
+	}}
+	return m
+}
+
+func unhide(st *store.Store, ss []*store.Suggestion) error {
+	for _, s := range ss {
+		if err := st.Unhide(s.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
