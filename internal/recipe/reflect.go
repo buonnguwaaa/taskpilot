@@ -69,7 +69,7 @@ func (r *Reflector) Reflect(ctx context.Context, project string, since time.Time
 	if n == 0 {
 		return out, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, ReflectTimeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "reflect"), ReflectTimeout)
 	defer cancel()
 	exec := r.Run
 	if exec == nil {

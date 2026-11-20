@@ -101,8 +101,7 @@ func (m Model) connectionsCard(w int) string {
 			fmt.Fprintf(&b, "%s   %s  %s\n", strings.Repeat(" ", 5), strings.Repeat(" ", nameW), dimStyle.Render(truncate(d, textW)))
 		}
 	}
-	b.WriteString("\n" + dimStyle.Render(wrap("Bấm phím bên trái để đăng nhập · S: Splunk + tạo token 90 ngày · t: dán JWT Hasaki Work", w-4)))
-	return card("Kết nối và đăng nhập", cRule, b.String(), w)
+	return card("Kết nối", cRule, b.String(), w)
 }
 
 func padRight(s string, n int) string {
@@ -133,21 +132,19 @@ func (m Model) daemonCard(w int) string {
 		b.WriteString("\n" + titleStyle.Render("Quét lỗi production") + "\n")
 		for _, name := range names {
 			p := m.d.Config.Projects[name]
-			line := fmt.Sprintf("%s  lịch %s", padRight(name, 10), strings.Join(p.LogsProduction.Scan.Times, ", "))
-			mark := okMark
-			if last, _ := m.d.Store.LastScan(name); last != nil {
-				line += dimStyle.Render(" · lần cuối " + last.StartedAt.Local().Format("02/01 15:04"))
-				if last.Error != "" {
-					mark = errMark
-					line += errStyle.Render(" lỗi")
-				}
-			} else {
-				mark = offMark
-			}
+			line := titleStyle.Render(padRight(name, 10)) + " " + truncate("lịch "+strings.Join(p.LogsProduction.Scan.Times, ", "), w-30)
 			if n := m.suggestionCount(name); n > 0 {
 				line += warnStyle.Render(fmt.Sprintf(" · %d đề xuất", n))
 			}
-			b.WriteString(mark + " " + truncate(line, w+40) + "\n")
+			mark, detail := offMark, "chưa quét lần nào"
+			if last, _ := m.d.Store.LastScan(name); last != nil {
+				mark, detail = okMark, "lần cuối "+last.StartedAt.Local().Format("02/01 15:04")
+				if last.Error != "" {
+					mark, detail = errMark, detail+" · lỗi: "+last.Error
+				}
+			}
+			b.WriteString(mark + " " + line + "\n")
+			b.WriteString("  " + strings.Repeat(" ", 11) + dimStyle.Render(truncate(detail, w-17)) + "\n")
 		}
 	}
 	return card("Daemon", color, b.String(), w)
@@ -200,7 +197,8 @@ func (m Model) graphCard(w int) string {
 		b.WriteString(errStyle.Render(err.Error()))
 		return card("Graphify", cErr, b.String(), w)
 	}
-	b.WriteString("\n" + titleStyle.Render("Agent dùng graph (30 ngày)") + "\n")
+	b.WriteString("\n" + titleStyle.Render("Agent dùng graph (30 ngày)") + " " +
+		dimStyle.Render("chỉ task chạy sau khi project có graph") + "\n")
 	if u.Calls == 0 {
 		b.WriteString(dimStyle.Render(wrap(fmt.Sprintf("Chưa có lần gọi graphify nào trong %d task gần đây. Agent được nhắc dùng graphify ở prompt đầu và khi xin duyệt plan.", u.Tasks), w-4)) + "\n")
 	} else {
@@ -211,7 +209,7 @@ func (m Model) graphCard(w int) string {
 			}
 		}
 		big := fg(cBright)
-		fmt.Fprintf(&b, "%s lần gọi · %s/%d task có dùng", big.Render(fmt.Sprint(u.Calls)), big.Render(fmt.Sprint(u.GraphTasks)), u.Tasks)
+		fmt.Fprintf(&b, "%s lần gọi · %s/%d task có hỏi graph", big.Render(fmt.Sprint(u.Calls)), big.Render(fmt.Sprint(u.GraphTasks)), u.Tasks)
 		if u.Errors > 0 {
 			b.WriteString(warnStyle.Render(fmt.Sprintf(" · %d lỗi", u.Errors)))
 		}
@@ -223,21 +221,27 @@ func (m Model) graphCard(w int) string {
 		if pct < 50 {
 			style = warnStyle
 		}
-		b.WriteString(style.Render(fmt.Sprintf("%d/%d lượt chạy có tìm code đã hỏi graph (%d%%)", u.GraphRuns, u.SearchRuns, pct)) + "\n")
+		b.WriteString(style.Render(fmt.Sprintf("%d/%d lượt chạy có grep code đã hỏi graph (%d%%)", u.GraphRuns, u.SearchRuns, pct)) + "\n")
 	}
-	if u.With.Tasks > 0 && u.Without.Tasks > 0 {
+	const minTasks = 3 // fewer per group and the averages are one task's story
+	if u.With.Tasks+u.Without.Tasks > 0 && (u.With.Tasks < minTasks || u.Without.Tasks < minTasks) {
 		b.WriteString("\n" + titleStyle.Render("Lượt lập plan: có graph vs không") + "\n")
-		b.WriteString(dimStyle.Render(fmt.Sprintf("%-14s %5s %9s %8s %9s %8s", "", "task", "tra cứu", "subagent", "chi phí", "thời gian")) + "\n")
+		b.WriteString(dimStyle.Render(wrap(fmt.Sprintf("chưa đủ để so: %d task hỏi graph khi lập plan, %d task không (cần ít nhất %d mỗi bên)",
+			u.With.Tasks, u.Without.Tasks, minTasks), w-4)) + "\n")
+	}
+	if u.With.Tasks >= minTasks && u.Without.Tasks >= minTasks {
+		b.WriteString("\n" + titleStyle.Render("Lượt lập plan: có graph vs không") + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("%-14s %5s %9s %8s %9s %8s", "", "task", "tra cứu", "subagent", "giá API", "thời gian")) + "\n")
 		row := func(name string, e ExploreRow) {
 			fmt.Fprintf(&b, "%-14s %5d %9.1f %8.1f %9s %8s\n", name, e.Tasks, e.Lookups, e.Explorers, fmt.Sprintf("$%.2f", e.PlanCost), fmt.Sprintf("%.0fp", e.PlanMinutes))
 		}
-		row("có dùng graph", ExploreRow(u.With))
-		row("không dùng", ExploreRow(u.Without))
+		row("hỏi graph", ExploreRow(u.With))
+		row("không hỏi", ExploreRow(u.Without))
 		if u.Without.Lookups > 0 {
 			d := (u.With.Lookups - u.Without.Lookups) / u.Without.Lookups * 100
 			msg := fmt.Sprintf("tra cứu %+.0f%%", d)
 			if u.Without.PlanCost > 0 {
-				msg += fmt.Sprintf(" · chi phí plan %+.0f%%", (u.With.PlanCost-u.Without.PlanCost)/u.Without.PlanCost*100)
+				msg += fmt.Sprintf(" · giá API plan %+.0f%%", (u.With.PlanCost-u.Without.PlanCost)/u.Without.PlanCost*100)
 			}
 			style := lipgloss.NewStyle().Foreground(clr(cOk))
 			if d > 0 {
@@ -245,11 +249,11 @@ func (m Model) graphCard(w int) string {
 			}
 			b.WriteString(style.Render(msg) + "\n")
 		}
-		b.WriteString(dimStyle.Render(wrap("So sánh thô: các task khác nhau về độ khó; cần nhiều task để kết luận. Tra cứu = Grep, Glob, Read và lệnh tìm (rg, find, cat…).", w-4)) + "\n")
+		b.WriteString(dimStyle.Render(wrap("chia theo lượt lập plan (lượt 1) có hỏi graph không · so sánh thô, task khác nhau về độ khó · tra cứu = Grep, Glob, Read, rg, cat…, không tính lệnh bị chặn", w-4)) + "\n")
 	}
 	if len(u.Recent) > 0 {
 		b.WriteString("\n" + dimStyle.Render("gần đây:") + "\n")
-		for _, r := range u.Recent {
+		for _, r := range u.Recent[:min(3, len(u.Recent))] {
 			b.WriteString(dimStyle.Render(truncate("  "+r, w-4)) + "\n")
 		}
 	}
@@ -286,7 +290,7 @@ func (m Model) foldCard(w int) string {
 		b.WriteString(dimStyle.Render(strings.Join(kinds, " · ")) + "\n")
 	}
 
-	b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("%-11s %5s %8s %9s %8s %5s %8s", "level", "task", "có sub", "sub/task", "chi phí", "lượt", "từ chối")) + "\n")
+	b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("%-11s %5s %8s %9s %8s %5s %8s", "level", "task", "có sub", "sub/task", "giá API", "lượt", "từ chối")) + "\n")
 	for _, l := range fs.Levels {
 		name := levelLabels[l.Level]
 		if name == "" {
@@ -316,7 +320,7 @@ func (m Model) foldCard(w int) string {
 
 	if fs.With.Tasks > 0 && fs.Without.Tasks > 0 {
 		b.WriteString("\n" + titleStyle.Render("Hiệu quả (task Trung bình+)") + "\n")
-		b.WriteString(dimStyle.Render(fmt.Sprintf("%-15s %5s %8s %5s %12s", "", "task", "chi phí", "lượt", "gate bị từ chối")) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("%-15s %5s %8s %5s %12s", "", "task", "giá API", "lượt", "gate bị từ chối")) + "\n")
 		row := func(name string, g store.FoldGroup) {
 			rate := "-"
 			if g.Decided > 0 {
@@ -336,7 +340,7 @@ func (m Model) foldCard(w int) string {
 			}
 			b.WriteString(style.Render(msg) + "\n")
 		}
-		b.WriteString(dimStyle.Render(wrap("So sánh thô: task có subagent thường là task khó hơn; xem cùng bảng theo level.", w-4)) + "\n")
+		b.WriteString(dimStyle.Render(wrap("so sánh thô, task có subagent thường khó hơn · xem cùng bảng theo level", w-4)) + "\n")
 	}
 	return card(title, cRule, b.String(), w)
 }
@@ -351,11 +355,10 @@ func (m Model) statsCard(w int) string {
 		return card("Hoạt động", cErr, errStyle.Render(err.Error()), w)
 	}
 	big := fg(cBright)
-	fmt.Fprintf(&b, "%s %s   %s %s   %s %s   %s %s\n",
-		dimStyle.Render("hôm nay"), big.Render(fmt.Sprintf("$%.2f", st.CostToday)),
-		dimStyle.Render("7 ngày"), big.Render(fmt.Sprintf("$%.2f", st.Cost7d)),
-		dimStyle.Render("lượt chạy"), big.Render(fmt.Sprint(st.Runs7d)),
-		dimStyle.Render("task xong"), big.Render(fmt.Sprint(st.TasksDone7d)))
+	fmt.Fprintf(&b, "%s %s   %s %s   %s %s\n",
+		big.Render(fmt.Sprint(st.TasksDone7d)), dimStyle.Render("task xong"),
+		big.Render(fmt.Sprint(st.Runs7d)), dimStyle.Render("lượt chạy"),
+		big.Render(fmtUSD(st.Cost7d)), dimStyle.Render("giá API · hôm nay "+fmtUSD(st.CostToday)))
 	if len(st.Gates) > 0 {
 		b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("%-8s %8s %9s %8s %12s", "cổng", "duyệt", "đã quyết", "đang chờ", "bạn trả lời")) + "\n")
 		for _, g := range st.Gates {
@@ -372,13 +375,15 @@ func (m Model) statsCard(w int) string {
 		}
 	}
 	if len(st.TopDenials) > 0 {
-		b.WriteString("\n" + warnMark + " " + wrap("agent bị chặn nhiều nhất: "+strings.Join(st.TopDenials, ", "), w-6) + "\n")
+		b.WriteString("\n" + warnMark + " " + dimStyle.Render("agent bị chặn nhiều nhất") + "\n")
+		for _, d := range st.TopDenials[:min(3, len(st.TopDenials))] {
+			b.WriteString("  " + truncate(d, w-6) + "\n")
+		}
 	}
 	if st.OutboxPending+st.OutboxFailed > 0 {
 		fmt.Fprintf(&b, "%s báo cáo về ticket: %d đang chờ gửi lại, %d thất bại\n", warnMark, st.OutboxPending, st.OutboxFailed)
 	}
-	b.WriteString("\n" + dimStyle.Render("chi tiết: :db stats · :db runs <task>"))
-	return card("Hoạt động 7 ngày", cRule, b.String(), w)
+	return card("7 ngày qua", cRule, b.String(), w)
 }
 
 func (m Model) projectsCard(w int) string {
@@ -390,13 +395,10 @@ func (m Model) projectsCard(w int) string {
 	}
 	for _, name := range names {
 		p := m.d.Config.Projects[name]
-		fmt.Fprintf(&b, "%s %s %s\n", titleStyle.Render(padRight(name, nw)), accentStyle.Render(fmt.Sprintf("%2d repo", len(p.Repos))), dimStyle.Render(p.Name))
-		for _, l := range strings.Split(wrap(strings.Join(p.RepoNames(), ", "), max(10, w-6-2)), "\n") {
-			b.WriteString("  " + dimStyle.Render(l) + "\n")
-		}
+		fmt.Fprintf(&b, "%s %s  %s\n", titleStyle.Render(padRight(name, nw)),
+			dimStyle.Render(fmt.Sprintf("%2d repo", len(p.Repos))), truncate(p.Name, w-nw-14))
 	}
-	b.WriteString("\n" + dimStyle.Render(truncate(m.d.Config.Path, w-4)) + "\n")
-	b.WriteString(keyCap("d") + dimStyle.Render(" doctor: kiểm tra repo, nhánh, công cụ, đăng nhập"))
+	b.WriteString("\n" + dimStyle.Render(truncate(m.d.Config.Path, w-4)))
 	return card("Dự án", cRule, b.String(), w)
 }
 
@@ -420,31 +422,123 @@ func (m Model) logCard(w int) string {
 		}
 		b.WriteString(l + "\n")
 	}
-	return card("Log daemon", cRule, b.String(), w)
+	return card("Log của daemon", cRule, b.String(), w)
 }
+
+// The Status tab has three sections, switched with ←/→: what taskpilot
+// runs on (connections, daemon, gates, projects, the daemon log), the token
+// usage over time, and how the agents work (graphify, subagents).
+type statusSection int
+
+const (
+	secOverview statusSection = iota
+	secUsage
+	secAgents
+)
+
+var statusSections = []string{"Tổng quan", "Usage", "Agent"}
 
 func (m *Model) refreshStatus() {
 	w := max(40, m.stVP.Width)
-	var out []string
-	if w >= 120 {
-		lw := w * 11 / 20
-		rw := w - lw - 1
-		left := lipgloss.JoinVertical(lipgloss.Left, m.connectionsCard(lw), m.daemonCard(lw), m.graphCard(lw))
-		right := lipgloss.JoinVertical(lipgloss.Left, m.statsCard(rw), m.foldCard(rw), m.projectsCard(rw))
-		out = append(out, lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right))
-	} else {
-		out = append(out, m.connectionsCard(w), m.daemonCard(w), m.graphCard(w), m.statsCard(w), m.foldCard(w), m.projectsCard(w))
-	}
-	if m.d.Daemon.Logs != nil {
-		out = append(out, m.logCard(w))
+	wide := w >= 120
+	lw := w * 11 / 20
+	rw := w - lw - 1
+	out := []string{m.statusSectionsLine(w)}
+	switch m.stSec {
+	case secOverview:
+		if wide {
+			out = append(out, columns(
+				[]string{m.connectionsCard(lw), m.projectsCard(lw)},
+				[]string{m.daemonCard(rw), m.statsCard(rw)}))
+		} else {
+			out = append(out, m.connectionsCard(w), m.daemonCard(w), m.statsCard(w), m.projectsCard(w))
+		}
+		if m.d.Daemon.Logs != nil {
+			out = append(out, m.logCard(w))
+		}
+	case secUsage:
+		m.loadUsage()
+		out = append(out, m.usageContent(w, time.Now()))
+	case secAgents:
+		if wide {
+			out = append(out, columns([]string{m.graphCard(lw)}, []string{m.foldCard(rw)}))
+		} else {
+			out = append(out, m.graphCard(w), m.foldCard(w))
+		}
 	}
 	y := m.stVP.YOffset
 	m.stVP.SetContent(strings.Join(out, "\n"))
 	m.stVP.SetYOffset(y)
 }
 
+// statusSectionsLine names the sections, the current one bright.
+func (m Model) statusSectionsLine(w int) string {
+	var parts []string
+	for i, name := range statusSections {
+		if statusSection(i) == m.stSec {
+			parts = append(parts, activeTabStyle.Render(name))
+		} else {
+			parts = append(parts, tabStyle.Render(name))
+		}
+	}
+	return " " + strings.Join(parts, "   ") + "\n"
+}
+
+// columns sets two stacks of cards side by side, the shorter stack's last
+// card stretched so both end on the same row.
+func columns(left, right []string) string {
+	l, r := strings.Join(left, "\n"), strings.Join(right, "\n")
+	lh, rh := lipgloss.Height(l), lipgloss.Height(r)
+	switch {
+	case lh < rh:
+		left[len(left)-1] = stretch(left[len(left)-1], rh-lh)
+		l = strings.Join(left, "\n")
+	case rh < lh:
+		right[len(right)-1] = stretch(right[len(right)-1], lh-rh)
+		r = strings.Join(right, "\n")
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, l, " ", r)
+}
+
+// stretch adds n empty rows at the bottom of a card, inside its frame.
+func stretch(card string, n int) string {
+	lines := strings.Split(card, "\n")
+	bottom := lines[len(lines)-1]
+	empty := strings.NewReplacer("╰", "│", "╯", "│", "─", " ").Replace(bottom)
+	fill := make([]string, n)
+	for i := range fill {
+		fill[i] = empty
+	}
+	return strings.Join(append(append(lines[:len(lines)-1:len(lines)-1], fill...), bottom), "\n")
+}
+
+// statusKeys is the footer of the Status tab: the section's own keys.
+func (m Model) statusKeys() string {
+	switch m.stSec {
+	case secUsage:
+		return "←/→ mục · [ ] khoảng thời gian · c chia giờ/ngày/tuần/tháng · j/k cuộn · r làm mới"
+	case secAgents:
+		return "←/→ mục · j/k cuộn · r làm mới · :graphify build dựng lại graph"
+	}
+	return "←/→ mục · l Hasaki · t dán JWT · s/S Splunk (S: token 90 ngày) · a Argo CD · v Vault · K Kafka · b Bitbucket · d doctor · r làm mới"
+}
+
 func (m Model) statusKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch k.String() {
+	key := k.String()
+	switch key {
+	case "left", "right":
+		n := len(statusSections)
+		d := map[bool]int{true: n - 1, false: 1}[key == "left"]
+		m.stSec = statusSection((int(m.stSec) + d) % n)
+		m.stVP.GotoTop()
+		m.refreshStatus()
+		return m, nil
+	}
+	if m.stSec == secUsage && m.usageKey(key) {
+		m.refreshStatus()
+		return m, nil
+	}
+	switch key {
 	case "l":
 		return m.runCommand("auth login")
 	case "t":

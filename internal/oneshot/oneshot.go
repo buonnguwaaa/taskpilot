@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -41,6 +42,7 @@ func Exec(ctx context.Context, bin string, args []string, stdin string, timeout 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	Note(ctx, out)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("claude quá thời gian (%s)", timeout)
@@ -87,4 +89,70 @@ func Clip(s string, n int) string {
 		return string(r[:n]) + "…"
 	}
 	return s
+}
+
+// Usage is the token usage of one call, for the Usage tab.
+type Usage struct {
+	At         time.Time
+	Purpose    string
+	Model      string
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+	CostUSD    float64
+}
+
+// Record, when set (by the process that opened the store), is told the
+// usage of every call that answered.
+var Record func(Usage)
+
+type purposeKey struct{}
+
+// WithPurpose names what the calls made with ctx are for ("soạn task", …).
+func WithPurpose(ctx context.Context, purpose string) context.Context {
+	return context.WithValue(ctx, purposeKey{}, purpose)
+}
+
+// ParseUsage reads the usage of a `claude -p --output-format json` answer.
+func ParseUsage(out []byte) (Usage, bool) {
+	var res struct {
+		TotalCostUSD float64 `json:"total_cost_usd"`
+		Usage        struct {
+			Input      int64 `json:"input_tokens"`
+			Output     int64 `json:"output_tokens"`
+			CacheRead  int64 `json:"cache_read_input_tokens"`
+			CacheWrite int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+		ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(out), &res) != nil {
+		return Usage{}, false
+	}
+	u := res.Usage
+	if u.Input+u.Output+u.CacheRead+u.CacheWrite == 0 && res.TotalCostUSD == 0 {
+		return Usage{}, false
+	}
+	var models []string
+	for m := range res.ModelUsage {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	return Usage{Model: strings.Join(models, ","), Input: u.Input, Output: u.Output,
+		CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, CostUSD: res.TotalCostUSD}, true
+}
+
+// Note records the usage of an answer (Exec calls it; a caller running
+// claude itself calls it too).
+func Note(ctx context.Context, out []byte) {
+	if Record == nil || len(out) == 0 {
+		return
+	}
+	u, ok := ParseUsage(out)
+	if !ok {
+		return
+	}
+	u.At = time.Now()
+	u.Purpose, _ = ctx.Value(purposeKey{}).(string)
+	Record(u)
 }

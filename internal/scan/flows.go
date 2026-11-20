@@ -272,7 +272,7 @@ func (c *ClaudeGrouper) Group(ctx context.Context, in GroupInput) ([]Flow, error
 	if len(in.Groups) < 2 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, GroupTimeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "gom nhóm lỗi"), GroupTimeout)
 	defer cancel()
 	run := c.Run
 	if run == nil {

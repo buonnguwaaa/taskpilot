@@ -33,6 +33,39 @@ type RunEnd struct {
 	CacheReadTokens  int64
 	CacheWriteTokens int64
 	Outcome          string // awaiting_approval, done, needs_attention, failed, interrupted
+	Session          *SessionTotals
+}
+
+// SessionTotals is what a session cost up to the end of a run.
+type SessionTotals struct {
+	CostUSD    float64
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+}
+
+// Since is the part of s after prev, an earlier total of the same session
+// (all of s when the session started again).
+func (s SessionTotals) Since(prev SessionTotals) SessionTotals {
+	if s.CostUSD < prev.CostUSD || s.Input+s.Output+s.CacheRead+s.CacheWrite < prev.Input+prev.Output+prev.CacheRead+prev.CacheWrite {
+		return s
+	}
+	return SessionTotals{CostUSD: s.CostUSD - prev.CostUSD, Input: max(0, s.Input-prev.Input), Output: max(0, s.Output-prev.Output),
+		CacheRead: max(0, s.CacheRead-prev.CacheRead), CacheWrite: max(0, s.CacheWrite-prev.CacheWrite)}
+}
+
+// SessionTotals is the latest total a run of the task's session ended with
+// (zero: none yet).
+func (s *Store) SessionTotals(taskID, sessionID string) SessionTotals {
+	var t SessionTotals
+	if sessionID == "" {
+		return t
+	}
+	s.DB.QueryRowContext(bg(), `SELECT session_cost_usd, session_input_tokens, session_output_tokens, session_cache_read_tokens,
+		session_cache_write_tokens FROM runs WHERE task_id = ? AND session_id = ? AND session_cost_usd > 0 ORDER BY id DESC LIMIT 1`,
+		taskID, sessionID).Scan(&t.CostUSD, &t.Input, &t.Output, &t.CacheRead, &t.CacheWrite)
+	return t
 }
 
 // ToolCall is one tool use of a run (input already summarised and redacted).
@@ -83,6 +116,13 @@ func (s *Store) FinishRun(runID int64, e RunEnd, calls []ToolCall) error {
 		ts(now), now.Sub(parseTS(started)).Milliseconds(), e.Subtype, e.IsError, e.Error, e.NumTurns, e.CostUSD,
 		e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens, outcome, runID); err != nil {
 		return err
+	}
+	if t := e.Session; t != nil {
+		if _, err := tx.Exec(`UPDATE runs SET session_cost_usd=?, session_input_tokens=?, session_output_tokens=?,
+			session_cache_read_tokens=?, session_cache_write_tokens=? WHERE id=?`,
+			t.CostUSD, t.Input, t.Output, t.CacheRead, t.CacheWrite, runID); err != nil {
+			return err
+		}
 	}
 	for _, c := range calls {
 		var denied any
@@ -293,18 +333,24 @@ type ExploreStats struct {
 
 // GraphUse is how agents used the graphify graph since a time, and how their
 // planning runs compare with those of tasks that did not use it.
+//
+// Only tasks started once their project's graph was in use count (the
+// project's first graphify call): older tasks had no graph to ask, and other
+// things changed since, so they would make the comparison say nothing.
 type GraphUse struct {
 	Since      time.Time
 	Calls      int
 	Errors     int
 	ByAction   map[string]int
-	Tasks      int // tasks whose first run started since
-	GraphTasks int // of which used graphify
-	// SearchRuns are the runs since that searched code (Grep, rg…);
-	// GraphRuns of them also queried the graph.
+	Tasks      int // tasks of projects with a graph, started since and after the graph was in use
+	GraphTasks int // of which asked the graph in any run
+	// SearchRuns are the runs of those tasks that searched code (Grep, rg…);
+	// GraphRuns of them also asked the graph.
 	SearchRuns, GraphRuns int
-	With                  ExploreStats
-	Without               ExploreStats
+	// With and Without split those tasks by whether the planning run (run 1)
+	// asked the graph; lookups, subagents, cost and time are of run 1.
+	With    ExploreStats
+	Without ExploreStats
 	// Recent are the latest graphify calls ("task: action text").
 	Recent []string
 }
@@ -312,41 +358,122 @@ type GraphUse struct {
 // searchCmd matches a shell command that only looks for or at code.
 var searchCmd = regexp.MustCompile(`^\s*(cd\s+\S+\s*&&\s*)?(rg|grep|egrep|find|fd|ls|tree|cat|head|tail|wc|sed\s+-n|git\s+(-C\s+\S+\s+)?(ls-files|grep|show|log|blame))\b`)
 
+// grepCmd matches a shell command that searches code by content.
+var grepCmd = regexp.MustCompile(`^\s*(cd\s+\S+\s*&&\s*)?(rg|grep|egrep|git\s+(-C\s+\S+\s+)?grep)\b`)
+
 func isGraphTool(name string) bool { return strings.HasSuffix(name, "graphify") }
+
+// isLookup: the call looks for or at code (Grep, Glob, Read, rg, cat…).
+func isLookup(tool, input string) bool {
+	switch tool {
+	case "Grep", "Glob", "Read", "Search":
+		return true
+	case "Bash", "Shell":
+		return searchCmd.MatchString(input)
+	}
+	return false
+}
+
+// isSearch: the call searches code by content (Grep, rg, grep).
+func isSearch(tool, input string) bool {
+	switch tool {
+	case "Grep", "Search":
+		return true
+	case "Bash", "Shell":
+		return grepCmd.MatchString(input)
+	}
+	return false
+}
 
 // GraphUsage computes the graphify graph usage since a time.
 func (s *Store) GraphUsage(since time.Time) (*GraphUse, error) {
 	u := &GraphUse{Since: since, ByAction: map[string]int{}}
-	rows, err := s.DB.QueryContext(bg(), `SELECT r.task_id, r.n, c.tool_name, c.input_summary, c.is_error, r.started_at
-		FROM tool_calls c JOIN runs r ON r.id = c.run_id
-		WHERE r.task_id IN (SELECT task_id FROM runs WHERE n = 1 AND started_at >= ?)
-		ORDER BY r.started_at, c.seq`, ts(since))
+	// When each project's graph came into use: its first graphify call.
+	graphFrom := map[string]time.Time{}
+	rows, err := s.DB.QueryContext(bg(), `SELECT t.project, min(r.started_at) FROM tool_calls c JOIN runs r ON r.id = c.run_id
+		JOIN tasks t ON t.id = r.task_id WHERE c.tool_name LIKE '%graphify' GROUP BY t.project`)
 	if err != nil {
 		return nil, err
 	}
-	type acc struct {
-		graph            bool
-		lookups, explore int
-	}
-	tasks := map[string]*acc{}
-	get := func(id string) *acc {
-		if tasks[id] == nil {
-			tasks[id] = &acc{}
-		}
-		return tasks[id]
-	}
 	for rows.Next() {
-		var task, tool, input, started string
-		var n int
-		var isErr bool
-		if err := rows.Scan(&task, &n, &tool, &input, &isErr, &started); err != nil {
+		var project, at string
+		if err := rows.Scan(&project, &at); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		a := get(task)
+		graphFrom[project] = parseTS(at)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// The tasks counted: their planning run started since, after their
+	// project's graph was in use.
+	type acc struct {
+		cost             float64
+		ms               int64
+		graph, planGraph bool
+		lookups, explore int
+	}
+	tasks := map[string]*acc{}
+	var order []string
+	rows, err = s.DB.QueryContext(bg(), `SELECT r.task_id, coalesce(t.project, ''), r.started_at, r.cost_usd, coalesce(r.duration_ms, 0)
+		FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.n = 1 AND r.started_at >= ? ORDER BY r.started_at, r.id`, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var task, project, at string
+		var a acc
+		if err := rows.Scan(&task, &project, &at, &a.cost, &a.ms); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		from, ok := graphFrom[project]
+		if !ok || parseTS(at).Before(from) || tasks[task] != nil {
+			continue
+		}
+		tasks[task] = &a
+		order = append(order, task)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Their tool calls; a call a hook or the permissions denied did not run.
+	rows, err = s.DB.QueryContext(bg(), `SELECT r.id, r.task_id, r.n, c.tool_name, c.input_summary, c.is_error, c.denied_by IS NOT NULL
+		FROM tool_calls c JOIN runs r ON r.id = c.run_id WHERE r.started_at >= ? ORDER BY r.started_at, c.seq`, ts(since))
+	if err != nil {
+		return nil, err
+	}
+	type runAcc struct{ graph, searched bool }
+	runs := map[int64]*runAcc{}
+	for rows.Next() {
+		var runID int64
+		var task, tool, input string
+		var n int
+		var isErr, denied bool
+		if err := rows.Scan(&runID, &task, &n, &tool, &input, &isErr, &denied); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		a := tasks[task]
+		if a == nil || denied {
+			continue
+		}
+		r := runs[runID]
+		if r == nil {
+			r = &runAcc{}
+			runs[runID] = r
+		}
 		switch {
 		case isGraphTool(tool):
-			a.graph = true
+			a.graph, r.graph = true, true
+			if n == 1 {
+				a.planGraph = true
+			}
 			u.Calls++
 			if isErr {
 				u.Errors++
@@ -357,54 +484,52 @@ func (s *Store) GraphUsage(since time.Time) (*GraphUse, error) {
 			}
 			u.ByAction[action]++
 			u.Recent = append(u.Recent, task+": "+input)
-		case n != 1:
-		case tool == "Grep" || tool == "Glob" || tool == "Read" || tool == "Search":
-			a.lookups++
-		case (tool == "Bash" || tool == "Shell") && searchCmd.MatchString(input):
-			a.lookups++
 		case tool == "Agent" || tool == "Task":
-			a.explore++
+			if n == 1 {
+				a.explore++
+			}
+		default:
+			if isSearch(tool, input) {
+				r.searched = true
+			}
+			if n == 1 && isLookup(tool, input) {
+				a.lookups++
+			}
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	if len(u.Recent) > 5 {
 		u.Recent = u.Recent[len(u.Recent)-5:]
 	}
-	// Runs since that searched code, and how many of them asked the graph.
-	if err := s.DB.QueryRowContext(bg(), `SELECT count(*), coalesce(sum(g), 0) FROM (
-		SELECT r.id, max(c.tool_name LIKE '%graphify') AS g,
-		       max(c.tool_name IN ('Grep','Search') OR ((c.tool_name IN ('Bash','Shell')) AND (c.input_summary LIKE '%rg %' OR c.input_summary LIKE '%grep %'))) AS searched
-		FROM runs r JOIN tool_calls c ON c.run_id = r.id WHERE r.started_at >= ? GROUP BY r.id) WHERE searched`, ts(since)).
-		Scan(&u.SearchRuns, &u.GraphRuns); err != nil {
-		return nil, err
+	for _, r := range runs {
+		if r.searched {
+			u.SearchRuns++
+			if r.graph {
+				u.GraphRuns++
+			}
+		}
 	}
-	// The planning run of every task started since (tasks without tool calls too).
-	rows, err = s.DB.QueryContext(bg(), `SELECT task_id, cost_usd, coalesce(duration_ms, 0) FROM runs WHERE n = 1 AND started_at >= ?`, ts(since))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	add := func(e *ExploreStats, a *acc, cost float64, ms int64) {
+
+	add := func(e *ExploreStats, a *acc) {
 		e.Tasks++
 		e.Lookups += float64(a.lookups)
 		e.Explorers += float64(a.explore)
-		e.PlanCost += cost
-		e.PlanMinutes += float64(ms) / 60000
+		e.PlanCost += a.cost
+		e.PlanMinutes += float64(a.ms) / 60000
 	}
-	for rows.Next() {
-		var task string
-		var cost float64
-		var ms int64
-		if err := rows.Scan(&task, &cost, &ms); err != nil {
-			return nil, err
-		}
-		a := get(task)
+	for _, id := range order {
+		a := tasks[id]
 		u.Tasks++
 		if a.graph {
 			u.GraphTasks++
-			add(&u.With, a, cost, ms)
+		}
+		if a.planGraph {
+			add(&u.With, a)
 		} else {
-			add(&u.Without, a, cost, ms)
+			add(&u.Without, a)
 		}
 	}
 	for _, e := range []*ExploreStats{&u.With, &u.Without} {
@@ -413,7 +538,7 @@ func (s *Store) GraphUsage(since time.Time) (*GraphUse, error) {
 			e.Lookups, e.Explorers, e.PlanCost, e.PlanMinutes = e.Lookups/n, e.Explorers/n, e.PlanCost/n, e.PlanMinutes/n
 		}
 	}
-	return u, rows.Err()
+	return u, nil
 }
 
 // OperatorTextOfRun returns what the operator wrote that started the task's

@@ -78,7 +78,7 @@ func (g *Generator) Generate(ctx context.Context, lc Context, question string) (
 	if question == "" {
 		return nil, errors.New("câu hỏi trống")
 	}
-	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "viết SPL"), Timeout)
 	defer cancel()
 	run := g.Run
 	if run == nil {

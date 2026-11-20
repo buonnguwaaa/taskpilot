@@ -82,7 +82,7 @@ func (d *Drafter) Draft(ctx context.Context, prompt string) (*Draft, error) {
 	if prompt == "" {
 		return nil, errors.New("prompt trống")
 	}
-	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "soạn task"), Timeout)
 	defer cancel()
 	run := d.Run
 	if run == nil {

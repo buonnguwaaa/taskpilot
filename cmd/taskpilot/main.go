@@ -239,6 +239,7 @@ func (c common) load() (*config.Config, *store.Store, error) {
 		return nil, nil, err
 	}
 	st.SuggestionWindow = cfg.ScanWindow
+	recordUsage(st)
 	return cfg, st, nil
 }
 

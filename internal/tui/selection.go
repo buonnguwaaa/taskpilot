@@ -33,7 +33,7 @@ type selection struct {
 // paneAt returns the content rectangle of the pane under (x, y).
 func (m Model) paneAt(x, y int) (x0, x1, y0, y1 int, ok bool) {
 	top, bottom := 2, 2+m.innerHeight()
-	if m.zoom || m.tab == tabStatus {
+	if m.zoom || m.fullWidthTab() {
 		top, bottom = 1, 1+m.innerHeight()+2
 		if y < top || y >= bottom {
 			return 0, 0, 0, 0, false

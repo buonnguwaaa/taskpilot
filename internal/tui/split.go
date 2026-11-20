@@ -91,7 +91,7 @@ func (m Model) splitKey(k string) (Model, bool) {
 // event through. The divider is the left panel's right border and the right
 // panel's left border.
 func (m Model) onDividerDrag(ev tea.MouseMsg) (Model, bool) {
-	if m.tab == tabStatus {
+	if m.fullWidthTab() {
 		return m, false
 	}
 	edge := m.listWidth() + 2 // the left box: border + inner width (with padding) + border

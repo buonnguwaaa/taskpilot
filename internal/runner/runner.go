@@ -52,6 +52,9 @@ type Result struct {
 	CacheWriteTokens int64
 	ToolCalls        []store.ToolCall
 	Quota            Quota
+	// Session is what the whole session cost so far (claude reports
+	// totals, resumes included); nil when the agent does not report it.
+	Session *store.SessionTotals
 }
 
 // systemContract is appended to Claude Code's system prompt for every run.
@@ -434,6 +437,12 @@ type streamEvent struct {
 	TotalCostUSD float64         `json:"total_cost_usd"`
 	NumTurns     int             `json:"num_turns"`
 	Usage        json.RawMessage `json:"usage"`
+	ModelUsage   map[string]struct {
+		Input      int64 `json:"inputTokens"`
+		Output     int64 `json:"outputTokens"`
+		CacheRead  int64 `json:"cacheReadInputTokens"`
+		CacheWrite int64 `json:"cacheCreationInputTokens"`
+	} `json:"modelUsage"`
 }
 
 func parseEvent(line []byte, res *Result) {
@@ -452,6 +461,16 @@ func parseEvent(line []byte, res *Result) {
 		res.CostUSD = ev.TotalCostUSD
 		res.NumTurns = ev.NumTurns
 		parseUsage(ev.Usage, res)
+		if len(ev.ModelUsage) > 0 {
+			s := &store.SessionTotals{CostUSD: ev.TotalCostUSD}
+			for _, u := range ev.ModelUsage { // subagents' models too
+				s.Input += u.Input
+				s.Output += u.Output
+				s.CacheRead += u.CacheRead
+				s.CacheWrite += u.CacheWrite
+			}
+			res.Session = s
+		}
 	}
 }
 

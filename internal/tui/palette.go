@@ -3,7 +3,7 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 // The palette: one graphite ramp for the chrome, one amber signal for what
-// waits on you, and two toned-down semantic colors. Every color in the TUI is
+// waits on you, one blue for what is running now, and two toned-down semantic colors. Every color in the TUI is
 // one of these tokens, each with a dark and a light terminal value.
 //
 // Amber is reserved: a gate waiting for your decision, a task that needs you,
@@ -16,6 +16,7 @@ const (
 	cRule    = "rule"    // hairlines, idle borders
 	cSurface = "surface" // one step up from the background: selection, keycaps
 	cAccent  = "accent"  // the amber signal
+	cRun     = "run"     // a task the agent is working on right now
 	cOk      = "ok"
 	cErr     = "err"
 )
@@ -28,6 +29,7 @@ var palette = map[string]lipgloss.AdaptiveColor{
 	cRule:    {Dark: "238", Light: "252"},
 	cSurface: {Dark: "236", Light: "254"},
 	cAccent:  {Dark: "214", Light: "130"},
+	cRun:     {Dark: "75", Light: "25"},
 	cOk:      {Dark: "108", Light: "29"},
 	cErr:     {Dark: "167", Light: "124"},
 }

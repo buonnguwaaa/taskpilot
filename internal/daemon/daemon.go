@@ -449,7 +449,7 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 	if resumeAt != "" { // the session now continues from there
 		_ = d.Store.SetResumeAt(t.ID, "")
 	}
-	applyRunResult(t, res)
+	d.applyRunResult(t, res)
 
 	pending, err := d.Store.PendingRequest(t.ID)
 	if err != nil {
@@ -470,6 +470,7 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 			end.Subtype, end.NumTurns, end.CostUSD = res.Subtype, res.NumTurns, res.CostUSD
 			end.InputTokens, end.OutputTokens = res.InputTokens, res.OutputTokens
 			end.CacheReadTokens, end.CacheWriteTokens = res.CacheReadTokens, res.CacheWriteTokens
+			end.Session = res.Session
 		}
 		if err := d.Store.FinishRun(runID, end, toolCallsOf(res)); err != nil {
 			return err
@@ -506,7 +507,7 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 		}
 		d.Log.Printf("%s: run %d (cursor fallback after Claude quota, model %s)", t.ID, t.Runs, orDefault(model))
 		res, runErr = d.Runner.RunKind(ctx, t, prompt, false, config.AgentCursor)
-		applyRunResult(t, res)
+		d.applyRunResult(t, res)
 		if pending, err = d.Store.PendingRequest(t.ID); err != nil {
 			return err
 		}
@@ -569,13 +570,27 @@ func (d *Daemon) work(ctx context.Context, t *store.Task) error {
 		end.Subtype, end.IsError, end.NumTurns, end.CostUSD = res.Subtype, res.IsError, res.NumTurns, res.CostUSD
 		end.InputTokens, end.OutputTokens = res.InputTokens, res.OutputTokens
 		end.CacheReadTokens, end.CacheWriteTokens = res.CacheReadTokens, res.CacheWriteTokens
+		end.Session = res.Session
 	}
 	return d.Store.FinishRun(runID, end, toolCallsOf(res))
 }
 
-func applyRunResult(t *store.Task, res *runner.Result) {
+func (d *Daemon) applyRunResult(t *store.Task, res *runner.Result) {
 	if res == nil {
 		return
+	}
+	// claude reports the session's totals: this run is the difference from
+	// the previous run of the same session.
+	if s := res.Session; s != nil {
+		prev := d.Store.SessionTotals(t.ID, res.SessionID)
+		run := s.Since(prev)
+		res.CostUSD = run.CostUSD
+		// Runs from before schema v18 kept no token totals: this run's own
+		// usage (main loop only) is then the best there is.
+		if prev.CostUSD == 0 || prev.Input+prev.Output+prev.CacheRead+prev.CacheWrite > 0 {
+			res.InputTokens, res.OutputTokens = run.Input, run.Output
+			res.CacheReadTokens, res.CacheWriteTokens = run.CacheRead, run.CacheWrite
+		}
 	}
 	// Cursor assigns the chat id on the first run; Claude uses the
 	// predetermined --session-id. Keep whichever the agent reported.

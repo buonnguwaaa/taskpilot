@@ -18,7 +18,7 @@ type stateLook struct{ icon, label, color string }
 var stateLooks = map[store.State]stateLook{
 	store.StateQueued:         {"○", "chờ chạy", cMuted},
 	store.StatePreparing:      {"◌", "chuẩn bị", cMuted},
-	store.StateRunning:        {"▸", "đang chạy", cBright},
+	store.StateRunning:        {"▸", "đang chạy", cRun},
 	store.StateAwaitApproval:  {"●", "chờ bạn duyệt", cAccent},
 	store.StateNeedsAttention: {"●", "cần bạn", cAccent},
 	store.StateDone:           {"✓", "xong", cOk},

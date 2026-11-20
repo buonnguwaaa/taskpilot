@@ -73,7 +73,7 @@ func (d *Drafter) Draft(ctx context.Context, in Input) (*Draft, error) {
 	if strings.TrimSpace(in.Title) == "" && strings.TrimSpace(in.Completion) == "" {
 		return nil, errors.New("không có gì để soạn: task chưa có tiêu đề hay tóm tắt hoàn thành")
 	}
-	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "soạn worklog"), Timeout)
 	defer cancel()
 	c := d.Config.Claude
 	out, err := d.run(ctx, oneshot.Args(schema, systemPrompt, c.WorklogModel, c.SettingSources), Prompt(in))
@@ -187,7 +187,7 @@ func (d *Drafter) Assess(ctx context.Context, in AssessInput) (*Assessment, erro
 	if strings.TrimSpace(in.Title) == "" && strings.TrimSpace(in.Ticket) == "" {
 		return nil, errors.New("task trống")
 	}
-	ctx, cancel := context.WithTimeout(ctx, Timeout)
+	ctx, cancel := context.WithTimeout(oneshot.WithPurpose(ctx, "đánh giá task"), Timeout)
 	defer cancel()
 	c := d.Config.Claude
 	args := oneshot.Args(assessSchema, assessSystem, c.Model, c.SettingSources)

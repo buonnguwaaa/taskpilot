@@ -68,6 +68,7 @@ func (h *Handlers) claudeMergeIntent(ctx context.Context, texts []string, repo, 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
+	oneshot.Note(oneshot.WithPurpose(ctx, "gộp ý định"), out)
 	if err != nil {
 		return false, "", fmt.Errorf("claude: %w: %s", err, oneshot.Clip(strings.TrimSpace(stderr.String()), 300))
 	}

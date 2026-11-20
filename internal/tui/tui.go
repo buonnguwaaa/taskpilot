@@ -172,6 +172,8 @@ type Model struct {
 	hw    hwTab
 	logs  logsTab
 	stVP  viewport.Model
+	stSec statusSection
+	usage usageTab
 
 	modal   *form
 	conf    *confirm
@@ -245,7 +247,7 @@ func (m *Model) refreshBanner() {
 // bodyView is the current tab between the header and the footer.
 func (m Model) bodyView() string {
 	switch {
-	case m.zoom && m.tab != tabStatus:
+	case m.zoom && !m.fullWidthTab():
 		return m.zoomView()
 	case m.tab == tabTasks:
 		return m.tasksView()
@@ -670,7 +672,7 @@ func (m Model) onMouse(ev tea.MouseMsg) (tea.Model, tea.Cmd) {
 	} else {
 		m = mm
 	}
-	if m.zoom && m.tab != tabStatus && ev.Y > 0 {
+	if m.zoom && !m.fullWidthTab() && ev.Y > 0 {
 		// One pane: the wheel scrolls it, clicks do nothing (no list).
 		if ev.Button == tea.MouseButtonWheelUp || ev.Button == tea.MouseButtonWheelDown {
 			m.zoomScroll(ev.Button == tea.MouseButtonWheelUp)
@@ -840,6 +842,9 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 		}
 	case "status":
 		return m.switchTab(tabStatus)
+	case "usage":
+		m.stSec = secUsage
+		return m.switchTab(tabStatus)
 	case "logs":
 		return m.switchTab(tabLogs)
 	case "help", "?":
@@ -1004,7 +1009,7 @@ func (m Model) footerView() string {
 			keys = "đang đọc log… · " + keys
 		}
 	case tabStatus:
-		keys = "l Hasaki · s/S Splunk (S: tạo token) · a Argo CD · v Vault QC · K Kafka UI · t dán token · b Bitbucket · d doctor · r làm mới"
+		keys = m.statusKeys()
 	}
 	// The tab's keys come first and give way; the way to the rest stays at the
 	// right edge (mouse, F3, y, </> and : are in the help).
@@ -1096,7 +1101,7 @@ var (
 	stateColors    = map[store.State]string{
 		store.StateQueued:         cMuted,
 		store.StatePreparing:      cMuted,
-		store.StateRunning:        cBright,
+		store.StateRunning:        cRun,
 		store.StateAwaitApproval:  cAccent,
 		store.StateNeedsAttention: cAccent,
 		store.StateDone:           cOk,
