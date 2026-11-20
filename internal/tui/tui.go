@@ -352,18 +352,20 @@ func (m Model) tabView(t tabID) string {
 			break
 		}
 	}
-	nameStyle := tabStyle
+	// " 1 Tasks " then the count, the same width as tabLabel.
+	out := " " + dimStyle.Render(num) + " " + tabStyle.Render(name) + " "
 	if t == m.tab {
-		nameStyle = activeTabStyle
+		bg := lipgloss.NewStyle().Background(clr(cSurface))
+		out = bg.Render(" ") + dimStyle.Background(clr(cSurface)).Render(num) + bg.Render(" ") + activeTabStyle.Render(name+" ")
 	}
-	out := " " + dimStyle.Render(num) + " " + nameStyle.Render(name)
+	extra = strings.TrimPrefix(extra, " ")
 	switch {
-	case strings.HasPrefix(extra, " ● "):
-		out += " " + warnStyle.Render(strings.TrimPrefix(extra, " "))
+	case strings.HasPrefix(extra, "● "):
+		out += warnStyle.Render(extra) + " "
 	case extra != "":
-		out += dimStyle.Render(extra)
+		out += dimStyle.Render(extra) + " "
 	}
-	return out + " "
+	return out
 }
 
 // ---- update ---------------------------------------------------------------
@@ -1097,7 +1099,7 @@ var (
 	boxStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(clr(cRule)).Padding(0, 1)
 	modalStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(clr(cSub)).Padding(1, 2)
 	tabStyle       = fg(cSub)
-	activeTabStyle = fg(cBright).Underline(true)
+	activeTabStyle = fg(cBright).Background(clr(cSurface)) // the selected tab: a surface step, padded by a space
 	stateColors    = map[store.State]string{
 		store.StateQueued:         cMuted,
 		store.StatePreparing:      cMuted,

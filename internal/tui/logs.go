@@ -223,11 +223,11 @@ func splitWindow(v string) (string, string) {
 
 // envLine is the first line of the Logs list box: which environment is shown.
 func (m Model) envLine() string {
-	prod, qc := tabStyle.Render("Production · Splunk"), activeTabStyle.Render("QC · Argo CD")
+	prod, qc := tabStyle.Render(" Production · Splunk "), activeTabStyle.Render(" QC · Argo CD ")
 	if m.logs.env != envQC {
-		prod, qc = activeTabStyle.Render("Production · Splunk"), tabStyle.Render("QC · Argo CD")
+		prod, qc = activeTabStyle.Render(" Production · Splunk "), tabStyle.Render(" QC · Argo CD ")
 	}
-	return " " + prod + "   " + qc + " " + dimStyle.Render("  e")
+	return prod + " " + qc + dimStyle.Render("  e")
 }
 
 func (m Model) logsView() string {

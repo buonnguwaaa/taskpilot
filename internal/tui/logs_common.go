@@ -40,7 +40,7 @@ func (m Model) logsLeft(projects []string, active int, rows []logRow, cursor int
 	var tabs []string
 	for i, p := range projects {
 		if i == active {
-			tabs = append(tabs, " "+activeTabStyle.Render(p)+" ")
+			tabs = append(tabs, activeTabStyle.Render(" "+p+" "))
 		} else {
 			tabs = append(tabs, tabStyle.Render(" "+p+" "))
 		}

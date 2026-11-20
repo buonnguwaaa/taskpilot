@@ -40,11 +40,11 @@ var usagePeriods = []usagePeriod{
 	{"30 ngày", store.ByDay, func(now, _ time.Time) (time.Time, time.Time) {
 		return dayStart(now).AddDate(0, 0, -29), dayStart(now).AddDate(0, 0, 1)
 	}},
-	{"Tháng này", store.ByDay, func(now, _ time.Time) (time.Time, time.Time) {
+	{"Tháng này", store.ByWeek, func(now, _ time.Time) (time.Time, time.Time) {
 		m := store.ByMonth.Start(now)
 		return m, m.AddDate(0, 1, 0)
 	}},
-	{"Tháng trước", store.ByDay, func(now, _ time.Time) (time.Time, time.Time) {
+	{"Tháng trước", store.ByWeek, func(now, _ time.Time) (time.Time, time.Time) {
 		m := store.ByMonth.Start(now)
 		return m.AddDate(0, -1, 0), m
 	}},
@@ -184,12 +184,12 @@ func (m Model) usagePeriodsLine(w int) string {
 	var parts []string
 	for i, p := range usagePeriods {
 		if i == m.usage.period {
-			parts = append(parts, activeTabStyle.Render(p.label))
+			parts = append(parts, activeTabStyle.Render(" "+p.label+" "))
 		} else {
-			parts = append(parts, dimStyle.Render(p.label))
+			parts = append(parts, dimStyle.Render(" "+p.label+" "))
 		}
 	}
-	return " " + ansi.Truncate(strings.Join(parts, dimStyle.Render("  ")), w-2, "…")
+	return ansi.Truncate(strings.Join(parts, " "), w, "…")
 }
 
 func (m Model) usageTotalCard(s *store.UsageSummary, w int) string {

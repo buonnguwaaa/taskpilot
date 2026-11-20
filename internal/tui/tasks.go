@@ -209,7 +209,7 @@ func (m *Model) taskDetail(t *store.Task) string {
 	tabs := []string{" Tổng quan ", " Trò chuyện "}
 	for i := range tabs {
 		if i == tt.view {
-			tabs[i] = fg(cBright).Underline(true).Render(tabs[i])
+			tabs[i] = activeTabStyle.Render(tabs[i])
 		} else {
 			tabs[i] = tabStyle.Render(tabs[i])
 		}

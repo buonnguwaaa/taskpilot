@@ -476,12 +476,12 @@ func (m Model) statusSectionsLine(w int) string {
 	var parts []string
 	for i, name := range statusSections {
 		if statusSection(i) == m.stSec {
-			parts = append(parts, activeTabStyle.Render(name))
+			parts = append(parts, activeTabStyle.Render(" "+name+" "))
 		} else {
-			parts = append(parts, tabStyle.Render(name))
+			parts = append(parts, tabStyle.Render(" "+name+" "))
 		}
 	}
-	return " " + strings.Join(parts, "   ") + "\n"
+	return strings.Join(parts, " ") + "\n"
 }
 
 // columns sets two stacks of cards side by side, the shorter stack's last
